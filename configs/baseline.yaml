@@ -1,0 +1,19 @@
+project:
+  seed: 20260921
+  sample_rate_hz: 100.0
+  channel_representation: cir
+
+window:
+  length_s: 2.0
+  stride_s: 0.25
+  alarm_threshold: 0.80
+  min_consecutive_positive_windows: 2
+
+domain_split:
+  strategy: leave_one_domain_out
+  domain_keys: [scene_id, subject_id, hardware_profile]
+
+simulator:
+  isaac_sim_version: unknown
+  sionna_version: unknown
+  dry_run: true
