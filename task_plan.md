@@ -10,8 +10,9 @@
 - [x] 阶段 2：核对核心文献，形成项目相关的证据记录和研究路线
 - [x] 阶段 3：建立仓库目录、Python 工程配置、数据契约和最小代码骨架
 - [x] 阶段 4：编写 README、架构说明、路线图和阶段进度文档
-- [ ] 阶段 5：网络恢复后同步 `git@github.com:11anticipate/Sim2Sense-Fall.git` 并核对上游内容
-- [ ] 阶段 6：接入 Isaac Sim / Sionna 实例，完成首个端到端 smoke test
+- [x] 阶段 5：搭建 Isaac Sim 室内场景（卧室/客厅/卫生间/厨房/次卧/走廊），配置墙体、地板、家具属性并导出 USD
+- [ ] 阶段 6：网络恢复后同步 `git@github.com:11anticipate/Sim2Sense-Fall.git` 并核对上游内容
+- [ ] 阶段 7：接入 Sionna RT，完成首个端到端 smoke test（场景 → CIR/CSI 样本）
 
 ## 关键问题
 
@@ -26,12 +27,31 @@
 - 代码采用 `src/` 布局、类型标注、`ruff`、`pytest` 和配置文件驱动。
 - 原始数据、生成数据、模型权重和渲染缓存默认不入 Git；仓库只保留小型示例、元数据和生成说明。
 - 先实现稳定的数据契约与 dry-run，再接入重量级 Isaac Sim / Sionna 运行时。
+- 场景几何用参数化图元拼装，不依赖在线素材库；同一材质同时定义渲染、力学和电磁三套属性。
+- 场景规划（CPU）与 USD 落地（Isaac Sim）分离：规划可脱离 Isaac Sim 单测和评审，USD 只消费规划结果。
 
 ## 错误与阻塞
 
 - 2026-09-21：`github.com` DNS 解析失败，无法读取上游仓库；已在 README 和进度文档中记录，待网络恢复后重试。
 - 2026-09-21：当前 `.git` 目录为只读空目录，`git init` 无法写入模板；本轮只能完成工作树文件，不能提交或更新远程配置。
+- 2026-09-21：独立运行的 Isaac Sim 不会把 PhysX 挂到 USD stage 上，物理步数在涨但没有任何物体运动。已封装 `activate_physics()`（`enable_all_default_callbacks` + `setup_simulation`）修复，并加入「抬高后落回」的正向对照测试，避免把「物理没跑」误判成「场景稳定」。
 
 ## 当前状态
 
-**阶段 4 已完成**：仓库骨架、文献证据、README、AGENTS.md、架构与进度文档已写入；等待网络恢复和 Git 元数据可写后同步上游。
+**室内场景任务已完成**：`configs/scenes/indoor_apartment.yaml` 描述的 6 房间住宅可导出为
+`artifacts/scenes/indoor_apartment.usda`（232 图元 / 231 碰撞体 / 14 材质），
+物理 smoke test 12 项全通过。构建与 GUI 查看指令见 [`docs/indoor-scene.md`](docs/indoor-scene.md)。
+
+## 室内场景子任务
+
+- [x] 创建卧室、客厅、卫生间、厨房、次卧及走廊配置，设置静态碰撞、材质与摩擦属性。
+- [x] 创建实际 Python 文件、CPU dry-run 和 USD 导出入口。
+- [x] 运行验证并记录结果，提供本机 GUI 启动指令。
+
+## 下一步
+
+1. 用 `configs/scenes/indoor_apartment.yaml` 的 `seed` 驱动房间布局/材质随机化，形成训练域族。
+2. 在场景中加入人体（刚体或骨架），导出与场景同时间基准的运动真值。
+3. 接入 Sionna RT，把 `/World` 下的几何与 `sim2sense:em_*` 材质映射成传播场景，生成首条 `ChannelSample`。
+4. 复核 `tile_floor`、`ceramic_sanitary`、`carpet`、`upholstery` 等代理电磁材质与实际
+   Sionna 版本 `itu_*` 数值的一致性。
