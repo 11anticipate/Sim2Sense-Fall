@@ -16,8 +16,8 @@ layer, so the test runs against a **temporary copy** and hashes the original
 before and after. That keeps the reported primitive count honest and proves the
 check does not mutate the shipped asset.
 
-    ~/isaacsim/python.sh scripts/verify_indoor_scene.py
-    ~/isaacsim/python.sh scripts/verify_indoor_scene.py --drop-height 0.25 --gui
+    ~/isaacsim/python.sh scripts/scenes/verify.py
+    ~/isaacsim/python.sh scripts/scenes/verify.py --drop-height 0.25 --gui
 
 Exit code is 0 only when every check passes.
 """
@@ -28,12 +28,13 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -47,10 +48,6 @@ LOGGER = logging.getLogger("verify_indoor_scene")
 SETTLE_TOLERANCE_M = 0.02
 #: A dropped body must actually come back down by about the height it was lifted.
 DROP_TOLERANCE_M = 0.02
-#: Expected overall footprint of the shipping apartment scene.
-EXPECTED_FOOTPRINT_M = (8.4, 7.0)
-#: Primitives in the exported file as written, before Isaac Sim opens it.
-EXPECTED_FILE_PRIMS = 344
 
 
 def _sha256(path: Path) -> str:
@@ -74,7 +71,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--drop-height", type=float, default=0.25, help="positive-control lift height in metres"
     )
     parser.add_argument("--gui", action="store_true", help="keep the viewport open afterwards")
-    return parser.parse_args(argv)
+    parser.add_argument("--position-tolerance", type=float, default=SETTLE_TOLERANCE_M)
+    parser.add_argument("--drop-tolerance", type=float, default=DROP_TOLERANCE_M)
+    parser.add_argument("--dry-run", action="store_true", help="validate manifest on CPU only")
+    parser.add_argument("--static-only", action="store_true", help="check USD without dynamics")
+    args = parser.parse_args(argv)
+    for name in ("settle_seconds", "drop_height", "position_tolerance", "drop_tolerance"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and positive")
+    if args.drop_height <= args.drop_tolerance:
+        parser.error("--drop-height must exceed --drop-tolerance for a positive control")
+    return args
 
 
 class Checks:
@@ -99,49 +106,40 @@ class Checks:
             pass
 
 
-def measure_floor_footprint(stage: object) -> tuple[float, float] | None:
-    """Return the ``(x, y)`` extent of the room floor slabs."""
-
-    from pxr import Usd, UsdGeom
-
-    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
-    x_min = y_min = float("inf")
-    x_max = y_max = float("-inf")
-    found = False
-    for prim in stage.Traverse():
-        if prim.GetName() != "floor":
-            continue
-        aligned = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
-        low, high = aligned.GetMin(), aligned.GetMax()
-        x_min, y_min = min(x_min, low[0]), min(y_min, low[1])
-        x_max, y_max = max(x_max, high[0]), max(y_max, high[1])
-        found = True
-    if not found:
-        return None
-    return (x_max - x_min, y_max - y_min)
-
-
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level="INFO", format="%(levelname)s %(name)s: %(message)s")
 
-    usd_path = args.usd if args.usd.is_absolute() else (Path.cwd() / args.usd)
+    from sim2sense_fall.scenes.verification import load_scene_manifest
+
+    try:
+        plan = load_scene_manifest(args.manifest)
+    except (OSError, ValueError) as exc:
+        LOGGER.error("manifest validation failed: %s", exc)
+        return 2
+    if args.dry_run:
+        print(f"CPU manifest check: PASS ({len(plan.prims)} primitives; USD/physics not checked)")
+        return 0
+    usd_path = args.usd.resolve()
     if not usd_path.is_file():
-        print(f"scene not found: {usd_path}", file=sys.stderr)
+        LOGGER.error("scene not found: %s", usd_path)
         return 2
     original_hash = _sha256(usd_path)
+    try:
+        from isaacsim.simulation_app import SimulationApp
 
-    from isaacsim.simulation_app import SimulationApp
-
-    sys.argv = [sys.argv[0]]
-    app = SimulationApp({"headless": not args.gui, "width": 1600, "height": 900})
+        sys.argv = [sys.argv[0]]
+        app = SimulationApp({"headless": not args.gui, "width": 1600, "height": 900})
+    except Exception as exc:
+        LOGGER.error("Isaac Sim startup failed; use ~/isaacsim/python.sh: %s", exc)
+        return 1
     checks = Checks()
-    exit_code = 0
+    exit_code = 1
     workdir = tempfile.TemporaryDirectory(prefix="sim2sense-verify-")
     try:
         import omni.usd
 
-        from sim2sense_fall.isaac_scene import (
+        from sim2sense_fall.scenes.usd import (
             activate_physics,
             lift_rigid_bodies,
             rigid_body_world_positions,
@@ -157,64 +155,31 @@ def main(argv: list[str] | None = None) -> int:
 
         summary = stage_summary(sandbox)
         checks.check("scene opens", summary["prim_count"] > 0, f"{summary['prim_count']} prims")
-        checks.check(
-            "exported file has the expected primitive count",
-            summary["prim_count"] == EXPECTED_FILE_PRIMS,
-            f"{summary['prim_count']} vs {EXPECTED_FILE_PRIMS}",
-        )
-        checks.check(
-            "Z-up with metres as the unit",
-            summary["up_axis"] == "Z" and summary["meters_per_unit"] == 1.0,
-            f"up={summary['up_axis']} m/unit={summary['meters_per_unit']}",
-        )
-        checks.check(
-            "colliders cover the geometry",
-            summary["collider_count"] == summary["shape_count"] == 231,
-            f"{summary['collider_count']} colliders / {summary['shape_count']} shapes",
-        )
-        checks.check("rigid bodies authored", summary["rigid_body_count"] >= 1)
+        from pxr import Usd
 
-        if args.manifest.is_file():
-            stats = json.loads(args.manifest.read_text(encoding="utf-8"))["stats"]
-            checks.check(
-                "authored geometry matches the plan",
-                summary["shape_count"] == stats["geometry_count"],
-                f"{summary['shape_count']} vs {stats['geometry_count']}",
-            )
-            checks.check(
-                "authored rigid bodies match the plan",
-                summary["rigid_body_count"] == stats["rigid_body_count"],
-                f"{summary['rigid_body_count']} vs {stats['rigid_body_count']}",
-            )
-        else:
-            checks.check("plan manifest available", False, str(args.manifest))
+        from sim2sense_fall.scenes.verification import stage_manifest_errors
 
-        omni.usd.get_context().open_stage(str(sandbox))
+        errors = stage_manifest_errors(Usd.Stage.Open(str(sandbox)), plan)
+        checks.check(
+            "USD matches every manifest primitive and material", not errors, "; ".join(errors[:10])
+        )
+        if errors:
+            raise ValueError("USD/manifest mismatch; physics check stopped")
+
+        if not omni.usd.get_context().open_stage(str(sandbox)):
+            raise RuntimeError("Isaac Sim could not open the scene")
         for _ in range(5):
             app.update()
 
-        footprint = measure_floor_footprint(omni.usd.get_context().get_stage())
-        if footprint is None:
-            checks.check("floor slabs found", False)
-        else:
+        if not args.static_only:
+            activation = activate_physics()
             checks.check(
-                "floor footprint matches the plan",
-                abs(footprint[0] - EXPECTED_FOOTPRINT_M[0]) < 0.02
-                and abs(footprint[1] - EXPECTED_FOOTPRINT_M[1]) < 0.02,
-                f"{footprint[0]:.2f} m x {footprint[1]:.2f} m",
+                "physics scene activated",
+                activation["physics_scenes"] == ["/World/PhysicsScene"]
+                and activation["active_engine"] == "physx",
+                json.dumps(activation),
             )
-
-        activation = activate_physics()
-        # ``simulating`` is False until the timeline plays, so assert on the scene
-        # and engine instead; the drop control below is what proves physics runs.
-        checks.check(
-            "physics scene activated",
-            activation["physics_scenes"] == ["/World/PhysicsScene"]
-            and activation["active_engine"] == "physx",
-            json.dumps(activation),
-        )
-
-        if args.settle_seconds > 0:
+        if not args.static_only:
             stage = omni.usd.get_context().get_stage()
             authored = rigid_body_world_positions(stage)
             checks.check("dynamic bodies reported", bool(authored), json.dumps(authored))
@@ -222,11 +187,12 @@ def main(argv: list[str] | None = None) -> int:
             # Phase 1 -- stable at rest.
             step_simulation(app, args.settle_seconds)
             settled = rigid_body_world_positions(stage)
+            checks.check("settled body set preserved", set(settled) == set(authored))
             for path, position in settled.items():
                 drift = max(abs(position[axis] - authored[path][axis]) for axis in range(3))
                 checks.check(
                     f"{path} stays put at rest",
-                    drift <= SETTLE_TOLERANCE_M,
+                    drift <= args.position_tolerance,
                     f"drift {drift:.4f} m",
                 )
 
@@ -236,19 +202,23 @@ def main(argv: list[str] | None = None) -> int:
                 app.update()
             step_simulation(app, args.settle_seconds)
             dropped = rigid_body_world_positions(stage)
+            checks.check("dropped body set preserved", set(dropped) == set(authored))
             for path, position in dropped.items():
                 fall = lifted[path][2] - position[2]
                 residual = max(abs(position[axis] - authored[path][axis]) for axis in range(3))
                 checks.check(
                     f"{path} falls back under gravity",
-                    fall >= args.drop_height - DROP_TOLERANCE_M,
+                    fall >= args.drop_height - args.drop_tolerance,
                     f"fell {fall:.4f} m from {lifted[path][2]:.4f} m to {position[2]:.4f} m",
                 )
                 checks.check(
                     f"{path} comes to rest where it started",
-                    residual <= SETTLE_TOLERANCE_M,
+                    residual <= args.position_tolerance,
                     f"residual {residual:.4f} m",
                 )
+
+        if args.static_only:
+            checks.lines.append("[SKIP] dynamics (--static-only)")
 
         if args.gui:
             print("GUI is open. Close the window or press Ctrl-C to exit.")
@@ -260,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             _sha256(usd_path) == original_hash,
             str(usd_path),
         )
+        exit_code = 1 if checks.failures else 0
     except Exception as exc:  # noqa: BLE001 - surfaced in the check report
         LOGGER.exception("verification failed")
         checks.check("verification completed without error", False, f"{type(exc).__name__}: {exc}")
@@ -270,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"verification: {'FAILED' if checks.failures else 'PASSED'}")
         if checks.failures:
             print("failed checks: " + ", ".join(checks.failures))
-        app.close()
+        app.close(exit_code=exit_code)
     return exit_code or (1 if checks.failures else 0)
 
 

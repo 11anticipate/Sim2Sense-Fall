@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .numbers import finite_vector
+
 __all__ = [
     "DEFAULT_FURNITURE_SIZE",
     "Part",
@@ -44,6 +46,14 @@ class Part:
     center: tuple[float, float, float]
     size: tuple[float, float, float]
     material: str
+
+    def __post_init__(self) -> None:
+        finite_vector(self.center, 3, f"{self.suffix}.center")
+        finite_vector(self.size, 3, f"{self.suffix}.size", positive=True)
+        if self.shape not in {"box", "cylinder"}:
+            raise ValueError(f"{self.suffix}: unsupported shape {self.shape!r}")
+        if self.shape == "cylinder" and self.size[0] != self.size[1]:
+            raise ValueError(f"{self.suffix}: cylinder diameters must match")
 
 
 def _box(
@@ -123,10 +133,14 @@ def furniture_parts(kind: str, size: tuple[float, float, float], material: str) 
     item can be added to a scene file before its recipe exists.
     """
 
+    finite_vector(size, 3, f"{kind}.size", positive=True)
     recipe = _RECIPES.get(kind)
     if recipe is None:
         return [_box("body", 0.0, 0.0, size[2] / 2, size[0], size[1], size[2], material)]
-    return recipe(size[0], size[1], size[2], material)
+    try:
+        return recipe(size[0], size[1], size[2], material)
+    except ValueError as exc:
+        raise ValueError(f"{kind}: size {size} is incompatible with its recipe: {exc}") from exc
 
 
 # --------------------------------------------------------------------------------------

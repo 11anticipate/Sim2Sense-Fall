@@ -33,7 +33,8 @@ from typing import Any
 
 import yaml
 
-from .scene_materials import MaterialSpec, material_library_from_config
+from .materials import MaterialSpec, material_library_from_config
+from .numbers import finite_number, finite_vector, strict_bool, strict_seed
 
 __all__ = [
     "FurnitureSpec",
@@ -63,13 +64,14 @@ def _as_float(mapping: Mapping[str, Any], key: str, *, default: float | None = N
                 "rather than 2.4e9)"
             )
         raise ValueError(f"{key!r} must be a number, got {value!r}{hint}")
-    return float(value)
+    return finite_number(value, key)
 
 
 def _as_pair(mapping: Mapping[str, Any], key: str) -> tuple[float, float]:
     value = mapping.get(key)
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ValueError(f"{key!r} must be a list of two numbers, got {value!r}")
+    finite_vector(value, 2, key)
     return (float(value[0]), float(value[1]))
 
 
@@ -77,10 +79,13 @@ def _as_triple(mapping: Mapping[str, Any], key: str) -> tuple[float, float, floa
     value = mapping.get(key)
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         raise ValueError(f"{key!r} must be a list of three numbers, got {value!r}")
+    finite_vector(value, 3, key)
     return (float(value[0]), float(value[1]), float(value[2]))
 
 
 def _reject_unknown(mapping: Mapping[str, Any], allowed: set[str], *, where: str) -> None:
+    if not isinstance(mapping, Mapping):
+        raise ValueError(f"{where}: expected a mapping")
     unknown = set(mapping) - allowed
     if unknown:
         raise ValueError(f"{where}: unsupported keys {sorted(unknown)}")
@@ -99,6 +104,9 @@ class OpeningSpec:
     leaf: bool = True
 
     def __post_init__(self) -> None:
+        for name in ("width", "height", "offset", "sill_height"):
+            finite_number(getattr(self, name), f"opening.{name}")
+        strict_bool(self.leaf, "opening.leaf")
         if self.wall not in WALL_FACES:
             raise ValueError(f"opening wall must be one of {WALL_FACES}, got {self.wall!r}")
         if self.kind not in OPENING_KINDS:
@@ -137,6 +145,20 @@ class FurnitureSpec:
     tags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        finite_vector(self.position, 2, f"{self.id}.position")
+        if self.size is not None:
+            finite_vector(self.size, 3, f"{self.id}.size", positive=True)
+        for name in (
+            "rotation_z_deg",
+            "elevation_m",
+            "density_kg_m3",
+            "static_friction",
+            "dynamic_friction",
+            "restitution",
+        ):
+            if getattr(self, name) is not None:
+                finite_number(getattr(self, name), f"{self.id}.{name}")
+        strict_bool(self.movable, f"{self.id}.movable")
         if not self.id.strip():
             raise ValueError("furniture id must be non-empty")
         if not self.kind.strip():
@@ -179,6 +201,11 @@ class RoomSpec:
     ceiling_enabled: bool = True
 
     def __post_init__(self) -> None:
+        finite_vector(self.origin, 2, f"{self.id}.origin")
+        finite_vector(self.size, 2, f"{self.id}.size", positive=True)
+        for name in ("wall_height", "wall_thickness", "floor_thickness", "ceiling_thickness"):
+            finite_number(getattr(self, name), f"{self.id}.{name}")
+        strict_bool(self.ceiling_enabled, f"{self.id}.ceiling")
         if not self.id.strip():
             raise ValueError("room id must be non-empty")
         if any(extent <= 0 for extent in self.size):
@@ -249,10 +276,18 @@ class SceneSpec:
     description: str = ""
     foundation: bool = True
     foundation_margin_m: float = 0.5
+    foundation_thickness_m: float = 0.30
     source_path: Path | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        finite_number(self.frequency_hz, "frequency_hz")
+        finite_number(self.foundation_margin_m, "foundation_margin_m")
+        finite_number(self.foundation_thickness_m, "foundation_thickness_m")
+        if self.foundation_margin_m < 0 or self.foundation_thickness_m <= 0:
+            raise ValueError("foundation margin must be non-negative and thickness positive")
+        strict_seed(self.seed)
+        strict_bool(self.foundation, "foundation")
         if not self.scene_id.strip():
             raise ValueError("scene_id must be non-empty")
         if not self.rooms:
@@ -326,6 +361,7 @@ def scene_spec_from_mapping(
             "seed",
             "foundation",
             "foundation_margin_m",
+            "foundation_thickness_m",
             "materials",
             "rooms",
         },
@@ -345,9 +381,10 @@ def scene_spec_from_mapping(
         rooms=rooms,
         materials=materials,
         frequency_hz=_as_float(payload, "frequency_hz", default=2.4e9),
-        seed=int(_as_float(payload, "seed", default=0.0)),
-        foundation=bool(payload.get("foundation", True)),
+        seed=strict_seed(payload.get("seed", 0)),
+        foundation=strict_bool(payload.get("foundation", True), "foundation"),
         foundation_margin_m=_as_float(payload, "foundation_margin_m", default=0.5),
+        foundation_thickness_m=_as_float(payload, "foundation_thickness_m", default=0.30),
         source_path=source_path,
     )
 
@@ -408,7 +445,7 @@ def _room_from_mapping(
         walls=walls,
         openings=tuple(_opening_from_mapping(entry, room_id) for entry in openings_payload),
         furniture=tuple(_furniture_from_mapping(entry, room_id) for entry in furniture_payload),
-        ceiling_enabled=bool(payload.get("ceiling", True)),
+        ceiling_enabled=strict_bool(payload.get("ceiling", True), f"{room_id}.ceiling"),
     )
 
 
@@ -443,7 +480,7 @@ def _opening_from_mapping(payload: Mapping[str, Any], room_id: str) -> OpeningSp
         height=_as_float(payload, "height"),
         offset=_as_float(payload, "offset"),
         sill_height=_as_float(payload, "sill_height", default=0.0),
-        leaf=bool(payload.get("leaf", True)),
+        leaf=strict_bool(payload.get("leaf", True), f"{room_id}.opening.leaf"),
     )
 
 
@@ -494,7 +531,7 @@ def _furniture_from_mapping(payload: Mapping[str, Any], room_id: str) -> Furnitu
         size=size,
         material=material,
         physics=physics,
-        density_kg_m3=None if density is None else float(density),
+        density_kg_m3=None if density is None else _as_float(payload, "density_kg_m3"),
         elevation_m=_as_float(payload, "elevation_m", default=0.0),
         static_friction=None
         if "static_friction" not in payload
@@ -503,7 +540,7 @@ def _furniture_from_mapping(payload: Mapping[str, Any], room_id: str) -> Furnitu
             None if "dynamic_friction" not in payload else _as_float(payload, "dynamic_friction")
         ),
         restitution=None if "restitution" not in payload else _as_float(payload, "restitution"),
-        movable=bool(payload.get("movable", physics == "dynamic")),
+        movable=strict_bool(payload.get("movable", physics == "dynamic"), f"{item_id}.movable"),
         tags=tuple(str(tag) for tag in tags_payload),
     )
 

@@ -2,7 +2,7 @@
 
 Everything here runs without Isaac Sim: the scene schema, the material library and
 the geometry planner are all pure Python. The USD authoring step is exercised
-separately by ``scripts/build_indoor_scene.py --headless``.
+separately by ``scripts/scenes/build.py --headless``.
 """
 
 from __future__ import annotations
@@ -13,16 +13,16 @@ from pathlib import Path
 import pytest
 import yaml
 
-from sim2sense_fall.scene_furniture import furniture_parts, known_furniture_kinds
-from sim2sense_fall.scene_materials import (
+from sim2sense_fall.scenes.furniture import furniture_parts, known_furniture_kinds
+from sim2sense_fall.scenes.materials import (
     DEFAULT_MATERIALS,
     MaterialSpec,
     material_library_from_config,
 )
-from sim2sense_fall.scene_planner import plan_scene, write_manifest
-from sim2sense_fall.scene_spec import SceneSpec, load_scene_spec, scene_spec_from_mapping
+from sim2sense_fall.scenes.planner import plan_scene, write_manifest
+from sim2sense_fall.scenes.spec import SceneSpec, load_scene_spec, scene_spec_from_mapping
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SCENE_CONFIG = REPO_ROOT / "configs" / "scenes" / "indoor_apartment.yaml"
 
 

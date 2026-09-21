@@ -6,17 +6,17 @@ Three ways to run it.
 1. CPU-only dry run -- no Isaac Sim needed, validates the scene file and writes
    the reproducibility manifest so a scene change can be reviewed in CI:
 
-       python3 scripts/build_indoor_scene.py --config configs/scenes/indoor_apartment.yaml
+       python3 scripts/scenes/build.py --dry-run --config configs/scenes/indoor_apartment.yaml
 
 2. Headless export inside Isaac Sim -- writes the ``.usda`` scene plus manifest:
 
-       ~/isaacsim/python.sh scripts/build_indoor_scene.py \\
+       ~/isaacsim/python.sh scripts/scenes/build.py \\
            --config configs/scenes/indoor_apartment.yaml --out artifacts/scenes --headless
 
 3. Interactive build -- same export, then opens the scene in the Isaac Sim GUI and
    steps physics for a few seconds so dynamic furniture can be watched settling:
 
-       ~/isaacsim/python.sh scripts/build_indoor_scene.py \\
+       ~/isaacsim/python.sh scripts/scenes/build.py \\
            --config configs/scenes/indoor_apartment.yaml --out artifacts/scenes --gui
 
 The scene is planned with pure Python *before* Isaac Sim boots, so an invalid
@@ -28,16 +28,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from sim2sense_fall.scene_planner import ScenePlan, plan_scene, write_manifest  # noqa: E402
-from sim2sense_fall.scene_spec import load_scene_spec  # noqa: E402
+from sim2sense_fall.scenes.planner import ScenePlan, plan_scene, write_manifest  # noqa: E402
+from sim2sense_fall.scenes.spec import load_scene_spec  # noqa: E402
 
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "scenes" / "indoor_apartment.yaml"
 DEFAULT_OUT_DIR = REPO_ROOT / "artifacts" / "scenes"
@@ -88,7 +89,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    for name in ("settle_seconds", "exit_after_seconds"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and non-negative")
+    if not args.name or Path(args.name).name != args.name or args.name in {".", ".."}:
+        parser.error("--name must be a file stem, not a path")
+    return args
 
 
 class Reporter:
@@ -173,7 +181,7 @@ def settle_physics(app: object, seconds: float) -> None:
 
     if seconds <= 0:
         return
-    from sim2sense_fall.isaac_scene import activate_physics, step_simulation
+    from sim2sense_fall.scenes.usd import activate_physics, step_simulation
 
     activation = activate_physics()
     LOGGER.info("physics scene %s on %s", activation["physics_scenes"], activation["active_engine"])
@@ -214,10 +222,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     usd_path = args.out / f"{args.name}.usda"
-    app = boot_isaac(headless=args.headless)
-    exit_code = 0
     try:
-        from sim2sense_fall.isaac_scene import (
+        app = boot_isaac(headless=args.headless)
+    except Exception as exc:
+        report(f"ERROR: Isaac Sim startup failed; use ~/isaacsim/python.sh: {exc}")
+        report.save(report_path)
+        return 1
+    exit_code = 1
+    try:
+        from sim2sense_fall.scenes.usd import (
             build_stage,
             rigid_body_world_positions,
             stage_summary,
@@ -242,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
             report(f"rigid body rest  : {json.dumps(positions)}")
             keep_window_open(report, app)
             run_gui(app, args.exit_after_seconds)
+        exit_code = 0
     except Exception as exc:  # noqa: BLE001 - reported to the console and the report file
         LOGGER.exception("scene build failed")
         report(f"ERROR: {type(exc).__name__}: {exc}")
@@ -250,8 +264,13 @@ def main(argv: list[str] | None = None) -> int:
         # The report must be written before the runtime shuts down: Isaac Sim's
         # fast shutdown terminates the interpreter, so anything after close() is
         # lost.
-        report.save(report_path)
-        app.close()
+        try:
+            report.save(report_path)
+        except OSError:
+            LOGGER.exception("could not save build report")
+            exit_code = 1
+        finally:
+            app.close(exit_code=exit_code)
     return exit_code
 
 

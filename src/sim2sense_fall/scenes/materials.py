@@ -29,6 +29,8 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
+from .numbers import finite_number, finite_vector
+
 __all__ = [
     "DEFAULT_MATERIALS",
     "ITUMaterial",
@@ -38,6 +40,7 @@ __all__ = [
 
 
 def _require_unit_interval(name: str, value: float) -> None:
+    finite_number(value, name)
     if not 0.0 <= value <= 1.0:
         raise ValueError(f"{name} must be within [0, 1], got {value!r}")
 
@@ -56,6 +59,12 @@ class ITUMaterial:
     c: float
     d: float
 
+    def __post_init__(self) -> None:
+        for name in ("a", "b", "c", "d"):
+            finite_number(getattr(self, name), f"ITU.{name}")
+        if self.a <= 0 or self.c < 0:
+            raise ValueError("ITU a must be positive and c non-negative")
+
     def relative_permittivity(self, frequency_hz: float) -> float:
         """Real part of the relative permittivity at ``frequency_hz``."""
 
@@ -68,6 +77,7 @@ class ITUMaterial:
 
     @staticmethod
     def _ghz(frequency_hz: float) -> float:
+        finite_number(frequency_hz, "frequency_hz")
         if frequency_hz <= 0:
             raise ValueError(f"frequency_hz must be positive, got {frequency_hz!r}")
         return frequency_hz / 1e9
@@ -91,6 +101,8 @@ class MaterialSpec:
     note: str = ""
 
     def __post_init__(self) -> None:
+        finite_number(self.thickness_m, f"{self.name}.thickness_m")
+        finite_number(self.density_kg_m3, f"{self.name}.density_kg_m3")
         if not self.name.strip():
             raise ValueError("material name must be non-empty")
         if len(self.base_color) != 3:
@@ -367,6 +379,7 @@ def _apply_patch(spec: MaterialSpec, patch: dict[str, Any]) -> MaterialSpec:
     values: dict[str, Any] = {}
     for key, value in patch.items():
         if key == "base_color":
+            finite_vector(value, 3, f"{spec.name}.base_color")
             value = tuple(float(channel) for channel in value)
         values[key] = value
     return dataclasses.replace(spec, **values)

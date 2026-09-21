@@ -143,3 +143,73 @@
    `ChannelSample` 并完成 CPU schema 校验。
 5. 复核代理电磁材质与已安装 Sionna 版本 `itu_*` 数值的一致性。
 6. 上游没有 LICENSE，先与仓库所有者确认许可范围，再考虑任何对外分发。
+
+## 2026-09-21 — 室内 USD 验收：证据采集
+
+- 已读取计划、配置、场景规划/导出/查看/验证代码和现有 27 项测试。
+- `python` 不存在（`command not found`），改用 `python3`：27 tests passed，compileall 通过；CPU dry-run 输出另存 `artifacts/acceptance/cpu/`，未覆盖既有产物。
+- `uv tool run ruff check .` 被 snap 环境阻止：`required permitted capability cap_dac_override not found`。使用已安装的 `/home/gsh/.local/bin/ruff check .`：通过。
+- GPU 读取报 `NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver`；提权的只读 `nvidia-smi` 未执行，自动审批服务报 `503 Service Unavailable`，属于审批服务故障而非安全拒绝。
+- Isaac 原验证脚本实际运行成功，14 项 PASS（`artifacts/acceptance/isaac_verify.log`），PhysX 使用 CPU 回退；日志同时报 `NVML_ERROR_DRIVER_NOT_LOADED`、`No device could be created`、`Failed to open display`。这能证明本轮物理 smoke test 通过，不能证明 GPU 渲染或 GUI 正常。
+- 直接导入 pxr 首次报缺包，其后报 `libusd_tf.so` 缺失；显式配置本机 bundled USD Python 和动态库路径后，OpenUSD 0.25.11 成功读取实际 USD：344 prim / 231 geometry / 0 camera。
+- 实际几何坐标确认六块吊顶覆盖全部房间；发现地基地面重合、地毯穿墙/越界、冰箱穿墙。验收结论尚待汇总。
+
+### 验收阶段 2 完成：问题复现与内部查看
+
+- 已用实际 USD 包围盒验证越界/穿墙；当前全部家具仅有轴对齐或 90° 倍数旋转，因此所报告盒体与墙的交集为真实盒体体积交集，不是任意旋转 AABB 的误报。
+- 故意传入不存在的 manifest，Isaac 验证日志明确 `verification: FAILED`，但命令退出码仍为 **0**。`SimulationApp.close()` 默认 fast shutdown 且默认 `exit_code=0`，吞掉了后续返回值。这一验收门禁漏洞尚未修复。
+- 配置反例均被错误接受：家具位置 NaN（manifest 含 NaN）、`same-name` 与 `same_name` 清洗后路径冲突（244 规划图元只有 238 个唯一路径）、0.05 m 床尺寸生成负床垫/枕头尺寸。
+- 新增 `scene_view.py` 与查看器 `--view top|roofless|exterior`；默认去顶俯视，临时 session layer 隐藏屋顶与灯具，保留原文件和碰撞体。
+- 系统 Python：28 passed / 1 skipped（缺少 pxr）；Isaac bundled Python 追加本机 pytest 所在目录后，2 项查看模块测试 passed，覆盖图层隔离、碰撞体保留、模式切换和相机包含地板四角。首次 bundled Python 测试报 `No module named pytest`，已用本机既有测试包完成，无下载。
+- compileall 和本地 ruff 通过。新增查看器的 GPU/GUI 尚未验证。
+
+### 验收阶段 3 完成：报告与最终验证
+
+- 完成 `docs/indoor-scene-review.md`：6 项可复现待修缺陷、研究用途边界、证据位置与整改顺序。
+- 重新 headless 导出到 `artifacts/acceptance/rebuilt/` 成功，USD SHA-256 与原件完全相同：`2e5fb8ec7523e972b5ef3ffb7f545a1078ffbf43480fc208e5f801c783cf86cb`。
+- 三种新查看模式在 Isaac 无界面下完成视口集成：相机切换正确；top/roofless 隐藏 6 块吊顶，exterior 恢复；231 碰撞体保留；源文件哈希不变。见 `inspection_view_checks.json` / `inspection_view.log`。没有 GPU 画面输出，GUI/RTX 视觉仍待验证。
+- 从实际 USD 生成并检查了对比图与布局标注图；三维预览采用 CPU 深度缓冲，图上明确标注不是 RTX 截图。
+- `task_plan.md` 当前状态已从“场景任务完成”改为“基础构建完成、整体验收需整改”。生成资产未加入 Git，未提交/推送；用户已有 `.workbuddy/` 保持未跟踪。
+
+## 室内验收整改 — 实现与 CPU 回归
+
+- R1：构建/验证/查看入口把最终错误码传给 `SimulationApp.close(exit_code=...)`；启动失败明确报错。验证器先检查清单，并拒绝 0/NaN 时长及无效落差对照。
+- R2：地基上表面位于最厚地板底面，厚度改由 `foundation_thickness_m` 配置；较薄地板下增加混凝土找平层，所有行走表面仍为 z=0。
+- R3/R4：三块地毯明确适配房间的尺寸，冰箱旋转 180° 使门/把手朝室内。增加 CPU 世界几何校验，处理动态家具父变换、旋转盒体与圆柱体，拒绝越界和穿墙；允许接触以及地毯与家具的合理叠放。
+- R5/R6：完整计划检查规范化路径唯一性；配置和派生零件检查有限数值与正尺寸；JSON 禁止 NaN/Infinity。
+- 验证器移除 344/231 等固定计数，以清单逐图元比较世界变换、尺寸、标签、碰撞、刚体质量以及渲染/物理/电磁材质。
+- 实现后的第一轮 CPU 回归：70 passed / 1 skipped；ruff 通过。新增子进程测试模拟 Kit 立即退出，确认构建/验证的启动异常与运行期异常均返回 1。
+
+### USD 与运行时复验
+
+- 真实 OpenUSD 回归 9 项通过：完整导出匹配、地板/地基分离、6 种同计数错误资产被拒绝，以及此前查看模式测试。
+- 完整系统测试：70 passed / 8 skipped（8 项需要 pxr 的测试已在 bundled USD 环境实际执行）；compileall 通过。
+- `uv tool run ruff check .` 本轮报 DBus：`Process 2 is a kernel thread, refusing.`；已安装 `/home/gsh/.local/bin/ruff check .` 通过。
+- 首次 Isaac headless 构建因无 GPU 触发图形错误弹窗，60 s 超时（退出 124）；其后验证因 USD 尚不存在而非零退出。改为 `DISPLAY= WAYLAND_DISPLAY=` 后 CPU 回退构建成功。
+- GPU 提权只读检查仍被自动审批服务 503 阻止，未执行；没有绕过审批或修改系统驱动。
+- 修复后的 USD 在 Isaac CPU 回退下通过 10 项检查，含逐图元/材质匹配、椅子稳定、0.25 m 抬升回落、源文件不变；退出码 0。
+
+### 整改完成与默认资产更新
+
+- 实际 Isaac 运行期负例（旧 USD / 新 manifest）返回 1，准确识别地基、三块地毯、冰箱的变换差异，确认不再出现失败返回成功。
+- 已把通过验证的 USD/清单更新到默认 `artifacts/scenes/`；旧版本备份在 `artifacts/remediation/before/`。新 USD SHA-256 为 `38f062c3ca9d54e5ab8f2b2cc7428ce06cb85c7933d74530a3c3452958403b86`。
+- 更新后实际 USD 几何审计：家具越界、家具/墙体体积交集均为空；地基顶面 -0.12 m，与地板底面接触，行走面仍为 0 m。
+- 已生成并逐张检查修复后的 CPU 立体预览和平面图；未把 CPU 预览写成 RTX 截图。
+- `docs/indoor-scene-remediation.md` 汇总六项闭环、测试结果、资产/源码哈希和后续边界；`task_plan.md`、研究笔记与场景文档已同步。未提交或推送。
+
+## 场景目录整理 — 迁移完成
+
+- 可复用实现迁入 `src/sim2sense_fall/scenes/`，三个入口迁入 `scripts/scenes/`，对应测试迁入 `tests/scenes/`。
+- 同步模块导入、脚本仓库定位、测试子进程与当前文档；旧入口不保留兼容副本。
+- 首轮 CPU 回归 70 passed / 8 skipped；下一步复验实际 USD 与物理行为。
+
+### 目录整理 — 回归完成
+
+- CPU 测试 70 passed / 8 skipped；bundled OpenUSD 测试 9 passed（包含被跳过的 8 项）。compileall、已安装 Ruff、diff 空白检查通过。
+- `uv tool run ruff check .` 退出 46，实际错误仍为 DBus `Process 2 is a kernel thread, refusing.`，使用 `/home/gsh/.local/bin/ruff check .` 完成检查。
+- 新入口 CPU 构建/清单验证通过；从 `/tmp` 使用绝对路径构建及查看帮助成功，验证迁移后的仓库定位。包发现包含 `sim2sense_fall.scenes`。
+- Isaac 构建和验证均退出 0，物理/资产 10 项 PASS；日志有 `NVML_ERROR_DRIVER_NOT_LOADED`、`No usable CUDA device`，实际使用 CPU 回退，GPU/GUI 视觉未复验。
+- USD SHA-256 仍为 `38f062c3ca9d54e5ab8f2b2cc7428ce06cb85c7933d74530a3c3452958403b86`，与迁移前逐字节一致。清单仅 generator 改为 `sim2sense_fall.scenes.planner`，默认清单已同步。
+- YAML 仅材质模块路径注释变化，当前 SHA-256 为 `34109c0df85b82ad86d7fc367cc3beaca0b730361444a5e93814407df0e59d83`；历史验收报告的旧配置/清单哈希保留。
+- 本轮为固定场景回归，无数据集划分、无模型；场景 `apartment_cn_two_bedroom`，seed=20260921，2.4 GHz。物理指标沿用整改记录：静置/回落各 3 s，抬升 0.25 m，最大轴向误差容限 0.02 m。
+- 日志和含源码/资产哈希的摘要在 `artifacts/reorganization/`。场景配置与产物目录保持清晰边界，文档和协作指令已同步。

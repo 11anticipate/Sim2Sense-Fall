@@ -3,7 +3,7 @@
 Planning is deliberately separated from authoring. :func:`plan_scene` is pure
 Python and runs on any CPU, so wall segmentation, opening placement, furniture
 assembly and the reproducibility manifest can all be unit-tested and reviewed in
-a normal CI environment. Only :mod:`sim2sense_fall.isaac_scene` needs the USD
+a normal CI environment. Only :mod:`sim2sense_fall.scenes.usd` needs the USD
 runtime, and it consumes this plan verbatim.
 
 Geometry conventions
@@ -49,8 +49,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from .scene_furniture import Part, furniture_default_size, furniture_parts
-from .scene_spec import FurnitureSpec, OpeningSpec, RoomSpec, SceneSpec
+from .furniture import Part, furniture_default_size, furniture_parts
+from .numbers import finite_number, finite_vector, strict_seed
+from .spec import FurnitureSpec, OpeningSpec, RoomSpec, SceneSpec
 
 __all__ = [
     "LightSpec",
@@ -111,6 +112,28 @@ class ScenePrim:
     tags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        finite_vector(self.center, 3, f"{self.path}.center")
+        finite_vector(self.size, 3, f"{self.path}.size", positive=self.is_geometry)
+        for name in (
+            "rotation_z_deg",
+            "density_kg_m3",
+            "static_friction",
+            "dynamic_friction",
+            "restitution",
+        ):
+            finite_number(getattr(self, name), f"{self.path}.{name}")
+        if self.density_kg_m3 < 0:
+            raise ValueError(f"{self.path}: density must be non-negative")
+        if self.mass_kg is not None:
+            if finite_number(self.mass_kg, f"{self.path}.mass_kg") <= 0:
+                raise ValueError(f"{self.path}: mass must be positive")
+        for name in ("static_friction", "dynamic_friction", "restitution"):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{self.path}: {name} must be within [0, 1]")
+        if self.dynamic_friction > self.static_friction:
+            raise ValueError(f"{self.path}: dynamic friction cannot exceed static friction")
+        if self.is_cylinder and self.size[0] != self.size[1]:
+            raise ValueError(f"{self.path}: cylinder diameters must match")
         if self.shape not in {"box", "cylinder", BODY_SHAPE}:
             raise ValueError(f"{self.path}: unsupported shape {self.shape!r}")
         if self.is_body and self.collision:
@@ -185,6 +208,15 @@ class LightSpec:
     rotation_euler_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
     room_id: str | None = None
 
+    def __post_init__(self) -> None:
+        finite_vector(self.position, 3, f"{self.path}.position")
+        finite_vector(self.rotation_euler_deg, 3, f"{self.path}.rotation")
+        finite_vector(self.color, 3, f"{self.path}.color")
+        if finite_number(self.intensity, "intensity") < 0:
+            raise ValueError("light intensity must be non-negative")
+        if finite_number(self.radius_m, "radius_m") <= 0:
+            raise ValueError("light radius must be positive")
+
     def as_manifest_entry(self) -> dict[str, Any]:
         return {
             "path": self.path,
@@ -211,6 +243,16 @@ class ScenePlan:
     materials: Mapping[str, Mapping[str, Any]]
     stats: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if finite_number(self.frequency_hz, "frequency_hz") <= 0:
+            raise ValueError("frequency_hz must be positive")
+        strict_seed(self.seed)
+        paths: set[str] = set()
+        for item in (*self.prims, *self.lights):
+            if item.path in paths:
+                raise ValueError(f"duplicate normalized prim path: {item.path}")
+            paths.add(item.path)
+
     @property
     def bodies(self) -> tuple[ScenePrim, ...]:
         return tuple(prim for prim in self.prims if prim.is_body)
@@ -221,7 +263,7 @@ class ScenePlan:
             "description": self.description,
             "seed": self.seed,
             "frequency_hz": self.frequency_hz,
-            "generator": "sim2sense_fall.scene_planner",
+            "generator": "sim2sense_fall.scenes.planner",
             "materials": {name: dict(entry) for name, entry in self.materials.items()},
             "stats": dict(self.stats),
             "lights": [light.as_manifest_entry() for light in self.lights],
@@ -235,7 +277,7 @@ def write_manifest(plan: ScenePlan, path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        json.dumps(plan.as_manifest(), indent=2, ensure_ascii=False) + "\n",
+        json.dumps(plan.as_manifest(), indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     return target
@@ -553,7 +595,10 @@ def _resolve_parts(item: FurnitureSpec, materials: Mapping[str, Any]) -> list[Pa
         raise ValueError(
             f"{item.id}: kind {item.kind!r} has no built-in recipe and no explicit 'size'"
         )
-    parts = furniture_parts(item.kind, size, item.material or "wood_furniture")
+    try:
+        parts = furniture_parts(item.kind, size, item.material or "wood_furniture")
+    except ValueError as exc:
+        raise ValueError(f"furniture {item.id}: {exc}") from exc
     if item.material:
         dominant = max(parts, key=lambda part: _volume(part.shape, part.size)).material
         parts = [
@@ -664,7 +709,8 @@ def _furniture_prims(
 def _foundation_prim(spec: SceneSpec) -> ScenePrim:
     x_min, y_min, x_max, y_max = spec.footprint
     margin = spec.foundation_margin_m
-    thickness = 0.30
+    thickness = spec.foundation_thickness_m
+    top = -max(room.floor_thickness for room in spec.rooms)
     material_name = "concrete_slab" if "concrete_slab" in spec.materials else "wood_floor"
     material = spec.materials[material_name]
     return _static_prim(
@@ -672,7 +718,7 @@ def _foundation_prim(spec: SceneSpec) -> ScenePrim:
         name="foundation slab",
         category="ground",
         shape="box",
-        center=((x_min + x_max) / 2, (y_min + y_max) / 2, -thickness / 2),
+        center=((x_min + x_max) / 2, (y_min + y_max) / 2, top - thickness / 2),
         size=(x_max - x_min + 2 * margin, y_max - y_min + 2 * margin, thickness),
         rotation_z_deg=0.0,
         material=material_name,
@@ -723,6 +769,25 @@ def plan_scene(spec: SceneSpec) -> ScenePlan:
         prims.append(_foundation_prim(spec))
 
     for room in spec.rooms:
+        # One level foundation supports the thickest floor. Fill beneath thinner
+        # floors so all walking surfaces stay at z=0 without gaps or overlaps.
+        if spec.foundation:
+            maximum = max(entry.floor_thickness for entry in spec.rooms)
+            fill = maximum - room.floor_thickness
+            if fill > 1e-9:
+                material = spec.materials[prims[0].material]
+                prims.append(
+                    _slab_prim(
+                        room,
+                        "subfloor",
+                        "ground",
+                        -maximum + fill / 2,
+                        fill,
+                        material.name,
+                        _physics_of(material),
+                        semantic="subfloor",
+                    )
+                )
         prims.append(
             _slab_prim(
                 room,
@@ -760,7 +825,7 @@ def plan_scene(spec: SceneSpec) -> ScenePlan:
 
     _add_global_lights(lights, spec)
     used = sorted({prim.material for prim in prims if prim.material is not None})
-    return ScenePlan(
+    plan = ScenePlan(
         scene_id=spec.scene_id,
         frequency_hz=spec.frequency_hz,
         seed=spec.seed,
@@ -772,6 +837,10 @@ def plan_scene(spec: SceneSpec) -> ScenePlan:
         },
         stats=_accumulate_stats(prims, lights, spec),
     )
+    from .geometry import validate_layout
+
+    validate_layout(plan, spec)
+    return plan
 
 
 def _add_global_lights(lights: list[LightSpec], spec: SceneSpec) -> None:

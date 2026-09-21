@@ -22,8 +22,9 @@ frequency_hz: 2.4e+9   # YAML 1.1 的浮点指数必须带符号；写成 2.4e9 
 seed: 20260921
 foundation: true
 foundation_margin_m: 0.5
+foundation_thickness_m: 0.30
 
-# 材质覆盖示例：不写 materials 时全部使用 scene_materials.py 中的默认值。
+# 材质覆盖示例：不写 materials 时全部使用 src/sim2sense_fall/scenes/materials.py 中的默认值。
 # 这里的写法只覆盖列出的字段，其余字段沿用默认。
 materials:
   tile_floor:
@@ -73,6 +74,7 @@ rooms:
       - id: rug
         kind: rug
         position: [2.55, 1.55]
+        size: [1.80, 2.50, 0.012]
         rotation_z_deg: 0.0
         tags: [soft_surface, fall_risk_medium]
       - id: ceiling_lamp
@@ -135,6 +137,7 @@ rooms:
       - id: rug
         kind: rug
         position: [2.60, 1.50]
+        size: [2.00, 2.50, 0.012]
         rotation_z_deg: 0.0
         tags: [soft_surface]
       - id: ceiling_lamp
@@ -175,6 +178,7 @@ rooms:
       - id: rug
         kind: rug
         position: [7.50, 0.60]
+        size: [1.40, 0.80, 0.012]
         rotation_z_deg: 0.0
         tags: [soft_surface, entrance]
       - id: ceiling_lamp
@@ -287,7 +291,7 @@ rooms:
       - id: refrigerator
         kind: refrigerator
         position: [2.50, 2.30]
-        rotation_z_deg: 0.0
+        rotation_z_deg: 180.0  # 门和把手朝室内，完整外廓避开北墙
         tags: [appliance, tall]
       - id: ceiling_lamp
         kind: ceiling_lamp

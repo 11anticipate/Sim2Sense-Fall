@@ -3,13 +3,13 @@
 ```text
 场景资产（CPU 可复现）
   ├─ configs/scenes/*.yaml       房间尺寸、墙体归属、门窗开口、家具、材质覆盖
-  ├─ scene_spec.py               schema + 快速失败校验
-  ├─ scene_materials.py          视觉 / 力学 / 电磁 三类属性
-  ├─ scene_furniture.py          参数化家具配方
-  └─ scene_planner.py            墙体分段、开口、家具 → ScenePrim 列表 + 清单
+  ├─ scenes/spec.py               schema + 快速失败校验
+  ├─ scenes/materials.py          视觉 / 力学 / 电磁 三类属性
+  ├─ scenes/furniture.py          参数化家具配方
+  └─ scenes/planner.py            墙体分段、开口、家具 → ScenePrim 列表 + 清单
           │ ScenePlan（纯数据，无 Isaac 依赖）
           ▼
-isaac_scene.py → /World USD
+scenes/usd.py → /World USD
   ├─ 几何：Cube / Cylinder，Z-up，单位米
   ├─ 碰撞：UsdPhysics.CollisionAPI（全量）
   ├─ 刚体：RigidBodyAPI + MassAPI（仅动态家具，组合刚体）
@@ -51,11 +51,14 @@ Sionna RT
 - `simulators.py` 只定义适配器协议和 dry-run；真实仿真实现应放到独立模块，记录确切版本和场景配置。
 - `windowing.py` 是 CPU 可运行的报警基线，不代表最终模型性能。
 - 后续模型代码必须接收 `ChannelSample` 或其派生张量，不直接读取 USD、视频或任意目录中的隐式文件。
-- 场景侧同样是「规划 / 落地」分离：`scene_spec.py`、`scene_materials.py`、
-  `scene_furniture.py`、`scene_planner.py` 是纯 Python，可在没有 Isaac Sim 的机器上单测和评审；
-  只有 `isaac_scene.py` 需要 USD/Isaac 运行时，并且 `pxr` 是惰性导入。
+- 场景侧同样是「规划 / 落地」分离：`scenes/spec.py`、`scenes/materials.py`、
+  `scenes/furniture.py`、`scenes/planner.py` 是纯 Python，可在没有 Isaac Sim 的机器上单测和评审；
+  `scenes/geometry.py` 和 `scenes/numbers.py` 提供 CPU 校验；
+  `scenes/usd.py`、`scenes/view.py` 和 `scenes/verification.py` 的运行时操作需要 USD/Isaac，`pxr` 均惰性导入。
+- 场景实现集中在 `src/sim2sense_fall/scenes/`；`scripts/scenes/` 负责命令行和应用生命周期，
+  `tests/scenes/` 对应场景回归。配置仍在 `configs/scenes/`，产物仍在 `artifacts/scenes/`。
 - 场景的消费边界是 `ScenePlan`（不可变数据）和导出的 USD；下游不应该反过来依赖
-  `scene_planner` 的内部函数。
+  `scenes.planner` 的内部函数。
 
 ## 关键风险
 

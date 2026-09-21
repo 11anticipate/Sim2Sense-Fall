@@ -1,8 +1,8 @@
-"""Author a :class:`~sim2sense_fall.scene_planner.ScenePlan` as a USD stage.
+"""Author a :class:`~sim2sense_fall.scenes.planner.ScenePlan` as a USD stage.
 
 This is the only module in the scene pipeline that needs a USD runtime, and the
 USD import is deferred into a function so that ``import
-sim2sense_fall.isaac_scene`` never fails on a machine without Isaac Sim.
+sim2sense_fall.scenes.usd`` never fails on a machine without Isaac Sim.
 
 What gets authored
 ------------------
@@ -25,7 +25,7 @@ exact dimensions from the plan.
 
 Usage (inside Isaac Sim's bundled Python)::
 
-    from sim2sense_fall.isaac_scene import build_stage, stage_summary
+    from sim2sense_fall.scenes.usd import build_stage, stage_summary
     build_stage(plan, "artifacts/scenes/indoor_apartment.usda")
 """
 
@@ -36,7 +36,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from .scene_planner import ScenePlan, ScenePrim
+from .planner import ScenePlan, ScenePrim
 
 __all__ = [
     "IsaacRuntimeUnavailable",
@@ -71,7 +71,7 @@ def pxr_modules() -> SimpleNamespace:
     except ImportError as exc:  # pragma: no cover - depends on the host runtime
         raise IsaacRuntimeUnavailable(
             "USD modules are unavailable; run this script through Isaac Sim's bundled "
-            "interpreter, for example: ~/isaacsim/python.sh scripts/build_indoor_scene.py"
+            "interpreter, for example: ~/isaacsim/python.sh scripts/scenes/build.py"
         ) from exc
     return SimpleNamespace(
         Gf=Gf,

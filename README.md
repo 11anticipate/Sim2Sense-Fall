@@ -52,23 +52,33 @@
 │   ├── data-contract.md      # CSI/CIR 样本契约
 │   ├── indoor-scene.md       # 室内场景构建、导出与 GUI 查看
 │   └── progress.md           # 阶段日志、验证结果和阻塞项
-├── scripts/
-│   ├── build_indoor_scene.py     # 场景构建入口（dry-run / headless / GUI）
-│   ├── view_indoor_scene.py      # 在 Isaac Sim GUI 中打开已导出场景
-│   └── verify_indoor_scene.py    # 场景与物理 smoke test
+├── scripts/scenes/           # 场景操作入口
+│   ├── build.py              # 构建（CPU dry-run / headless / GUI）
+│   ├── view.py               # 查看（俯视去顶 / 斜视去顶 / 外观）
+│   └── verify.py             # 清单、USD 与物理验收
 ├── src/sim2sense_fall/
-│   ├── schema.py              # 样本与事件数据结构
-│   ├── validation.py          # 数据契约检查
-│   ├── windowing.py           # 流式窗口和报警事件聚合
-│   ├── simulators.py          # Isaac/Sionna 适配器协议与 dry-run
-│   ├── scene_materials.py     # 视觉 / 力学 / 电磁三类材质属性
-│   ├── scene_spec.py          # 场景 schema、YAML 加载与校验
-│   ├── scene_furniture.py     # 参数化家具配方
-│   ├── scene_planner.py       # CPU 几何规划与可复现清单
-│   └── isaac_scene.py         # USD 落地（几何/碰撞/刚体/材质/灯光）
+│   ├── schema.py             # 样本与事件数据结构
+│   ├── validation.py         # 数据契约检查
+│   ├── windowing.py          # 流式窗口和报警事件聚合
+│   ├── simulators.py         # Isaac/Sionna 适配器协议与 dry-run
+│   └── scenes/               # 可复用场景实现
+│       ├── __init__.py       # CPU 公共接口
+│       ├── spec.py           # 场景 schema、YAML 加载与校验
+│       ├── materials.py      # 视觉 / 力学 / 电磁材质
+│       ├── furniture.py      # 参数化家具配方
+│       ├── planner.py        # CPU 几何规划与清单
+│       ├── numbers.py        # 数值边界校验
+│       ├── geometry.py       # 世界坐标、越界与穿墙检查
+│       ├── usd.py            # USD 导出与物理激活
+│       ├── view.py           # 临时查看相机与去顶显示
+│       └── verification.py   # USD 与清单逐项核对
 ├── tests/
 │   ├── test_core.py
-│   └── test_scenes.py
+│   └── scenes/               # 场景单测与回归
+│       ├── test_scenes.py
+│       ├── test_scene_regressions.py
+│       ├── test_scene_usd.py
+│       └── test_scene_view.py
 └── .gitignore
 ```
 
@@ -97,16 +107,16 @@ Isaac Sim 和 Sionna 是可选运行时，不在基础安装中强制拉取。�
 
 ```bash
 # 校验场景并写出可复现清单（不需要 Isaac Sim）
-python3 scripts/build_indoor_scene.py --dry-run
+python3 scripts/scenes/build.py --dry-run
 
 # 导出 USD（headless）
-~/isaacsim/python.sh scripts/build_indoor_scene.py --headless
+~/isaacsim/python.sh scripts/scenes/build.py --headless
 
-# 物理 smoke test（12 项检查，退出码 0 表示通过）
-~/isaacsim/python.sh scripts/verify_indoor_scene.py --settle-seconds 3
+# 场景与物理 smoke test（退出码 0 表示通过）
+~/isaacsim/python.sh scripts/scenes/verify.py --settle-seconds 3
 
 # 用 Isaac Sim GUI 查看已导出的场景
-~/isaacsim/python.sh scripts/view_indoor_scene.py --activate-physics --settle-seconds 2
+~/isaacsim/python.sh scripts/scenes/view.py --activate-physics --settle-seconds 2
 ```
 
 导出产物写在 `artifacts/scenes/`（`.gitignore` 已排除）：`indoor_apartment.usda`、

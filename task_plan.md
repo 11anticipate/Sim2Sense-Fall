@@ -45,9 +45,9 @@
 
 ## 当前状态
 
-**室内场景任务已完成**：`configs/scenes/indoor_apartment.yaml` 描述的 6 房间住宅可导出为
+**室内场景 R1–R6 整改完成，已通过 CPU、实际 USD 和物理复验**：`configs/scenes/indoor_apartment.yaml` 描述的 6 房间住宅可导出为
 `artifacts/scenes/indoor_apartment.usda`（232 图元 / 231 碰撞体 / 14 材质），
-物理 smoke test 12 项全通过。构建与 GUI 查看指令见 [`docs/indoor-scene.md`](docs/indoor-scene.md)。
+当前验收器 10 项检查通过（CPU 回退），失败负例实际返回非零；详见 `docs/indoor-scene-remediation.md`。构建与 GUI 查看指令见 [`docs/indoor-scene.md`](docs/indoor-scene.md)。
 
 ## 室内场景子任务
 
@@ -62,3 +62,30 @@
 3. 接入 Sionna RT，把 `/World` 下的几何与 `sim2sense:em_*` 材质映射成传播场景，生成首条 `ChannelSample`。
 4. 复核 `tile_floor`、`ceramic_sanitary`、`carpet`、`upholstery` 等代理电磁材质与实际
    Sionna 版本 `itu_*` 数值的一致性。
+
+## 2026-09-21 室内 USD 批判性验收
+
+- [x] 核对现有 USD、配置、查看入口和测试覆盖，复现内部不可见问题。
+- [x] 检查布局、物理与参数边界，运行 CPU 检查和可用的 Isaac 验证。
+- [x] 交付验收报告与可查看的内部证据，更新进度和研究笔记。
+
+首次验收结论为需整改；现 R1–R6 已修复，查看入口提供临时去顶俯视/斜视；GPU/GUI 视觉待有显示环境复验。
+
+上述整改已完成，原始缺陷证据保留在 `docs/indoor-scene-review.md`；当前修复与复验见 `docs/indoor-scene-remediation.md`。
+
+## 验收整改 R1–R6
+
+- [x] 修复运行入口错误退出码，增加进程级负例；让验证依据 manifest 而非固定计数。
+- [x] 修复地基层叠与家具布局，增加 CPU 几何越界/穿墙检查。
+- [x] 严格校验有限数值、派生尺寸和规范化路径，加入回归测试。
+- [x] 重新构建 USD、执行 CPU/Isaac 验证、刷新预览及整改记录。
+
+范围：先完成当前固定室内场景可靠性基础；人体、Sionna、门铰链和机器人导航仍为后续阶段。
+
+## 场景代码目录整理
+
+- [x] 将场景实现集中到 `src/sim2sense_fall/scenes/`，入口集中到 `scripts/scenes/`，测试集中到 `tests/scenes/`。
+- [x] 同步导入、仓库路径定位及当前使用文档，保留历史验收记录的证据语义。
+- [x] 执行 CPU、OpenUSD 和 Isaac 回归，并确认目录迁移没有改变场景几何。
+
+目录整理已完成：CPU 70 passed / 8 skipped，bundled USD 9 passed，Isaac CPU 回退 10 项 PASS；新旧 USD 字节一致。当前入口统一见 `scripts/scenes/`，详细证据见 `docs/progress.md`。

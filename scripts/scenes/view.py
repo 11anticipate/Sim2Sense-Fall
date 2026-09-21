@@ -3,11 +3,11 @@
 
 This is the convenience wrapper around Isaac Sim's standalone launcher. It does
 not rebuild anything -- it opens the ``.usda`` produced by
-``scripts/build_indoor_scene.py`` and keeps the viewport alive until the window is
+``scripts/scenes/build.py`` and keeps the viewport alive until the window is
 closed.
 
-    ~/isaacsim/python.sh scripts/view_indoor_scene.py
-    ~/isaacsim/python.sh scripts/view_indoor_scene.py --usd artifacts/scenes/indoor_apartment.usda
+    ~/isaacsim/python.sh scripts/scenes/view.py
+    ~/isaacsim/python.sh scripts/scenes/view.py --usd artifacts/scenes/indoor_apartment.usda
 
 The equivalent manual route, if you prefer to use Isaac Sim's own launcher, is:
 
@@ -25,7 +25,7 @@ import logging
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -38,6 +38,12 @@ LOGGER = logging.getLogger("view_indoor_scene")
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Open an exported scene in the Isaac Sim GUI.")
     parser.add_argument("--usd", type=Path, default=DEFAULT_USD, help="USD scene to open")
+    parser.add_argument(
+        "--view",
+        choices=["top", "roofless", "exterior"],
+        default="top",
+        help="inspection view: top (default), roofless oblique, or closed exterior",
+    )
     parser.add_argument(
         "--settle-seconds",
         type=float,
@@ -72,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     if not usd_path.is_file():
         print(f"scene not found: {usd_path}", file=sys.stderr)
         print(
-            "build it first:\n  ~/isaacsim/python.sh scripts/build_indoor_scene.py --headless",
+            "build it first:\n  ~/isaacsim/python.sh scripts/scenes/build.py --headless",
             file=sys.stderr,
         )
         return 2
@@ -85,9 +91,25 @@ def main(argv: list[str] | None = None) -> int:
     app = SimulationApp(
         {"headless": False, "width": 1600, "height": 900, "open_usd": str(usd_path)}
     )
+    exit_code = 1
     try:
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        from sim2sense_fall.scenes.view import configure_inspection_view
+
+        for _ in range(5):
+            app.update()
+        camera_path = configure_inspection_view(
+            omni.usd.get_context().get_stage(), mode=args.view, aspect_ratio=1600 / 900
+        )
+        viewport = get_active_viewport()
+        if viewport is None:
+            raise RuntimeError("Isaac Sim did not create an active viewport")
+        viewport.camera_path = camera_path
+        LOGGER.info("inspection view: %s (temporary session layer)", args.view)
         if args.activate_physics or args.settle_seconds > 0:
-            from sim2sense_fall.isaac_scene import activate_physics, step_simulation
+            from sim2sense_fall.scenes.usd import activate_physics, step_simulation
 
             activation = activate_physics()
             LOGGER.info(
@@ -105,10 +127,14 @@ def main(argv: list[str] | None = None) -> int:
             app.update()
             if deadline is not None and time.monotonic() >= deadline:
                 break
+    except KeyboardInterrupt:
+        exit_code = 130
+    else:
+        exit_code = 0
     finally:
-        app.close()
+        app.close(exit_code=exit_code)
     del isaacsim
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

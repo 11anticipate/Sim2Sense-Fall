@@ -8,14 +8,18 @@ Isaac Sim 查看 GUI 画面，以及实际跑通的验证结果。
 | 文件 | 作用 |
 |---|---|
 | `configs/scenes/indoor_apartment.yaml` | 场景声明：房间尺寸、墙体归属、门窗开口、家具与材质覆盖 |
-| `src/sim2sense_fall/scene_materials.py` | 材质库：视觉 + 力学 + 电磁三套属性 |
-| `src/sim2sense_fall/scene_spec.py` | 场景 schema、YAML 加载与快速失败校验 |
-| `src/sim2sense_fall/scene_furniture.py` | 参数化家具配方（盒体/圆柱体拼装） |
-| `src/sim2sense_fall/scene_planner.py` | CPU 几何规划：墙体分段、开口、家具、清单 |
-| `src/sim2sense_fall/isaac_scene.py` | USD 落地：几何、碰撞、刚体、材质、灯光 |
-| `scripts/build_indoor_scene.py` | 构建入口（dry-run / headless / GUI） |
-| `scripts/view_indoor_scene.py` | 打开已导出场景查看 GUI |
-| `scripts/verify_indoor_scene.py` | 场景与物理 smoke test |
+| `src/sim2sense_fall/scenes/materials.py` | 材质库：视觉 + 力学 + 电磁三套属性 |
+| `src/sim2sense_fall/scenes/spec.py` | 场景 schema、YAML 加载与快速失败校验 |
+| `src/sim2sense_fall/scenes/furniture.py` | 参数化家具配方（盒体/圆柱体拼装） |
+| `src/sim2sense_fall/scenes/planner.py` | CPU 几何规划：墙体分段、开口、家具、清单 |
+| `src/sim2sense_fall/scenes/usd.py` | USD 落地：几何、碰撞、刚体、材质、灯光 |
+| `src/sim2sense_fall/scenes/numbers.py` | 有限数值与正尺寸校验 |
+| `src/sim2sense_fall/scenes/geometry.py` | 世界变换、家具越界与穿墙检查 |
+| `src/sim2sense_fall/scenes/verification.py` | 实际 USD 与清单逐图元/材质核对 |
+| `src/sim2sense_fall/scenes/view.py` | 会话层相机与临时去顶显示 |
+| `scripts/scenes/build.py` | 构建入口（dry-run / headless / GUI） |
+| `scripts/scenes/view.py` | 打开已导出场景查看 GUI |
+| `scripts/scenes/verify.py` | 场景与物理 smoke test |
 
 ## 1. 场景内容
 
@@ -90,7 +94,7 @@ y=0.0 └───────────────────────�
 
 ```bash
 cd /home/gsh/Documents/室内摔倒与机器人救援
-python3 scripts/build_indoor_scene.py --dry-run
+python3 scripts/scenes/build.py --dry-run
 ```
 
 校验场景文件并写出可复现清单 `artifacts/scenes/indoor_apartment.scene.json`。
@@ -99,14 +103,14 @@ python3 scripts/build_indoor_scene.py --dry-run
 
 ```bash
 cd /home/gsh/Documents/室内摔倒与机器人救援
-~/isaacsim/python.sh scripts/build_indoor_scene.py --headless
+~/isaacsim/python.sh scripts/scenes/build.py --headless
 ```
 
 ### 4.3 物理 smoke test
 
 ```bash
 cd /home/gsh/Documents/室内摔倒与机器人救援
-~/isaacsim/python.sh scripts/verify_indoor_scene.py --settle-seconds 3
+~/isaacsim/python.sh scripts/scenes/verify.py --settle-seconds 3
 ```
 
 退出码为 0 才表示全部检查通过。
@@ -114,13 +118,13 @@ cd /home/gsh/Documents/室内摔倒与机器人救援
 ## 5. 用 Isaac Sim 查看 GUI 画面
 
 > 前置条件：需要 GPU 与显示环境。本机为 NVIDIA RTX 4060 Laptop + Wayland（`DISPLAY=:0`），
-> 下面 A / B / C 三条命令均已在本机实际运行通过。
+> 早期版本曾在本机运行 A / B / C；目录迁移后的命令已更新，本轮未复验 GPU/GUI 画面。
 
 ### 方案 A（推荐）— 一条命令打开已导出场景并启用物理
 
 ```bash
 cd /home/gsh/Documents/室内摔倒与机器人救援
-~/isaacsim/python.sh scripts/view_indoor_scene.py --activate-physics --settle-seconds 2
+~/isaacsim/python.sh scripts/scenes/view.py --activate-physics --settle-seconds 2
 ```
 
 - `--activate-physics` 是必要的：独立运行时默认不会把 PhysX 挂到 USD stage 上，
@@ -148,7 +152,7 @@ cd ~/isaacsim && ./isaac-sim.sh
 
 ```bash
 cd /home/gsh/Documents/室内摔倒与机器人救援
-~/isaacsim/python.sh scripts/build_indoor_scene.py --gui --settle-seconds 2
+~/isaacsim/python.sh scripts/scenes/build.py --gui --settle-seconds 2
 ```
 
 会重新规划、导出 `.usda`，然后打开 GUI 并步进物理。加 `--exit-after-seconds 20` 可
@@ -197,7 +201,7 @@ Isaac Sim 提供流式启动器，本仓库没有在本机验证过这条路径�
 | 刚体 | 1（`bedroom_2/chair`，13.56 kg） |
 | USD 文件 | `indoor_apartment.usda`，335 KB，344 个 prim |
 
-`scripts/verify_indoor_scene.py --settle-seconds 3` 的 14 项检查全部 PASS：
+`scripts/scenes/verify.py --settle-seconds 3` 的 14 项检查全部 PASS：
 
 ```text
 [PASS] scene opens -- 344 prims
@@ -241,3 +245,34 @@ CPU 侧：`python -m pytest -q` → 27 passed；`python -m compileall src tests 
    的接触场景。
 6. **玻璃与渲染外观**：玻璃用了 `opacity = 0.35`，实际透明度取决于渲染器设置；材质
    本身没有贴图，属于刻意的「几何 + 参数」风格。
+
+## 8. 本轮验收与内部查看（2026-09-21）
+
+**当前状态：验收发现的 R1–R6 已修复并通过 CPU/实际 USD/物理复验。**
+详见 [`indoor-scene-remediation.md`](indoor-scene-remediation.md)；GPU 视觉和完整研究链路仍待验证。
+以上第 6 节保留首次构建的历史验证记录。
+
+`scripts/scenes/view.py` 现在默认使用去顶正交俯视相机，打开后可以检查六个房间内部：
+
+```bash
+~/isaacsim/python.sh scripts/scenes/view.py --view top
+~/isaacsim/python.sh scripts/scenes/view.py --view roofless
+~/isaacsim/python.sh scripts/scenes/view.py --view exterior
+```
+
+- `top`：隐藏吊顶和吸顶灯具几何，按地板范围自动构图；这是默认模式。
+- `roofless`：相同的隐藏规则，采用斜上方透视相机。
+- `exterior`：显示完整屋顶和灯具，查看建筑外壳。
+- 相机与可见性仅写入 USD session layer；碰撞体仍存在，原始 USD 文件不变。
+- 当前只修改独立查看入口；`scripts/scenes/build.py --gui` 和官方 GUI 的直接 File > Open
+  仍显示原始封闭资产。建议先导出，再用上述查看入口。
+- 本轮已验证 USD 可见性切换、相机覆盖四角、源图层不变和碰撞体保留；由于当前环境
+  无 GPU/显示，**新查看入口的实际 GUI/RTX 画面尚未验收**。
+- `artifacts/acceptance/usd_before_after.png` 与 `usd_layout_findings.png` 是从实际 USD 世界几何
+  生成的 CPU 预览，不是 Isaac RTX 截图，也不用于判断光照、阴影、玻璃透明度。
+
+## 9. 后续场景修改的检查规则
+
+配置现支持 `foundation_thickness_m`（默认 0.30 m）。地基位于最厚地板下，较薄地板通过找平层连续支撑；所有行走面为 z=0。家具与墙的交集、房间外廓、非有限数值、负派生尺寸和路径碰撞均在 CPU 规划阶段拒绝。
+
+验证器现按清单逐图元及材质比较，容差可通过 `--position-tolerance` 与 `--drop-tolerance` 指定。`--dry-run` 仅检查清单；`--static-only` 明确跳过动力学，其结果不能当作动态测试通过。
