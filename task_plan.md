@@ -11,8 +11,9 @@
 - [x] 阶段 3：建立仓库目录、Python 工程配置、数据契约和最小代码骨架
 - [x] 阶段 4：编写 README、架构说明、路线图和阶段进度文档
 - [x] 阶段 5：搭建 Isaac Sim 室内场景（卧室/客厅/卫生间/厨房/次卧/走廊），配置墙体、地板、家具属性并导出 USD
-- [ ] 阶段 6：网络恢复后同步 `git@github.com:11anticipate/Sim2Sense-Fall.git` 并核对上游内容
+- [x] 阶段 6：同步 `git@github.com:11anticipate/Sim2Sense-Fall.git` 并核对上游内容
 - [ ] 阶段 7：接入 Sionna RT，完成首个端到端 smoke test（场景 → CIR/CSI 样本）
+- [ ] 阶段 8：用场景 `seed` 驱动房间布局/材质/家具随机化，形成训练域族
 
 ## 关键问题
 
@@ -32,9 +33,15 @@
 
 ## 错误与阻塞
 
-- 2026-09-21：`github.com` DNS 解析失败，无法读取上游仓库；已在 README 和进度文档中记录，待网络恢复后重试。
-- 2026-09-21：当前 `.git` 目录为只读空目录，`git init` 无法写入模板；本轮只能完成工作树文件，不能提交或更新远程配置。
+- 2026-09-21：**已解除** — 早前 `github.com` DNS 解析失败；现在 `git ls-remote origin` 正常，
+  `origin/main` 停在 `c77a37d`，与本地 `main` 完全一致（0 ahead / 0 behind）。
+- 2026-09-21：**已解除** — 早前工作树 `.git` 是只读空目录；现在 `.git` 可写，存在 `main`
+  分支与提交 `c77a37d`，且 `origin` 已指向目标仓库。场景工作已提交到
+  `feature/indoor-scene` 分支，`main` 保持不动。详见 [`docs/progress.md`](docs/progress.md)。
 - 2026-09-21：独立运行的 Isaac Sim 不会把 PhysX 挂到 USD stage 上，物理步数在涨但没有任何物体运动。已封装 `activate_physics()`（`enable_all_default_callbacks` + `setup_simulation`）修复，并加入「抬高后落回」的正向对照测试，避免把「物理没跑」误判成「场景稳定」。
+- 2026-09-21：上游仓库**没有 LICENSE 文件**，默认即「保留所有权利」。在明确许可前不应假设
+  代码可以对外分发或复用。
+- 2026-09-21：**未做**推送。`feature/indoor-scene` 只存在于本地，是否推送与开 PR 待用户确认。
 
 ## 当前状态
 

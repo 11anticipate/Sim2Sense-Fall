@@ -35,13 +35,6 @@
 - 首次 `pytest`：因导入路径和测试构造问题失败，已修复，待复跑。
 - `ruff check .`：当前环境未安装 `ruff`，未将其写成通过。
 
-### 阶段 5：GitHub 上游同步 — 阻塞
-
-- 目标：`git@github.com:11anticipate/Sim2Sense-Fall.git`
-- 实际错误：`ssh: Could not resolve hostname github.com: Temporary failure in name resolution`
-- 另外当前 `.git` 目录为只读空目录，`git init` 返回 `Read-only file system`，无法创建 Git 元数据、提交或更新 remote。
-- 当前状态：本地工作树文件已准备好，但不能声称已 clone、push 或完成上游核对。
-
 ### 阶段 5：Isaac Sim 室内场景 — 已完成
 
 目标：搭建包含卧室、客厅、卫生间等典型室内空间的三维场景，配置墙体、地板与家具属性，
@@ -118,11 +111,35 @@
    会报出 344（文件真实值）和 351（进程内被改写后的值）两个数。验证脚本已改为在
    `.usda` 的临时副本上运行，并比对原文件 SHA-256，保证产物不被验证过程污染。
 
+### 阶段 6：GitHub 上游同步 — 已完成（未推送）
+
+- 目标：`git@github.com:11anticipate/Sim2Sense-Fall.git`
+- 早前错误：`ssh: Could not resolve hostname github.com`，且 `.git` 只读。这两条**已解除**：
+  本轮 `git ls-remote --heads origin` 与 `git fetch origin` 均成功，`.git` 可写。
+- 当前事实：本地 `main` = `origin/main` = `c77a37d`
+  （*chore: scaffold Sim2Sense fall sensing project*），0 ahead / 0 behind，顶层目录树一致。
+  也就是说上游目前只有脚手架提交，没有需要合并的内容。
+- 许可证核查：上游**没有 LICENSE / COPYING 文件**，默认即「保留所有权利」。在拿到明确许可前，
+  不应假设代码可对外分发。
+- 本轮动作：把场景工作提交到 `feature/indoor-scene` 分支（3 个 Conventional Commits），
+  `main` 保持与上游一致、未被改动。
+- 未做：**没有 push**，也没有开 PR。推送属于对外发布动作，等用户确认。
+- 附注：`.workbuddy/`（Agent 工作记忆）目前是未跟踪状态，是否纳入版本管理由用户决定。
+
+### 阶段 6 验证记录
+
+- `git ls-remote --heads origin`：`c77a37dc…  refs/heads/main`，退出码 0。
+- `git fetch origin`：成功，无新对象。
+- `git rev-list --left-right --count origin/main...HEAD`：`0  0`。
+- `git ls-tree --name-only origin/main` 与本地已跟踪的顶层条目逐项一致。
+- `git status --short`：仅剩未跟踪的 `.workbuddy/`，无未提交的源码改动。
+
 ## 下一步
 
-1. 用场景配置里的 `seed` 驱动房间布局、材质与家具的随机化，形成训练域族（对应 DGSense 路线）。
-2. 在场景中加入人体（刚体或骨架）并导出与场景同时间基准的运动真值。
-3. 接入 Sionna RT，把 `/World` 几何与 `sim2sense:em_*` 材质映射为传播场景，生成首条
+1. 确认是否把 `feature/indoor-scene` 推到远端并开 PR；同时决定 `.workbuddy/` 是否纳入版本管理。
+2. 用场景配置里的 `seed` 驱动房间布局、材质与家具的随机化，形成训练域族（对应 DGSense 路线）。
+3. 在场景中加入人体（刚体或骨架）并导出与场景同时间基准的运动真值。
+4. 接入 Sionna RT，把 `/World` 几何与 `sim2sense:em_*` 材质映射为传播场景，生成首条
    `ChannelSample` 并完成 CPU schema 校验。
-4. 复核代理电磁材质与已安装 Sionna 版本 `itu_*` 数值的一致性。
-5. 网络恢复后读取上游分支、许可证和目录，做一次非破坏性合并评估。
+5. 复核代理电磁材质与已安装 Sionna 版本 `itu_*` 数值的一致性。
+6. 上游没有 LICENSE，先与仓库所有者确认许可范围，再考虑任何对外分发。

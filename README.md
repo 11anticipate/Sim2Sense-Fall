@@ -22,12 +22,15 @@
 - Isaac Sim 室内场景：两室一厅一厨一卫加走廊，6 个房间、46 段墙、11 处门窗开口、
   34 件家具/灯具，含墙体/地板/家具的碰撞、摩擦、密度与电磁属性，可导出为 USD。
   说明、运行方式和 GUI 查看指令见 [`docs/indoor-scene.md`](docs/indoor-scene.md)。
+- GitHub 上游核对：`origin/main` 与本地 `main` 同为 `c77a37d`，无差异；场景工作提交在
+  `feature/indoor-scene` 分支（未 push）。
 
 待完成：
 
-- GitHub 上游同步。当前环境对 `github.com` 的 DNS 解析失败，且工作树 `.git` 目录只读，详见 [`docs/progress.md`](docs/progress.md)。
+- 推送 `feature/indoor-scene` 并开 PR（待确认）。
 - Sionna RT 接入、人体轨迹与 CSI/CIR 生成。
 - 场景领域随机化、真实 CSI/CIR 数据导入、跨域实验和仿真到真实验证。
+- 上游没有 LICENSE，需要先与仓库所有者确认许可范围。
 
 ## 目录
 
@@ -112,15 +115,28 @@ python3 scripts/build_indoor_scene.py --dry-run
 
 ## 远程仓库
 
-目标地址为 `git@github.com:11anticipate/Sim2Sense-Fall.git`。当前会话尝试读取该地址时收到 `Temporary failure in name resolution`，因此没有声称已经完成 clone、push 或上游代码核对。网络恢复且 `.git` 可写后，按以下顺序同步：
+目标地址为 `git@github.com:11anticipate/Sim2Sense-Fall.git`。
+
+早前会话读不到该地址（`Temporary failure in name resolution`），且工作树 `.git` 只读；
+这两条**已经解除**。当前状态：
+
+- `origin/main` = 本地 `main` = `c77a37d`（*chore: scaffold Sim2Sense fall sensing project*），
+  0 ahead / 0 behind，顶层目录树一致 —— 上游目前只有脚手架提交，没有需要合并的内容。
+- 室内场景工作提交在 `feature/indoor-scene` 分支（3 个 Conventional Commits），
+  `main` 未被改动。**尚未 push**，也未开 PR。
+- 上游**没有 LICENSE 文件**，默认即「保留所有权利」。在确认许可范围前，不要假设代码可以
+  对外分发。
+- `.workbuddy/`（Agent 工作记忆）目前未跟踪，是否纳入版本管理待定。
+
+按项目分支约定，功能开发不直接落在 `main` 上：
 
 ```bash
-git fetch origin
-git branch --show-current
-git log --oneline --decorate -5
+git checkout feature/indoor-scene
+git log --oneline --decorate -4
+git push -u origin feature/indoor-scene     # 确认后再执行
 ```
 
-同步后先检查上游目录和许可证，再决定是否合并本地骨架；不要覆盖用户未审阅的上游文件。
+同步后先检查上游目录和许可证，再决定是否合并；不要覆盖用户未审阅的上游文件。
 
 ## 文献依据
 
