@@ -1,0 +1,268 @@
+# Human rig, controller, perturbation and export contract for the SMPL-topology body.
+#
+# Read with configs/humans/human_smpl_neutral.yaml by scripts/humans/*.py.
+#
+# Frame convention (body-local, right-handed): +X forward, +Y left, +Z up.
+# Rotation axes are therefore:
+#   y -> flexion / extension (sagittal plane)
+#   x -> abduction / lateral bend (frontal plane)
+#   z -> twist (transverse plane)
+# A downward-pointing segment (thigh, shank, upper arm) moves its tip *backward*
+# for a positive rotation about +Y, so hip and shoulder flexion are negative and
+# knee and elbow flexion are positive. The sign is checked by
+# tests/humans/test_rig.py, which is what keeps a limit range from silently
+# capping every motion at rest.
+
+human_id: smpl_neutral_standing
+description: >-
+  SMPL-topology articulated body with capsule colliders, used to close the
+  human -> motion/fall -> synchronised ground-truth loop in the fixed indoor
+  apartment. The topology, joint order and kinematic tree are SMPL's; the rest
+  joint positions are procedural until the licensed model file is available.
+
+skeleton:
+  topology: smpl
+  # v1.1.0 is the release that actually has a neutral body; v1.0.0 ships only female and
+  # male, so an id like smpl_neutral_v1_0_0 names something the registry does not define.
+  # Nothing used to notice, because no entry point loaded a model.
+  model_asset: smpl_neutral_v1_1_0
+  # Allows falling back to the procedural skeleton when the licensed model is absent or
+  # will not import. Artefacts built that way say so in their provenance block; nothing
+  # marks the licensed body as imported. Set to false to make a missing model fatal.
+  allow_procedural_skeleton: true
+  height_m: 1.70
+  mass_kg: 72.0
+  note: >-
+    height_m and mass_kg are the nominal adult values used for the procedural
+    skeleton. They are replaced by shape coefficients (betas) and the fitted
+    segment masses when the model file is present.
+
+rig:
+  root_joint: pelvis
+  # free   -> the pelvis is a free body: the whole figure can topple and fall.
+  # anchored -> a fixed joint ties the pelvis to the world; used only for the
+  #             controlled tracking tests, and always recorded in the export.
+  root_mode: free
+  collider: capsule
+  # Capsules of neighbouring segments overlap in the rest pose by design (the
+  # torso is a stack of short bones with large radii). Self-collisions are off, so
+  # that overlap is inert; turning them on would make the body explode on spawn.
+  self_collisions: false
+  contact_offset_m: 0.01
+  rest_offset_m: 0.0
+  linear_damping: 0.02
+  angular_damping: 0.02
+
+  segments:
+    # mass_weight is a relative weight, normalised to skeleton.mass_kg. These are
+    # hand-set plausible values for an adult (trunk ~53%, legs ~33%, arms ~14%),
+    # NOT fitted anthropometric data.
+    pelvis:        {radius_m: 0.135, mass_weight: 1.400, aim: spine1}
+    spine1:        {radius_m: 0.115, mass_weight: 0.900}
+    spine2:        {radius_m: 0.115, mass_weight: 0.900}
+    spine3:        {radius_m: 0.110, mass_weight: 0.900}
+    neck:          {radius_m: 0.085, mass_weight: 0.200}
+    head:          {radius_m: 0.100, mass_weight: 0.750}
+
+    left_hip:      {radius_m: 0.090, mass_weight: 0.900}
+    right_hip:     {radius_m: 0.090, mass_weight: 0.900}
+    left_knee:     {radius_m: 0.072, mass_weight: 0.430}
+    right_knee:    {radius_m: 0.072, mass_weight: 0.430}
+    left_ankle:    {radius_m: 0.050, mass_weight: 0.130}
+    right_ankle:   {radius_m: 0.050, mass_weight: 0.130}
+    left_foot:     {radius_m: 0.045, mass_weight: 0.115}
+    right_foot:    {radius_m: 0.045, mass_weight: 0.115}
+
+    left_collar:   {radius_m: 0.058, mass_weight: 0.150}
+    right_collar:  {radius_m: 0.058, mass_weight: 0.150}
+    left_shoulder: {radius_m: 0.055, mass_weight: 0.240}
+    right_shoulder: {radius_m: 0.055, mass_weight: 0.240}
+    left_elbow:    {radius_m: 0.045, mass_weight: 0.170}
+    right_elbow:   {radius_m: 0.045, mass_weight: 0.170}
+    left_wrist:    {radius_m: 0.036, mass_weight: 0.075}
+    right_wrist:   {radius_m: 0.036, mass_weight: 0.075}
+    left_hand:     {radius_m: 0.040, mass_weight: 0.055}
+    right_hand:    {radius_m: 0.040, mass_weight: 0.055}
+
+  # Only joints with a degree of freedom are listed. Every joint not listed here
+  # becomes a fixed attachment (collars, wrists, hands, feet, head), so the rig has
+  # no unconstrained flapping links.
+  #
+  # Single axis per joint is a deliberate simplification: a USD/PhysX revolute
+  # joint has one degree of freedom, and the shipped rig models only the dominant
+  # sagittal axis. Lateral toppling still happens, because the pelvis is a free
+  # body and the whole figure rotates about the feet. Multi-axis joints are
+  # supported by the planner as a chain of revolute joints with proxy links, but
+  # that path has not been run in Isaac Sim -- see docs/human-simulation.md.
+  joints:
+    left_hip:      {dof: revolute, rotations: [y], limits_deg: [[-120, 30]],
+                    drive: {stiffness: 400, damping: 40, max_force: 400}}
+    right_hip:     {dof: revolute, rotations: [y], limits_deg: [[-120, 30]],
+                    drive: {stiffness: 400, damping: 40, max_force: 400}}
+    left_knee:     {dof: revolute, rotations: [y], limits_deg: [[0, 150]],
+                    drive: {stiffness: 300, damping: 30, max_force: 300}}
+    right_knee:    {dof: revolute, rotations: [y], limits_deg: [[0, 150]],
+                    drive: {stiffness: 300, damping: 30, max_force: 300}}
+    left_ankle:    {dof: revolute, rotations: [y], limits_deg: [[-35, 45]],
+                    drive: {stiffness: 150, damping: 15, max_force: 150}}
+    right_ankle:   {dof: revolute, rotations: [y], limits_deg: [[-35, 45]],
+                    drive: {stiffness: 150, damping: 15, max_force: 150}}
+
+    spine1:        {dof: revolute, rotations: [y], limits_deg: [[-25, 60]],
+                    drive: {stiffness: 500, damping: 50, max_force: 500}}
+    spine2:        {dof: revolute, rotations: [y], limits_deg: [[-25, 60]],
+                    drive: {stiffness: 500, damping: 50, max_force: 500}}
+    spine3:        {dof: revolute, rotations: [y], limits_deg: [[-25, 60]],
+                    drive: {stiffness: 500, damping: 50, max_force: 500}}
+    neck:          {dof: revolute, rotations: [y], limits_deg: [[-40, 50]],
+                    drive: {stiffness: 120, damping: 12, max_force: 120}}
+
+    left_shoulder: {dof: revolute, rotations: [y], limits_deg: [[-170, 110]],
+                    drive: {stiffness: 200, damping: 20, max_force: 200}}
+    right_shoulder: {dof: revolute, rotations: [y], limits_deg: [[-170, 40]],
+                    drive: {stiffness: 200, damping: 20, max_force: 200}}
+    left_elbow:    {dof: revolute, rotations: [y], limits_deg: [[-150, 5]],
+                    drive: {stiffness: 150, damping: 15, max_force: 150}}
+    right_elbow:   {dof: revolute, rotations: [y], limits_deg: [[-150, 5]],
+                    drive: {stiffness: 150, damping: 15, max_force: 150}}
+
+# The imported SMPL neutral asset has a horizontal rest arm.  These display-only
+# targets rotate both shoulders down beside the torso and relax the elbows, so the
+# authored skin and the PhysX capsules start from the same natural pose.
+visualization:
+  default_pose_rad:
+    left_shoulder: 1.5707963267948966
+    right_shoulder: -1.5707963267948966
+    left_elbow: -0.20
+    right_elbow: -0.20
+
+control:
+  # pd          -> joints track the reference with the configured drive gains.
+  # kinematic   -> joints are written directly, no dynamics; used to validate the
+  #                retargeting path separately from the controller.
+  # torque_free -> drives are switched off; the body is a passive ragdoll baseline.
+  mode: pd
+  warmup_seconds: 0.3
+  # Pre-registered acceptance threshold. Fixed here, before any tracking run, so
+  # the result cannot be judged after the fact.
+  tracking_tolerance_deg: 15.0
+  pose_hold_seconds: 0.2
+  max_root_linear_velocity_m_s: 3.0
+
+simulation:
+  physics_dt_s: 0.008333333333333333
+  solver_position_iterations: 16
+  solver_velocity_iterations: 4
+  settle_seconds: 0.6
+  gravity_m_s2: 9.81
+  stabilization_threshold_s: 0.001
+
+# Scripted balance perturbations. The perturbation is *not* the label: fall events
+# are labelled from the resulting trajectory by sim2sense_fall.humans.events.
+perturbations:
+  - id: push_forward
+    kind: force
+    body: pelvis
+    direction: [1.0, 0.0, 0.0]
+    magnitude_n: 220.0
+    start_s: 0.4
+    duration_s: 0.25
+    notes: Push from behind, tipping the figure toward +X (forward).
+  - id: push_backward
+    kind: force
+    body: pelvis
+    direction: [-1.0, 0.0, 0.0]
+    magnitude_n: 200.0
+    start_s: 0.4
+    duration_s: 0.25
+    notes: Push from the front, tipping the figure toward -X (backward).
+  - id: push_right
+    kind: force
+    body: pelvis
+    direction: [0.0, -1.0, 0.0]
+    magnitude_n: 180.0
+    start_s: 0.4
+    duration_s: 0.25
+    notes: Lateral push toward -Y (the figure's right).
+  - id: push_left
+    kind: force
+    body: pelvis
+    direction: [0.0, 1.0, 0.0]
+    magnitude_n: 180.0
+    start_s: 0.4
+    duration_s: 0.25
+    notes: Lateral push toward +Y (the figure's left).
+  # A 'support_loss' perturbation (a slipping surface) is defined by the schema but
+  # is deliberately NOT shipped: it needs live mutation of floor colliders or
+  # friction, which has not been validated here. The stage plan defers slips and
+  # trips until free standing and walking pass their control acceptance point, and
+  # that point has not been met. See docs/human-simulation.md.
+  - id: control_loss
+    kind: control_failure
+    body: pelvis
+    start_s: 0.4
+    duration_s: 1.5
+    control_scale: 0.0
+    notes: >-
+      Joint drives are scaled to zero from start_s, so the body collapses under
+      gravity with no external load. This is the passive-ragdoll baseline.
+  - id: none
+    kind: none
+    body: pelvis
+    start_s: 0.0
+    duration_s: 1.0
+    notes: >-
+      Unperturbed control trial: nothing is applied. Included so every trial id
+      resolves to a config entry rather than needing a special case.
+
+export:
+  # The wireless sampling rate is separate from simulation.physics_dt_s on
+  # purpose: resampling is explicit, and the method used is recorded next to the
+  # data. At 120 Hz physics and 50 Hz channel sampling the ratio is not integral,
+  # which is the honest case to test.
+  channel_sample_hz: 50.0
+  resample_method: slerp
+  include_contact_forces: true
+  include_surface_points: true
+  surface_points_per_segment: 8
+  surface_point_seed: 20260922
+  # Splits are grouped by source subject and source sequence, so the same person
+  # or the same capture can never appear on both sides of a train/test boundary.
+  group_by: [subject, sequence]
+  record_wireless_interval: true
+
+# Pre-registered event definitions. Fixed here, before any trial is labelled, and
+# applied identically to every trial, so a result cannot be judged after the fact.
+#
+# These are project-chosen heuristics, NOT a validated clinical fall detector. The
+# rules say plainly what counts as a fall in this dataset: the trunk passes
+# trunk_angle_deg, or the pelvis falls below pelvis_height_fraction of the standing
+# pelvis height; the low state persists for min_low_frames; the transition from upright to
+# low takes at most max_transition_s; and an impact is seen, meaning a body point
+# comes within impact_height_m of the floor moving down faster than
+# impact_speed_m_s. A slow descent that never exceeds controlled_descent_speed_m_s
+# is labelled a controlled lie-down rather than a fall -- that is the boundary that
+# separates falling from deliberately lying down.
+events:
+  # Trunk angle at which the body is considered to be falling.
+  trunk_angle_deg: 60.0
+  # Fraction of that angle at which the body is considered to have begun tipping.
+  # The gap between the two thresholds is what makes the transition time meaningful:
+  # imbalance_onset is the tipping moment, and time_to_low_posture is measured from
+  # there to the first sustained low posture.
+  trunk_onset_fraction: 0.5
+  # Applied to the STANDING PELVIS height, not to the stature: 0.55 of 0.99 m, so
+  # a seated or lying pelvis, not an ordinary sag under gravity.
+  pelvis_height_fraction: 0.55
+  min_low_frames: 10
+  max_transition_s: 1.5
+  impact_height_m: 0.25
+  impact_speed_m_s: 1.0
+  settle_window_s: 0.5
+  settle_speed_m_s: 0.15
+  controlled_descent_speed_m_s: 1.2
+  divergence_limit_m: 5.0
+  penetration_limit_m: -0.05
+  # Above this fraction of standing height at the last frame, the body is judged to
+  # have got back up, so the trial is a recovery rather than a fall.
+  recovery_height_fraction: 0.6

@@ -1,0 +1,243 @@
+# Reference motion library for the SMPL-topology human rig.
+#
+# These are analytic programs, not captures. They exist so the retargeting,
+# replay, tracking and labelling code paths can be exercised, cross-checked and
+# unit-tested with exact reproducibility before any AMASS sequence is obtained.
+# A clip compiled from here is tagged `scripted` in its provenance and must never
+# be reported as motion-capture data.
+#
+# Body-local frame: +X forward, +Y left, +Z up.
+# Rotations about +Y are pitch: a downward-pointing segment moves its tip backward
+# for positive values, so hip and shoulder flexion are negative while knee, elbow
+# and spine flexion are positive.
+#
+# `phase` is the single phase label for a scripted clip. Fall trials get their
+# labels from the trajectory instead, in sim2sense_fall.humans.events.
+#
+# Root height during a fall reference follows half of L*(cos(phi) - 1), where L is
+# the planner's pelvis-to-floor distance and phi is the topple angle. The full
+# rigid-topple law keeps the supporting foot planted but lets other capsules sweep
+# below the floor once the body is horizontal; halving the drop keeps the pelvis
+# high enough that nothing penetrates. These are rotation references for the
+# controller, not fall trajectories: the physics trials produce the real motion, and
+# scripts/humans/simulate.py --dry-run reports the depth of any penetration so the
+# numbers can be checked rather than assumed.
+# Root translation in a clip is an OFFSET from the nominal standing root position
+# that the rig planner computes (the height at which the lowest capsule just
+# touches the floor). So stand_neutral is (0, 0, 0) and a squat that lowers the
+# pelvis by 0.315 m is (0, 0, -0.315). Keeping clips relative to the planner's
+# spawn height means a clip stays valid when the skeleton is rescaled.
+
+version: 1
+notes: >-
+  Analytic reference motions only. No AMASS or other captured sequence is included
+  or referred to here.
+
+defaults:
+  fps: 60.0
+  generator: keyframes
+  tags: [reference]
+
+motions:
+  # --- controlled, near-static poses: used with an anchored root -------------
+  - id: stand_neutral
+    phase: standing
+    duration_s: 1.0
+    tags: [reference, controlled]
+    notes: Zero pose. The identity reference for every joint.
+
+  - id: bend_forward
+    phase: bending
+    duration_s: 2.0
+    tags: [reference, controlled, confusable]
+    notes: >-
+      Forward trunk flexion with the arms hanging. A daily-life pose that must not
+      be labelled a fall: the trunk angle passes 60 degrees, which exceeds the
+      forward-fall threshold, so the labeller has to distinguish it using the root
+      height and the descent speed rather than the trunk angle alone.
+    joint_keyframes:
+      spine1: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, 0.35, 0], [0, 0.35, 0]]}
+      spine2: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, 0.45, 0], [0, 0.45, 0]]}
+      spine3: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, 0.40, 0], [0, 0.40, 0]]}
+      left_hip: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, -0.30, 0], [0, -0.30, 0]]}
+      right_hip: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, -0.30, 0], [0, -0.30, 0]]}
+      left_shoulder: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, -0.25, 0], [0, -0.25, 0]]}
+      right_shoulder: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, -0.25, 0], [0, -0.25, 0]]}
+
+  - id: squat
+    phase: squatting
+    duration_s: 2.2
+    tags: [reference, controlled, confusable]
+    notes: >-
+      Squat: hip and knee flexion with ankle dorsiflexion. The root drops far but
+      the trunk stays upright, which is the feature the labeller uses to keep it
+      out of the fall class.
+    root:
+      translation_keyframes:
+        times_s: [0.0, 1.1, 2.2]
+        values: [[0.0, 0.0, 0.0], [0.0, 0.0, -0.240], [0.0, 0.0, -0.240]]
+    joint_keyframes:
+      left_hip: {times_s: [0.0, 1.1, 2.2], values: [[0, 0, 0], [0, -1.25, 0], [0, -1.25, 0]]}
+      right_hip: {times_s: [0.0, 1.1, 2.2], values: [[0, 0, 0], [0, -1.25, 0], [0, -1.25, 0]]}
+      left_knee: {times_s: [0.0, 1.1, 2.2], values: [[0, 0, 0], [0, 1.40, 0], [0, 1.40, 0]]}
+      right_knee: {times_s: [0.0, 1.1, 2.2], values: [[0, 0, 0], [0, 1.40, 0], [0, 1.40, 0]]}
+      left_ankle: {times_s: [0.0, 1.1, 2.2], values: [[0, 0, 0], [0, -0.30, 0], [0, -0.30, 0]]}
+      right_ankle: {times_s: [0.0, 1.1, 2.2], values: [[0, 0, 0], [0, -0.30, 0], [0, -0.30, 0]]}
+
+  - id: sit_down
+    phase: sitting
+    duration_s: 2.4
+    tags: [reference, controlled, confusable]
+    notes: >-
+      Sit down onto a seat at roughly 0.45 m. Needs an anchored root: an unsupported
+      free body cannot hold a seated pose, and saying otherwise would be a false
+      claim about the controller.
+    root:
+      translation_keyframes:
+        times_s: [0.0, 1.2, 2.4]
+        values: [[0.0, 0.0, 0.0], [0.0, -0.10, -0.170], [0.0, -0.10, -0.200]]
+    joint_keyframes:
+      left_hip: {times_s: [0.0, 1.2, 2.4], values: [[0, 0, 0], [0, -0.90, 0], [0, -1.50, 0]]}
+      right_hip: {times_s: [0.0, 1.2, 2.4], values: [[0, 0, 0], [0, -0.90, 0], [0, -1.50, 0]]}
+      left_knee: {times_s: [0.0, 1.2, 2.4], values: [[0, 0, 0], [0, 1.10, 0], [0, 1.45, 0]]}
+      right_knee: {times_s: [0.0, 1.2, 2.4], values: [[0, 0, 0], [0, 1.10, 0], [0, 1.45, 0]]}
+      spine2: {times_s: [0.0, 1.2, 2.4], values: [[0, 0, 0], [0, 0.25, 0], [0, 0.10, 0]]}
+
+  - id: walk_in_place
+    phase: walking
+    duration_s: 2.0
+    generator: sine
+    tags: [reference, controlled]
+    notes: >-
+      One cycle per 1.11 s. Alternating hip and knee flexion with counter-phased
+      arm swing; the body does not translate, so it isolates joint tracking from
+      root locomotion.
+    sine:
+      channels:
+        - {joint: left_hip, axis: y, amplitude_deg: 28.0, frequency_hz: 0.9, phase_deg: 0.0}
+        - {joint: right_hip, axis: y, amplitude_deg: 28.0, frequency_hz: 0.9, phase_deg: 180.0}
+        - {joint: left_knee, axis: y, amplitude_deg: 25.0, frequency_hz: 0.9, phase_deg: 90.0, offset_deg: 25.0}
+        - {joint: right_knee, axis: y, amplitude_deg: 25.0, frequency_hz: 0.9, phase_deg: 270.0, offset_deg: 25.0}
+        - {joint: left_shoulder, axis: y, amplitude_deg: 18.0, frequency_hz: 0.9, phase_deg: 180.0}
+        - {joint: right_shoulder, axis: y, amplitude_deg: 18.0, frequency_hz: 0.9, phase_deg: 0.0}
+        - {joint: left_ankle, axis: y, amplitude_deg: 12.0, frequency_hz: 0.9, phase_deg: 90.0}
+        - {joint: right_ankle, axis: y, amplitude_deg: 12.0, frequency_hz: 0.9, phase_deg: 270.0}
+
+  # --- fall references: used as kinematic targets and as label boundaries ----
+  - id: fall_forward_reference
+    phase: lying_prone
+    duration_s: 1.2
+    tags: [reference, fall_reference]
+    notes: >-
+      Kinematic reference for a forward topple: the root pitches to +90 degrees
+      about +Y, which puts the body up axis along +X and the face downward. Root
+      translation is held in x/y so this is a rotation reference, not a trajectory;
+      the physics trials produce the real motion, and the labels come from events.
+    root:
+      translation_keyframes:
+        times_s: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]
+        values: [
+          [0.0, 0.0, 0.0],
+          [0.0, 0.0, -0.0169],
+          [0.0, 0.0, -0.0664],
+          [0.0, 0.0, -0.1452],
+          [0.0, 0.0, -0.2478],
+          [0.0, 0.0, -0.3500],
+          [0.0, 0.0, -0.4000],
+        ]
+      rotation_keyframes:
+        times_s: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]
+        values: [
+          [0, 0.0, 0],
+          [0, 0.2617994, 0],
+          [0, 0.5235988, 0],
+          [0, 0.7853982, 0],
+          [0, 1.0471976, 0],
+          [0, 1.3089969, 0],
+          [0, 1.5707963, 0],
+        ]
+    # Joints stay at rest for the reference topples: the arms hang along the body,
+    # so a prone figure has them lying beside it rather than reaching downward
+    # through the floor. Protective arm motion is reach_then_topple's job.
+
+  - id: fall_backward_reference
+    phase: lying_supine
+    duration_s: 1.2
+    tags: [reference, fall_reference]
+    notes: >-
+      Kinematic reference for a backward topple: root pitches to -90 degrees about
+      +Y, putting the body up axis along -X and the chest upward.
+    root:
+      translation_keyframes:
+        times_s: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]
+        values: [
+          [0.0, 0.0, 0.0],
+          [0.0, 0.0, -0.0169],
+          [0.0, 0.0, -0.0664],
+          [0.0, 0.0, -0.1452],
+          [0.0, 0.0, -0.2478],
+          [0.0, 0.0, -0.3500],
+          [0.0, 0.0, -0.4000],
+        ]
+      rotation_keyframes:
+        times_s: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]
+        values: [
+          [0, 0.0, 0],
+          [0, -0.2617994, 0],
+          [0, -0.5235988, 0],
+          [0, -0.7853982, 0],
+          [0, -1.0471976, 0],
+          [0, -1.3089969, 0],
+          [0, -1.5707963, 0],
+        ]
+
+  - id: fall_lateral_reference
+    phase: lying_lateral
+    duration_s: 1.2
+    tags: [reference, fall_reference]
+    notes: >-
+      Kinematic reference for a lateral topple: root rolls to +90 degrees about +X,
+      which puts the body up axis along -Y and lands the figure on its right side.
+      Only the root rotates, so this is exactly the motion the single-axis sagittal
+      rig cannot produce by joint motion alone -- which is the point.
+    root:
+      translation_keyframes:
+        times_s: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]
+        values: [
+          [0.0, 0.0, 0.0],
+          [0.0, 0.0, -0.0169],
+          [0.0, 0.0, -0.0664],
+          [0.0, 0.0, -0.1452],
+          [0.0, 0.0, -0.2478],
+          [0.0, 0.0, -0.3500],
+          [0.0, 0.0, -0.4000],
+        ]
+      rotation_keyframes:
+        times_s: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]
+        values: [
+          [0.0, 0, 0],
+          [0.2617994, 0, 0],
+          [0.5235988, 0, 0],
+          [0.7853982, 0, 0],
+          [1.0471976, 0, 0],
+          [1.3089969, 0, 0],
+          [1.5707963, 0, 0],
+        ]
+
+  - id: reach_then_topple
+    phase: falling
+    duration_s: 1.0
+    tags: [reference, fall_reference]
+    notes: >-
+      Arms reach forward while the trunk pitches over, the shape a protective
+      response takes. Kept separate from the topple so a protective-reaction label
+      can be argued from the joint trace rather than from the perturbation id.
+    root:
+      rotation_keyframes:
+        times_s: [0.0, 0.5, 1.0]
+        values: [[0, 0, 0], [0, 0.35, 0], [0, 0.90, 0]]
+    joint_keyframes:
+      left_shoulder: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, -1.40, 0], [0, -1.55, 0]]}
+      right_shoulder: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, -1.40, 0], [0, -1.55, 0]]}
+      left_elbow: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, -0.40, 0], [0, -0.30, 0]]}
+      right_elbow: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, -0.40, 0], [0, -0.30, 0]]}

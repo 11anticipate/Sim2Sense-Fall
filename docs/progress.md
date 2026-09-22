@@ -1,5 +1,107 @@
 # 阶段进度
 
+## 2026-09-22 — Transitions 录屏动作表现复核
+
+- 复核用户提供的 `/home/gsh/Videos/Screencasts/Screencast from 2026-09-22 23-30-10.mp4`（约 7.05 s）：画面从站立开始，中段下坐并后仰、腿部抬起，后段恢复站立。
+- 该表现与 Transitions `amass__sit_stand_poses` 的坐下/起立参考动作一致；它是动作预览证据，不是跌倒标签，也不代表已经完成 PhysX 接触响应验收。
+- `view_amass.py` 当前每帧直接写入 DOF 和根部位姿并清零速度，属于运动学回放。墙体和地面碰撞代理仍写入 stage，但接触反作用会被下一帧传送覆盖；要验收碰撞应使用独立物理入口或后续 physics replay mode。
+- `DISPLAY= WAYLAND_DISPLAY= ~/isaacsim/python.sh scripts/humans/verify.py` 的最新实际结果：19 个胶囊碰撞代理恢复，重力回落 `1.3051 m`，最低人体点 `-0.0000 m`，地面碰撞已通过。墙体代理已写入场景，但当前验收未覆盖墙体接触响应，不能把它概括为墙/地面碰撞均已完成。
+
+## 2026-09-22 — AMASS 查看器启动路径与碰撞边界核对
+
+- 指定 `--motion amass__sit_stand_poses` 时，查看器现在按动作 ID 直接定位单个 `.npz`，不再先解析 Transitions 的全部 110 个序列；未指定动作时仍保持完整库扫描和确定性排序。
+- 实测隔离会话从进程启动到 headless 完成约 18 s，其中 Isaac Sim/Kit 扩展初始化约 13.4 s；日志显示当前隔离会话没有可用 CUDA/NVML，RTX 初始化失败后回退 CPU，这部分不能用仓库代码进一步压缩。首次启动还会建立 shader/材质缓存。
+- `view_amass.py` 的 19 个胶囊代理确实带有 `UsdPhysics.CollisionAPI`，SMPL `/Skin` 明确是 visual-only。该入口是运动学回放：每帧写入 DOF/root 位姿并清零速度，所以墙/地面的 PhysX 反作用会被下一帧传送覆盖，不能把它当作碰撞响应实验。真实碰撞正向对照仍由 `scripts/humans/verify.py` 的重力回落和地面穿透检查承担。
+- 重新运行 `DISPLAY= WAYLAND_DISPLAY= ~/isaacsim/python.sh scripts/humans/verify.py`：实际 Isaac CPU PhysX 通过，19 个碰撞代理恢复，抬高后骨盆下降 1.3051 m，最终最低人体点 `-0.0000 m`；地面碰撞链路有效，墙体代理已写入但本次检查未覆盖墙体接触响应。日志仍记录当前隔离环境的 CUDA fallback。
+
+## 2026-09-22 — Transitions sit-stand 预览根位姿修复
+
+- 用户复现 `view_amass.py --motion amass__sit_stand_poses` 时，人物曾因直接使用 AMASS 序列的全局 `trans`/root rotation 而出现在房间外并横向倾倒；蒙皮又没有使用同一根旋转，导致视觉皮肤与 PhysX 胶囊代理错位、穿墙。
+- 新增 `normalize_root_motion()`：以首帧为局部锚点，使用 `t[k] - t[0]` 和 `R[k] @ R[0].T`；查看器的 `forward_kinematics()`、SMPL skin 和 `HumanRuntime.set_root_pose()` 现在消费同一帧归一化根位姿。
+- 根旋转连续性检查改用旋转测地距离，避免跨越 180° 时主值轴角向量被误判为 359° 跳变。
+- CPU 回归：`201 passed / 8 skipped`，Ruff 和 compileall 通过。真实 Transitions `amass__sit_stand_poses`：980 帧、120 Hz、8.158 s；Isaac headless CPU PhysX 播放和 USD/JSON 导出通过，`root motion anchored` 检查通过。
+- 当前隔离执行仍记录 `NVML_ERROR_DRIVER_NOT_LOADED` / `cuInit failed (100)`，所以这次 headless 结果是 CPU PhysX fallback；宿主机 GUI 需要用用户已恢复的 NVIDIA 会话重新运行命令观察画面。
+
+## 2026-09-22 — 人体 GUI 姿态、碰撞代理与取景修复
+
+- 用户截图中的三项视觉问题已定位并修复：SMPL neutral 的水平 rest pose 造成手臂穿墙；胶囊碰撞体被错误显示造成皮肤与内部结构分离；整屋包围盒取景使人体显得过小。
+- `configs/humans/human_smpl_neutral.yaml` 新增配置驱动的 `visualization.default_pose_rad`：左右肩分别为 `+pi/2`、`-pi/2`，左右肘为 `-0.20` rad；左肩限位扩展到 110°。CPU 正运动学实测左右上臂向下约 0.27 m，SMPL 6890 顶点姿态全部有限。
+- `scripts/humans/build.py` 用上述 DOF 姿态生成 posed SMPL 网格，并在 GUI 启动时对同一组 PhysX DOF 写入 position/target；`--view human` 按 `/World/Human` 边界取景并隐藏屋顶，现为默认视角。`roofless`、`top`、`exterior` 仍可选。
+- `usd_human.py` 将 19 个胶囊设置为不可见，同时保留 `UsdPhysics.CollisionAPI`；headless USD 检查确认 `19/19` 隐藏、`19/19` 仍是碰撞体，SMPL 网格为 6890 顶点 / 13776 三角面。
+- 验证：`python3 -m pytest -q` 为 `199 passed / 8 skipped`；compileall 与 Ruff 通过；`DISPLAY= WAYLAND_DISPLAY= timeout 180 ~/isaacsim/python.sh scripts/humans/build.py --headless --name human_display_repair` 通过。Isaac 日志仍记录隔离环境不可见宿主机 GPU（NVML/CUDA CPU fallback），不把它写成 GPU 渲染通过。
+- 复核补充：新增显示姿态回归后完整测试为 `200 passed / 8 skipped`，本机 `/home/gsh/.local/bin/ruff check .` 通过；`uv tool run ruff check .` 仍被运行环境的 DBus transient scope 错误阻断（`Process 2 is a kernel thread, refusing`），不影响已完成的本机 Ruff 检查。
+- 用户在宿主机 GUI 首次运行时报告 `AssertionError: Instance's physics tensor entity is not valid. Play the simulation/timeline to re-initialize it`。根因是 GUI 分支在 `runtime.play()` 后立即写 DOF，Kit 尚未完成 tensor articulation 初始化；已补上 4 次 `app.update()`，与 `verify.py`/`simulate.py` 的已验证顺序一致。CPU 回归与 headless 构建复验继续通过；当前隔离环境没有显示会话，GUI 需在宿主机重新运行确认画面。
+
+## 2026-09-22 — 人体 GUI 与真实蒙皮显示修复
+
+- 复现了用户截图：`scripts/humans/build.py --gui` 未接入场景查看器的 roofless 相机，因此完整屋顶遮挡室内；同时该入口虽然加载 SMPL，却没有将网格传入 `build_human_stage()`，生成的 USD 只含胶囊碰撞体。
+- 已修复 `scripts/humans/build.py`：默认 `--view roofless`，支持 `top` / `roofless` / `exterior`，通过临时 session layer 隐藏屋顶并设置相机；`--view exterior` 可恢复完整外观。
+- 已修复 `build.py`、`verify.py`、`simulate.py` 的 USD 导出参数：真实 SMPL 网格传入 `/World/Human/Skin`。在 headless 复验中实际输出 `6890 skin verts`、`13776` 三角面、24 links、19 colliders，最终 `human build: PASSED`；基础场景哈希检查通过。
+- 复验：`python3 scripts/humans/build.py --dry-run` 通过；`python3 -m pytest -q` 为 `199 passed / 8 skipped`；本机 Ruff 和 compileall 通过。当前隔离会话的 Isaac 日志仍因没有宿主机 GPU/显示而 CPU fallback，但 USD 结构与蒙皮计数已验证。
+
+## 2026-09-22 — AMASS 导入与 GPU/CUDA 复核补充
+
+- 已新增 `src/sim2sense_fall/humans/amass.py` 和 `scripts/humans/import_amass.py`：本地 AMASS `.npz` 扫描、字段校验、源 SHA-256、SMPL-H 52→SMPL 24 重定向、Y-up→Z-up、来源元数据和摔倒候选筛选；`scripts/humans/simulate.py` 可通过 `--amass-root` / `--amass-fall-only` 接入 dry-run/仿真选择。
+- 新增 `tests/humans/test_amass_import.py`，覆盖字段缺失快速失败、来源哈希、坐标转换、候选摔倒和确定性排序。用 `/tmp/synth-amass-import` 合成 fixture 实跑 `import_amass.py`：`2 sequences scanned, 1 fall candidates`；合成数据仅验证管线，不能当作真实 AMASS。
+- 当前资产根扫描未发现真实 AMASS `.npz`，因此真实子集、人物、序列、许可和物理复核仍待用户提供已授权数据；项目不会自动下载注册制数据集。
+- GPU/CUDA 复核结果：PCI 设备 `01:00.0` 为 RTX 4060 Max-Q，内核 `nvidia` 驱动 `595.91.07` 已绑定，`nvcc 12.0`、`libcuda.so.1`、`libcudart.so.12` 和 `libnvidia-ml.so.1` 存在，`systemd-udevd` 与 `nvidia-persistenced` 均运行；但 `/dev/nvidia0`、`/dev/nvidiactl`、`/dev/nvidia-uvm` 均不存在，`/sys/class/misc` 也没有 NVIDIA 节点，`nvidia-smi` 返回 `couldn't communicate with the NVIDIA driver`。`udevadm test` 显示规则会调用 `/sbin/ub-device-create`，但该工具在当前受限会话无权限创建节点；`sudo` 被 `no new privileges` 阻断。结论是宿主机 udev/设备节点或容器权限问题，非仓库代码缺少 CUDA toolkit。
+- 因此 Isaac 日志中的 `NVML_ERROR_DRIVER_NOT_LOADED` / `No usable CUDA device present` 仍属环境限制；本轮没有手工 `mknod`、卸载/重载驱动或修改系统服务，GPU/RTX 渲染不能写成已通过。宿主机管理员需在真实系统会话修复 udev 设备节点后再复验 `nvidia-smi`、CUDA sample 和 Isaac GPU backend。
+
+### 宿主机修复后的复验（用户终端，2026-09-22）
+
+- 用户在真实宿主机执行 udev 规则重载、`udevadm trigger` 和 `nvidia-persistenced` 重启后，`/dev/nvidia0`、`/dev/nvidiactl`、`/dev/nvidia-uvm`、`/dev/nvidia-modeset` 和 `nvidia-uvm-tools` 已恢复。
+- 用户提供的 `nvidia-smi` 已成功返回：RTX 4060 Laptop GPU，驱动 `595.91.07`，驱动报告 CUDA `13.2`，显存 `1720 MiB / 8188 MiB`，GPU 利用率 `40%`。这证明宿主机 NVML 和字符设备链路已经恢复；此前的 GPU 故障已解决。
+- 本仓库的受限执行会话仍看不到宿主机 `/dev/nvidia*`，所以不能从该隔离会话代替用户运行 Isaac GPU smoke test。真实宿主机下一步运行 `~/isaacsim/python.sh scripts/humans/verify.py` 和 `~/isaacsim/python.sh scripts/humans/build.py --headless`，检查日志中不再出现 `NVML_ERROR_DRIVER_NOT_LOADED` / `No usable CUDA device`，并用 `nvidia-smi` 观察 Isaac 进程显存占用。
+- `nvcc` 工具链仍是本机 CUDA 12.0，而 NVIDIA 驱动向后兼容并报告 CUDA 13.2；这是驱动支持版本与本地编译工具包版本不同，不是当前设备故障。
+
+## 2026-09-22 — 房屋扩大与 AMASS 预览复验
+
+- `configs/scenes/indoor_apartment.yaml` 新增 `layout_scale_xy: 1.10`。缩放同时作用于房间 origin/size、门窗宽度与偏移、家具位置和水平尺寸，墙高保持原值；CPU manifest 和 Isaac headless USD 实测 footprint 为 `9.24 m × 7.70 m`，面积为 `71.148 m²`。
+- 新增 `scripts/humans/view_amass.py`。它只读取已授权的原始 AMASS `.npz`，在同一帧更新 SMPL skin、PhysX articulation DOF 和 root pose，并调用 `configure_inspection_view(mode="human")`；不把导入产物 NPZ 当作原始 AMASS 输入。
+- 用 `/tmp/synth-amass-import/Subject1/fall.npz` 播放 `amass__fall`：Isaac headless 启动、PhysX 激活、241 帧播放和 USD 预览导出全部通过，退出码 0；产物为 `artifacts/humans/amass_preview.usda`。合成 fixture 不能作为真实 AMASS 实验结果。
+- 首次预览失败是 `Prim` 直接调用 `GetPointsAttr()`，已改为 `UsdGeom.Mesh(prim)` 后复验通过。误把 `/tmp/amass-import-result`（retargeted NPZ）作为原始输入会明确失败，这是输入边界而非静默降级。
+- 本次隔离 Isaac 日志仍报告 `NVML_ERROR_DRIVER_NOT_LOADED`、`cuInit failed (100)` 并回退 CPU PhysX；宿主机 `nvidia-smi` 已由用户复验正常，GPU Isaac smoke test 仍需在宿主机显示/设备会话运行。
+- 官方 AMASS 列表访问已实际尝试：凭证 dry-run 通过并识别 4 个配置项，但带现有代理访问返回 `Connection refused`；去掉代理后返回 TLS `SSLV3_ALERT_HANDSHAKE_FAILURE`。因此本轮没有把在线下载写成完成，待网络/代理恢复后可直接重跑 `fetch_assets.py --site amass --list`。
+
+## 2026-09-22 — Transitions 本地下载核验
+
+- `/home/gsh/Downloads/Transitions.tar.bz2` 已通过 `bzip2 -tv`，归档内有 110 个 `.npz`，字段实测包含 `poses (N,156)`、`trans (N,3)`、`mocap_framerate`、`gender` 和 `betas`；解压后占用约 261 MB，存于 `data/humans/amass_raw/Transitions_mocap/`。
+- `scripts/humans/import_amass.py --root data/humans/amass_raw --out artifacts/humans/amass_transitions_import` 已通过：110 sequences scanned，全部完成 SMPL-H→SMPL 重定向；候选筛选为 `0 fall candidates`。这批数据可用于 `sit_stand`、`walk`、`crawl`、`run` 等易混淆动作，不能写成已取得跌倒样本。
+- 真实 Transitions 动作 `amass__sit_stand_poses` 已在 Isaac headless 中播放 980 帧并通过，产物和元数据写入 `artifacts/humans/amass_preview.usda/.json`；本次运行仍是当前隔离环境的 CPU PhysX fallback。
+- CMU 下载状态：此前看到的 `.part` 临时文件和 0 字节目标文件目前均已从 Downloads 消失，当前没有可校验的 CMU 压缩包；需要官网重新下载或由浏览器对仍存在的任务执行续传。
+
+## 2026-09-22 — 房屋再次扩大
+
+- 用户要求把当前房屋再扩大到 2 倍。`layout_scale_xy` 已从 `1.10` 调整为 `2.20`，因此当前实际导出 footprint 从 `9.24 × 7.70 m` 变为 `18.48 × 15.40 m`；房间高度、墙厚和竖向家具尺寸保持不变。
+- 房间 origin/size、门窗宽度/偏移、家具位置和水平尺寸继续由同一个缩放锚点统一变换，避免房间与家具各自缩放造成坐标错位；CPU 测试期望和 USD manifest 将同步刷新。
+
+## 2026-09-22 — 阶段 7 二次验收与逐帧网格导出（当前）
+
+### 修复后复验（repair6）
+
+- 修复 `scripts/humans/verify.py` 的 PD 验收：每个 DOF 单独跟踪，传送后清零根部/关节速度，并在控制试验期间暂时关闭 19 个**人体自身**碰撞体，避免固定室内家具/墙体把控制误差污染成关节跟踪失败；重力和地面检查前恢复全部碰撞体。
+- 新增 `HumanRuntime.reset_velocities()` 与 `set_body_collisions_enabled()`，并将逐 DOF 的 target/reached/error 写入 `human_verify.json`，保留可审计证据。
+- 最新 headless Isaac：[`artifacts/humans/human_verify_repair6.json`](../artifacts/humans/human_verify_repair6.json)，**PASSED**；PD 最大误差 `1.540°`（容限 `15°`），逐 DOF target/reached/error 及 stiffness/damping 均写入 JSON，驱动关闭负对照、19 个碰撞体恢复、抬高后重力回落、地面穿透和基础场景哈希均通过。运行仍记录无 NVIDIA/CUDA 设备，因此这是 CPU PhysX 回退，不是 GPU 渲染验收。
+- 新增 `scripts/humans/migrate_trials_index.py` 并迁移两个旧批次索引：`physics_dt_s` 从错误的 `120.0` 修为 `0.008333333333333333`，同时加入 `physics_hz: 120.0`；迁移脚本会读取被引用 trial JSON 的 provenance 做一致性校验。
+
+- 资产结论已纠正：`data/humans/smpl/` 中存在并可加载 SMPL v1.1.0 neutral、male、female 三个 pickle；审计为 **3/5 个声明模型可用**。neutral 实测 6890 顶点、13776 三角面、24 关节、300 个 shape directions，静止姿态线性蒙皮最大漂移 `2.22e-16 m`。因此“SMPL 尚未下载”不成立。
+- AMASS 仍未取得：在配置资产根及项目数据目录中未发现 AMASS 原始 `.npz` 动作序列；当前动作仍为 `scripted`。不能把现有动作称为 AMASS。
+- 新增 [`docs/mesh-export.md`](mesh-export.md) 和 `humans/mesh_sequence.py`：固定拓扑、逐帧世界坐标 `(x,y,z)`、米制、Z-up、物理时间轴与信道时间轴均有校验。
+- `scripts/humans/build.py` 与 `simulate.py` 现在共享同一实际 SMPL 资产和尺度拟合；CPU 规划的 `ground_offset_m` 已从此前程序骨架的 `0.9911 m` 对齐到 SMPL 规划的 `1.2462 m`。
+- `GroundTruth`/NPZ 现在写入 `mesh_vertices_xyz`、`mesh_faces`、`channel_mesh_vertices_xyz`、顶点归属和拓扑哈希。无真实模型时使用明确标记的 `capsule_proxy_mesh`，不会伪称 SMPL。
+- CPU 验收：`compileall` 通过；`196 passed / 8 skipped`；本机 Ruff 通过；`uv tool run ruff check .` 仍被环境 DBus 错误阻断（`Process 2 is a kernel thread, refusing`）。`scripts/humans/plan.py` 通过并验证真实 SMPL；`scripts/humans/simulate.py --dry-run` 通过，并实际写出每个动作的 `<motion>.mesh.npz`（`stand_neutral`: `(121, 6890, 3)` 顶点、`(13776, 3)` 面、全部有限），代理网格无零面积三角形。Isaac 数值稳定性曾在 repair3 失败，已由 repair6 复验修复。
+- 下一步：在已通过的 Isaac 分层验收上继续检查每帧 link pose→mesh 的有限性、拓扑一致性和 USD/NPZ 时间对齐；取得 AMASS 后再做动作筛选与重定向；随后进入 Sionna RT 首条 CIR/CSI smoke test。
+- Isaac repair3 的失败记录保留为历史证据：[stage7-final-isaac.log](../artifacts/humans/stage7-final-isaac.log)。其后的 repair6 已通过；失败原因是控制试验未隔离人体碰撞且复用传送后的速度状态，已在代码中修复并由逐 DOF 证据复验。
+
+## 2026-09-22 — 阶段 7 第一次批判性复审（历史快照）
+
+- 完整验收不通过，阶段 7 恢复未完成状态；程序骨架/CPU 契约部分可用。详见 [`stage7-review.md`](stage7-review.md)。该快照的资产扫描结论已被二次验收纠正。
+- 当时误报两个配置资产根不存在、SMPL 审计 0/5；二次验收确认项目内已有 3 个 SMPL v1.1.0 pickle，并通过 neutral CPU 加载与静止蒙皮复验。AMASS 原始序列仍未发现。
+- CPU：compileall、134 passed / 8 skipped、本机 Ruff 通过；plan/build/simulate CPU 路径通过。`uv tool run ruff check .` 退出 46，DBus `Process 2 is a kernel thread, refusing.`。
+- 六项待整改：伪模型导致真实蒙皮假通过及禁止降级无效；PD 目标重复转弧度；体点/方向速度混用导致假撞击；索引把 120 Hz 写成 120 s；联合键不保证人物隔离；日常动作超跟踪容差仍标可用。
+- Isaac 结构与前 3 个姿态比较通过后报 `ValueError: quaternion contains a non-finite value`，退出 1；同时有 `NVML_ERROR_DRIVER_NOT_LOADED`、接触视图 `AttributeError: 'NoneType' object has no attribute 'check'`。历史全部 PASS 未复现，根因未定位，不能只归为 GPU 缺失。
+- 日志：`artifacts/humans/stage7-review-isaac.log`。固定场景 `apartment_cn_two_bedroom`、seed=20260922、程序胶囊代理；无新训练/数据划分，指标与哈希见验收报告；GPU/GUI 未验证。
+
 ## 2026-09-21
 
 ### 阶段 1：环境与资料核对 — 已完成
@@ -213,3 +315,159 @@
 - YAML 仅材质模块路径注释变化，当前 SHA-256 为 `34109c0df85b82ad86d7fc367cc3beaca0b730361444a5e93814407df0e59d83`；历史验收报告的旧配置/清单哈希保留。
 - 本轮为固定场景回归，无数据集划分、无模型；场景 `apartment_cn_two_bedroom`，seed=20260921，2.4 GHz。物理指标沿用整改记录：静置/回落各 3 s，抬升 0.25 m，最大轴向误差容限 0.02 m。
 - 日志和含源码/资产哈希的摘要在 `artifacts/reorganization/`。场景配置与产物目录保持清晰边界，文档和协作指令已同步。
+
+## 2026-09-22 — 阶段 7：SMPL 人体、动作与跌倒仿真
+
+实现与验收细节见 [`human-simulation.md`](human-simulation.md)。本节只记录实际跑过的东西与失败教训。
+
+### 交付概览
+
+- 新增 `src/sim2sense_fall/humans/`（skeleton / assets / rotations / motion / config / rig /
+  events / export / usd_human）、`scripts/humans/`（common / plan / build / simulate / verify）、
+  `configs/humans/`（assets / human_smpl_neutral / motions）、`tests/humans/test_humans.py`（52 项）。
+- `python3 scripts/humans/plan.py`：全部 PASS。
+- `python3 -m pytest -q`：122 passed / 8 skipped（8 项需 pxr，在 bundled USD 环境另跑）。
+- `/home/gsh/.local/bin/ruff check .`：All checks passed。
+- `python3 -m compileall -q src tests scripts`：通过。
+
+### Isaac Sim 实际运行
+
+- 早期 `~/isaacsim/python.sh scripts/humans/verify.py` 记录为**全部 PASS**，但该记录不能代表当前状态；后续使用实际 SMPL 规划重跑后未复现。
+  物理姿态与 CPU 正运动学在 6 组姿态、24 连杆上误差 **0.00 mm**；
+  关节极限往返最大偏差 7×10⁻⁶ 度；抬高 0.25 m 后骨盆下落 0.279 m；最低体点 0.0000 m；
+  PD 跟踪最大误差 2.0 度（预先登记容限 15 度）；物理步长 1/120 s 生效。
+  产物 `artifacts/humans/human_verify.json`。
+- `~/isaacsim/python.sh scripts/humans/simulate.py --headless`（自由根，7 项）：
+  `fall=2`（`control_loss`、`walk_in_place`）、`no_fall=5`（无扰动站立与四向推动）。
+- `~/isaacsim/python.sh scripts/humans/simulate.py --headless --pin-root`（带记录的骨盆钉定，6 项）：
+  `no_fall=4`（站立、弯腰、坐下、原地行走），2 项被有效性门禁排除（下蹲、后倒参考）。
+- `~/isaacsim/python.sh scripts/humans/build.py --headless`：导出带动画学人体的 USD。
+
+### 最新复验状态（2026-09-22）
+
+- `python3 -m compileall -q src tests scripts`：通过；`python3 -m pytest -q`：**196 passed / 8 skipped**；本机 `/home/gsh/.local/bin/ruff check .`：通过；`uv tool run ruff check .` 仍被 DBus 环境错误阻断。
+- `scripts/humans/plan.py`：真实 SMPL neutral 资产审计和 CPU 规划通过；`scripts/humans/simulate.py --dry-run`：通过，`stand_neutral.mesh.npz` 为 `(121, 6890, 3)`、`(13776, 3)`，数值有限。
+- repair3 的失败结果（PD 57.064°、非有限残差、回落 0.1127 m）已被 repair6 复验替代；不要将该历史快照当作当前状态。当前 CPU/USD/Isaac 分层验收通过，AMASS 动作筛选和自由站立/行走控制仍未完成。
+
+### 踩到的坑（均已修复，记录以免重复）
+
+1. **`UsdPhysics.RigidBodyAPI` 没有阻尼属性**：`CreateLinearDampingAttr` 属于
+   `PhysxSchema.PhysxRigidBodyAPI`（属性名为 `physxRigidBody:linearDamping`）。已单独封装，
+   schema 缺失时记录「未写入阻尼」而不是静默跳过。
+2. **`Articulation.get_world_poses()` 只返回根连杆的位姿**（双连杆也返回一行）。逐连杆世界位姿
+   必须用 `RigidPrim(path).get_world_poses()` 读。
+3. **连杆名与骨骼关节名不同**：根连杆的 prim 名取自 articulation 路径（`Human`），不是 `pelvis`。
+   运行时的名字索引改为按规划路径构造，并在名字对不上时直接报错。
+4. **接触视图必须在构造时创建**：`RigidPrim(..., contact_filter_paths=..., max_contact_count=...)`；
+   否则 `get_net_contact_forces` 抛断言。当前实现仍取不到（记录为能力缺失与原因，不伪造零值）。
+5. **物理张量视图只在时间轴播放时有效**：未 `play()` 就读关节位置会抛
+   `Instance's physics tensor entity is not valid`。运行封装新增 `play()`/`pause()`。
+6. **出生点必须在房间地板上**：公寓是逐房间铺地板，硬编码 `(0, 0)` 落在房间之外，
+   人体直接穿过世界下落 40 m。改为从场景配置推导（最大房间内网格采样，取离家具最远且避开墙厚的点）。
+7. **空中对照的高度不能穿过天花板**：抬到 +2.0 m 会撞 2.7 m 天花板，实测误差 317 mm。
+   改到 +0.9 m 后误差为 0。检查代码里写下了这段经历。
+8. **比对参照量必须是引擎自报的关节角**：比 `指令角` 时驱动器正把关节拉回零位，差值被误算成映射误差；
+   改成用实测关节角做正运动学，测的才是映射本身。
+9. **物理步长与物理速率的混淆**：`execute_trial` 把「速率」当「步长」用，导致 1 s 试验的时间轴导出成
+   14400 s，稳定期被压缩成一步，于是所有试验都从倒地的身体开始。已修正并加入时长自检断言。
+10. **骨盆高度门限的量纲**：`pelvis_height_fraction` 原先乘的是**身高**，0.55×1.70 m 相当于直立骨盆高度的
+    94%，于是重力下正常的 6 cm 下沉被判成「姿态丧失」。改为乘**站立骨盆高度**。
+11. **世界锚定（`root_mode: anchored`）不可用**：PhysX 对 `body0 = 空` 的固定关节返回非有限四元数。
+    现在模拟入口显式拒绝该模式并给出替代路径，而不是产出 NaN 产物。
+12. **参考动作必须与关节折叠自洽**：跌倒参考的根高度按「半个刚体绕足翻倒律」下降，
+    否则身体横躺后其他胶囊体会扫到地板以下；下蹲参考的骨盆下降量与腿部折叠不匹配时，
+    双脚会穿过地板并被有效性门禁排除（这是门禁在正常工作，不是门禁出错）。
+
+### 明确未验证 / 未达标
+
+- **该历史记录中的“真实 SMPL 蒙皮网格与 AMASS 序列均未取得”已过时。** 当前 SMPL neutral 已实际加载并可导出 `smpl_skin_mesh`；AMASS 序列仍未取得。无模型时才使用明确标记的 `capsule_proxy_mesh`。
+- **自由站立与行走控制未达标**（阶段计划允许不以此作为导入成功条件）。
+- 多轴关节链未在 Isaac Sim 中运行；`support_loss` 扰动未实现。
+
+---
+
+## 2026-09-23 物理交互 P0 修复（阶段 7 之后）
+
+对照 `docs/physics-interaction-audit.md` 的根因清单，本轮完成 P0-1 与 P0-2，并在修复过程中
+发现并修掉了第三条更隐蔽的缺陷。全部结论均有 GPU 实跑证据。
+
+### P0-1 出生/站立高度两种约定混用 —— 已修复
+
+`rig.py` 把 `ground_offset_m`（体坐标系量）当 `spawn_root_position`（根连杆世界坐标）用，
+导致出生点系统性偏移。现已统一到同一约定，`verify.py` 双侧确认：
+
+- `[PASS] CPU model puts the lowest capsule on the floor -- lowest capsule point at +0.000000 m`
+- `[PASS] spawn height and ground offset use one convention -- spawn root z 1.012637 m, ground offset 1.012637 m`
+
+> 更正：早先审计里写的「出生悬空 0.2336 m」是把 `|pelvis.rest_position[2]|` 误读成悬空量。
+> 两份约定的真实差值是 **−0.044589 m**，方向是**下沉**而非悬空。已在审计文档中更正。
+
+### P0-2 接触通道 —— 已修复并改为几何归因
+
+`omni.physics.tensors` 的接触视图在本机不可用（插件报
+`Pattern '/World/Human' did not match any rigid contact for filters`，随后
+`rigid_prim.py:1924` 抛 `AttributeError: 'NoneType' object has no attribute 'check'`）。
+可用的替代是 `omni.physx` 的 `get_contact_report()`，但它返回的是**一对不透明数值句柄**，
+且实测 `PhysxContactReportAPI` 是**按 actor 而非按 collider** 生效的（摘掉全部 19 个人体胶囊，
+报告仍是同样 6 对；摘掉环境侧才清空）。因此**逐连杆归因不可能从句柄做出来**。
+
+改成**几何包含**判定：拿报告里的接触点去和实时世界坐标胶囊体做包含测试。GPU 实测：
+`attribution=geometry, limbs=['left_ankle', 'right_ankle']`，单次试验 632 行接触覆盖 121 帧。
+
+同时消除一处**静默降级**：原先三处 `except ContactSourceUnavailable` 会把「通道坏了」和
+「没碰到东西」混为一谈，一次异常就能把整段接触历史抹成空而所有检查仍报 PASS。现在：
+逐帧中途失效 → 抛错拒绝出结果；稳定期可读但归因不到连杆 → 抛错；稳定期确实零接触 → 单独报错。
+
+### 新发现并修复：支撑面高度被 bbox API 静默算错
+
+`contact_is_support` 依赖「支撑面高度」标量，这条链路连踩三层：
+
+1. `UsdGeom.BBoxCache.ComputeWorldBound` 返回**错的参考系**——不带 `xformOp:scale` 也不带
+   prim 自身 translate。地板世界顶面应为 `0.00`，它返回 `−0.0`；其上方的天花板返回同一个值
+   （应为 2.85）。错值恰好压线通过容差，所以从未暴露。
+2. 改手算时 `BBox3d`/`Range3d` 在本构建里**都没有 `TransformBy`**（`hasattr → False`），
+   按 USD 文档写的调用直接抛 `AttributeError`，又被上面的 `try/except` 吞掉。
+3. `ComputeLocalBound` 本身也错：返回**已缩放但仍被 prim translate 偏移**的盒
+   （地板实测 `z ∈ [−0.12, 0.0]`，几何真值 `[−0.06, +0.06]`），再叠一次 translate 就成了 `−0.06`。
+   它对 `render`/`proxy`/`guide` 还返回反向无穷哨兵盒。
+
+**独立交叉验证**（不依赖任何 bbox API）：实测接触点全部落在 `z = 0.00000`、`normal_z = +1.0000`，
+与场景 authord 的 `−0.06 + 0.06 = 0.00` 吻合；`docs/progress.md` 早先独立记录的
+「地基顶面 −0.12 m，行走面仍为 0 m」也一致。
+
+**修法**：绕开 `BBoxCache`，从 prim 自身 `size`/`radius`/`height` 构造居中几何盒再变换 8 个角点。
+本场景碰撞体全是 `Cube`(197) 或 `Cylinder`(34) 且都带 `size`，此法完备；未知类型返回 `None`。
+
+**效果**：`support_surface_height_m` 从 `0.0`（错值压线）变为 `−1.34e−9`（浮点零，真值）；
+`contact_is_support` 从 **True=0 / False=632** —— 一个躺在地板上的身体却判「无任何支撑接触」——
+变为 **True=456 / False=176**：456 条全部 `z = 0.00000`、`normal_z = +1.0000`（躺在地面上），
+176 条是躯干/肩/肘撞立面的冲击（高度最高 1.45 m）。回归测试 CPU 可跑、不依赖 `pxr`。
+
+### 本轮验收
+
+```bash
+python -m compileall -q src tests scripts   # OK
+uv tool run ruff check .                    # All checks passed!
+python -m pytest -q                         # 213 passed, 8 skipped
+DISPLAY=:0 ~/isaacsim/python.sh scripts/humans/verify.py                  # 31 PASS / 0 FAIL
+DISPLAY=:0 ~/isaacsim/python.sh scripts/humans/simulate.py --trial stand_neutral:none
+```
+
+`verify.py` 关键行：
+
+```
+[PASS] contact channel is readable -- 2 pairs on the probe step, source physx_contact_report
+[PASS] reported contact points resolve to body limbs -- attribution=geometry,
+       limbs=['left_ankle', 'right_ankle']
+[PASS] support surface height is readable -- -1.341104505225843e-09 m
+[PASS] raised body falls back under gravity -- pelvis descended 0.9338 m from 1.2289 m
+[PASS] no body geometry is pushed through the floor after settling -- lowest body point -0.0000 m
+```
+
+### 仍未做（诚实记录）
+
+- **P0-3**：稳定期仍每步 `set_root_pose` 传送骨盆。「站着」不是因为地面支撑，而是因为每步都在传送；
+  `settle_used_root_support: true` 是诚实记录，但首帧从不处于力学平衡。这是目前最大的剩余 P0。
+- **P0-4**：`view_amass.py` 的 physics replay mode 未实现。
+- 后果之一：`stand_neutral`（一个**站立**片段）仍被标成 `fall`（`peak_descent_speed 6.20 m/s`、
+  `final_trunk_angle 95.9°`、最低点 `−0.0406 m` 穿地 41 mm）。根因就是 P0-3。

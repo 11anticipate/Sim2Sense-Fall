@@ -1,0 +1,273 @@
+# Declared human assets and motion-capture sources for the Sim2Sense-Fall human stage.
+#
+# Nothing listed here is downloaded automatically. Both families of asset are
+# registration-gated research releases: they require an account and acceptance of a
+# licence, so the pipeline declares them, searches for them, and fails with the
+# registration URL rather than fetching anything.
+#
+# The `verified` flag records whether *this repository* has confirmed the entry
+# against the official source. Entries marked `verified: false` come from public
+# secondary documentation (reference implementations, dataset documentation
+# mirrors) and must be re-checked after registration; they are not treated as
+# established facts.
+#
+# `roots` is the search order. `$PROJECT` expands to the repository root. Licensed
+# assets must never be committed, so the in-repo root is `.gitignore`d.
+#
+# ## 2026-09-22: the SMPL family is now verified against the account's own download page
+#
+# `scripts/humans/fetch_assets.py --site smpl --list` enumerated 17 offers, which settles
+# several claims this registry used to flag as guesses:
+#
+#   1. The download page DOES publish file names (it did not when these entries were
+#      written from second-hand loaders). The Python releases are `SMPL_python_v.1.0.0.zip`
+#      and `SMPL_python_v.1.1.0.zip`, the UV map is `smpl_uv_20200910.zip`, and there are
+#      also NumPy `.npz` bodies (`SMPL_NEUTRAL.npz` and friends, 43 MB each) plus
+#      `dmpls.tar.xz`, Maya/Unity/Blender ports and sample animations.
+#   2. Inside `SMPL_python_v.1.1.0.zip` the pickles are at
+#      `smpl/models/basicmodel_{neutral,m,f}_lbs_10_207_0_v1.1.0.pkl` with a LOWERCASE
+#      leading `b`; the capitalised `basicModel_...` spelling from third-party loaders is
+#      only kept as a candidate.
+#   3. The v1.1.0 zip is 330,607,275 bytes, and the download endpoint cut the first
+#      connection at ~36 MB while still answering 200. A size-only check accepted that
+#      fragment as a delivered model, which is the same class of error as R1: fetch now
+#      validates the declared length, resumes with Range requests, and opens the container.
+#   4. Measured inside the neutral pickle: 6890 vertices, 13776 faces, `weights`
+#      (6890, 24) as a plain ndarray summing to 1 per row, `shapedirs` (6890, 3, 300) as
+#      a chumpy node, `posedirs` (6890, 3, 207), and `J_regressor` stored as a
+#      **scipy.sparse csc matrix**, not a dense array. Rest pose is Y-up with a 1.717 m
+#      stature, and the outstretched arms span 1.745 m along X, so the up axis is derived
+#      from the pelvis-to-head joint vector rather than from "longest extent".
+#
+# AMASS is still `verified: false`: smpl.is.tue.mpg.de and amass.is.tue.mpg.de are
+# separate registrations, and the account used above was refused at the AMASS login (HTTP
+# 200 with no session cookie), so no sequence has been inspected.
+
+version: 1
+notes: >-
+  SMPL and AMASS are both released for non-commercial scientific research by the
+  Max Planck Society. Neither may be redistributed, so no model file, mesh, or
+  capture sequence is stored in this repository.
+
+roots:
+  - $PROJECT/data/humans
+  - ~/.cache/sim2sense-fall/humans
+
+models:
+  # Rewritten on 2026-09-22 from the account's own download page and from the unpacked
+  # v1.1.0 pickle. The claims this block used to flag as second-hand are now measured:
+  #
+  #   1. v1.0.0 has NO neutral model. Only female and male.              (still untested)
+  #   2. v1.1.0 is the release that adds neutral, and it carries 300 shape PCs. MEASURED:
+  #      `shapedirs` is (6890, 3, 300).
+  #   3. Both are PYTHON 2.7 pickles. MEASURED for v1.1.0: it loads with the latin1
+  #      fallback, `shapedirs` is a chumpy node, `J_regressor` is a scipy.sparse csc
+  #      matrix, and `weights`/`posedirs`/`v_template`/`f` are plain NumPy arrays.
+  #
+  # The page publishes the archive names; the pickle names below were confirmed inside
+  # `SMPL_python_v.1.1.0.zip`, so `filename` is the real spelling and
+  # `filename_candidates` keeps the third-party capitalisation for files that came from
+  # elsewhere.
+
+  - id: smpl_neutral_v1_1_0
+    family: smpl
+    version: "1.1.0"
+    filename: basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl
+    filename_candidates:
+      - basicModel_neutral_lbs_10_207_0_v1.1.0.pkl
+      - basicmodel_neutral_lbs_300_207_0_v1.1.0.pkl
+      - smpl_neutral.pkl
+    subdirectory: smpl
+    requires_registration: true
+    registration_url: https://smpl.is.tue.mpg.de/download.php
+    license: >-
+      Non-commercial scientific research use only. Requires an account on
+      smpl.is.tue.mpg.de and acceptance of the SMPL licence terms.
+    license_url: https://smpl.is.tue.mpg.de/modellicense.html
+    joint_count: 24
+    betas: 300
+    pose_parameters: 72
+    pickle_python_major: 2
+    contains_chumpy_reported: true
+    pickle_layout: >-
+      MEASURED in the unpacked file: v_template (6890,3) float, f (13776,3) integer,
+      J_regressor (24,6890) as a scipy.sparse csc matrix, weights (6890,24) plain float
+      with rows summing to 1, shapedirs (6890,3,300) as a chumpy node, posedirs
+      (6890,3,207), kintree_table (2,24). Rest pose is Y-up, 1.717 m tall.
+    provenance: >-
+      Verified 2026-09-22 against the account's own download page and the unpacked
+      SMPL_python_v.1.1.0.zip. SHA-256 of the pickle as it landed:
+      4924f235e63f7c5d5b690acedf736419c2edb846a2d69fc0956169615fa75688; the fetch log in
+      artifacts/humans/asset_fetch_log.json records the archive hash and the 3-segment
+      resumed transfer.
+    verified: true
+    notes: >-
+      PREFERRED model for this project: it is the release that includes a NEUTRAL body and
+      it carries 300 shape PCs, which is what the stage-9 body-shape axis needs. The "10"
+      in the file name is a legacy label, not the shape-PC count: shapedirs measures
+      (6890, 3, 300), so all 300 directions are present and stage 9 can use any prefix of
+      them.
+
+  - id: smpl_male_v1_1_0
+    family: smpl
+    version: "1.1.0"
+    filename: basicmodel_m_lbs_10_207_0_v1.1.0.pkl
+    filename_candidates:
+      - basicModel_m_lbs_10_207_0_v1.1.0.pkl
+    subdirectory: smpl
+    requires_registration: true
+    registration_url: https://smpl.is.tue.mpg.de/download.php
+    license: >-
+      Non-commercial scientific research use only. Requires an account on
+      smpl.is.tue.mpg.de and acceptance of the SMPL licence terms.
+    license_url: https://smpl.is.tue.mpg.de/modellicense.html
+    joint_count: 24
+    betas: 300
+    pose_parameters: 72
+    pickle_python_major: 2
+    contains_chumpy_reported: true
+    pickle_layout: "same layout as the neutral release"
+    provenance: >-
+      Gender model listed on the official download page; file name from public
+      reference loaders and unverified.
+    verified: false
+    notes: Used when a gendered body is wanted instead of the neutral one.
+
+  - id: smpl_female_v1_1_0
+    family: smpl
+    version: "1.1.0"
+    filename: basicmodel_f_lbs_10_207_0_v1.1.0.pkl
+    filename_candidates:
+      - basicModel_f_lbs_10_207_0_v1.1.0.pkl
+    subdirectory: smpl
+    requires_registration: true
+    registration_url: https://smpl.is.tue.mpg.de/download.php
+    license: >-
+      Non-commercial scientific research use only. Requires an account on
+      smpl.is.tue.mpg.de and acceptance of the SMPL licence terms.
+    license_url: https://smpl.is.tue.mpg.de/modellicense.html
+    joint_count: 24
+    betas: 300
+    pose_parameters: 72
+    pickle_python_major: 2
+    contains_chumpy_reported: true
+    pickle_layout: "same layout as the neutral release"
+    provenance: >-
+      Gender model listed on the official download page; file name from public
+      reference loaders and unverified.
+    verified: false
+    notes: Used when a gendered body is wanted instead of the neutral one.
+
+  - id: smpl_male_v1_0_0
+    family: smpl
+    version: "1.0.0"
+    filename: basicModel_m_lbs_10_207_0_v1.0.0.pkl
+    filename_candidates:
+      - basicmodel_m_lbs_10_207_0_v1.0.0.pkl
+    subdirectory: smpl_v1_0_0
+    requires_registration: true
+    registration_url: https://smpl.is.tue.mpg.de/download.php
+    license: >-
+      Non-commercial scientific research use only. Requires an account on
+      smpl.is.tue.mpg.de and acceptance of the SMPL licence terms.
+    license_url: https://smpl.is.tue.mpg.de/modellicense.html
+    joint_count: 24
+    betas: 10
+    pose_parameters: 72
+    pickle_python_major: 2
+    contains_chumpy_reported: false
+    pickle_layout: >-
+      dict with v_template (V,3), f (F,3), J_regressor (24,V), weights (V,24),
+      posedirs, shapedirs, kintree_table (2,24). Public reports say this release is
+      plain NumPy while the 1.1.0 one uses chumpy; that has NOT been confirmed here,
+      and the loader detects whichever is true.
+    provenance: >-
+      Official page states v1.0.0 is female/male with 10 shape PCs. File name from
+      public reference loaders and unverified.
+    verified: false
+    notes: >-
+      Fallback only. It has no neutral body and only 10 shape PCs, so it is weaker for
+      the body-shape axis; kept so a user who already has it is not blocked.
+
+  - id: smpl_female_v1_0_0
+    family: smpl
+    version: "1.0.0"
+    filename: basicModel_f_lbs_10_207_0_v1.0.0.pkl
+    filename_candidates:
+      - basicmodel_f_lbs_10_207_0_v1.0.0.pkl
+    subdirectory: smpl_v1_0_0
+    requires_registration: true
+    registration_url: https://smpl.is.tue.mpg.de/download.php
+    license: >-
+      Non-commercial scientific research use only. Requires an account on
+      smpl.is.tue.mpg.de and acceptance of the SMPL licence terms.
+    license_url: https://smpl.is.tue.mpg.de/modellicense.html
+    joint_count: 24
+    betas: 10
+    pose_parameters: 72
+    pickle_python_major: 2
+    contains_chumpy_reported: false
+    pickle_layout: "same layout as the v1.0.0 male release"
+    provenance: "Official page states v1.0.0 is female/male with 10 shape PCs."
+    verified: false
+    notes: "Fallback only; see smpl_male_v1_0_0."
+
+auxiliary:
+  - id: smpl_uv_map_obj
+    kind: uv_map
+    filename: smpl_uv.obj
+    filename_candidates:
+      - smpl_uv_20200910.obj
+      - UV_Map.obj
+    subdirectory: smpl
+    requires_registration: true
+    registration_url: https://smpl.is.tue.mpg.de/download.php
+    license: >-
+      Non-commercial scientific research use only, same terms as the body model.
+    license_url: https://smpl.is.tue.mpg.de/modellicense.html
+    provenance: >-
+      Verified 2026-09-22: the page's UV entry is the archive `smpl_uv_20200910.zip`
+      (1,239,958 bytes) and it contains `smpl_uv.obj` (1,010,199 bytes) plus
+      `smpl_uv_20200910.png`. Both names are published, unlike the pickle names this entry
+      used to guess at.
+    verified: true
+    notes: >-
+      For texturing later. It carries no joints and no skinning weights, so it is not a
+      body model; declaring it here keeps it audited rather than forgotten in a comment.
+
+motions:
+  - id: amass
+    dataset: AMASS
+    representation: smplh_52
+    pose_parameters: 156
+    body_joints: 22
+    betas: 16
+    dmpls: 8
+    subsets:
+      - CMU
+      - KIT
+      - Transitions
+      - SFU
+      - MPI_HDM05
+      - BMLmovi
+      - ACCAD
+      - HumanEva
+    requires_registration: true
+    registration_url: https://amass.is.tue.mpg.de/download.php
+    license: >-
+      Software and data for non-commercial scientific research purposes. The AMASS
+      code repository must be cited, and the dataset terms are accepted at download.
+    license_url: https://raw.githubusercontent.com/nghorbani/amass/master/LICENSE
+    provenance: >-
+      AMASS format, SMPL-H representation, 16 betas, 8 DMPLs and the non-commercial
+      research licence are stated by the AMASS code repository README. The subset
+      list above is the set of contributing collections named publicly; the
+      per-sequence contents, frame rates and coordinate conventions have NOT been
+      inspected, because the sequences were never obtained.
+    verified: false
+    notes: >-
+      No specific sequence is claimed. In particular this repository does NOT
+      assume that AMASS contains enough fall sequences, or any reliable fall
+      annotation: candidate clips must be screened and labelled by inspection
+      after access is granted, and the screening result recorded before any
+      retargeted fall clip is used.

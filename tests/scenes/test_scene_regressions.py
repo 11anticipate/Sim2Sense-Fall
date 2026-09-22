@@ -79,6 +79,7 @@ def test_normalized_identifier_collision(payload: dict[str, Any], target: str) -
 
 @pytest.mark.parametrize("room_index", [0, 1, 2])
 def test_original_oversized_rugs_are_rejected(payload: dict[str, Any], room_index: int) -> None:
+    payload["layout_scale_xy"] = 1.0
     rug = next(p for p in payload["rooms"][room_index]["furniture"] if p["id"] == "rug")
     rug.pop("size")
     with pytest.raises(ValueError, match="outside room|intersects wall"):
@@ -86,6 +87,7 @@ def test_original_oversized_rugs_are_rejected(payload: dict[str, Any], room_inde
 
 
 def test_original_fridge_orientation_is_rejected(payload: dict[str, Any]) -> None:
+    payload["layout_scale_xy"] = 1.0
     fridge = next(p for p in payload["rooms"][4]["furniture"] if p["id"] == "refrigerator")
     fridge["rotation_z_deg"] = 0
     with pytest.raises(ValueError, match="refrigerator.*intersects wall"):

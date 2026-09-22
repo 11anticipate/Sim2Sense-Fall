@@ -32,9 +32,16 @@ def test_inspection_is_transient_and_preserves_colliders() -> None:
         cube.AddScaleOp().Set(Gf.Vec3f(*size))
         cube.GetPrim().CreateAttribute("sim2sense:category", Sdf.ValueTypeNames.String).Set(name)
         UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+    human = UsdGeom.Cube.Define(stage, "/World/Human/Skin")
+    human.CreateSizeAttr(1)
+    human.AddTranslateOp().Set(Gf.Vec3d(2, 1.5, 1.0))
+    human.AddScaleOp().Set(Gf.Vec3f(0.2, 0.2, 2.0))
+    human.GetPrim().CreateAttribute("sim2sense:category", Sdf.ValueTypeNames.String).Set(
+        "human_skin"
+    )
     source_text = stage.GetRootLayer().ExportToString()
     roof = stage.GetPrimAtPath("/World/ceiling")
-    for mode in ("top", "roofless", "exterior", "top"):
+    for mode in ("human", "top", "roofless", "exterior", "top"):
         camera_path = configure_inspection_view(stage, mode=mode)
         assert stage.GetRootLayer().ExportToString() == source_text
         assert roof.HasAPI(UsdPhysics.CollisionAPI)
@@ -42,6 +49,8 @@ def test_inspection_is_transient_and_preserves_colliders() -> None:
         assert UsdGeom.Imageable(roof).ComputeVisibility() == expected
         camera = UsdGeom.Camera(stage.GetPrimAtPath(camera_path))
         assert camera
+        if mode == "human":
+            assert camera.GetProjectionAttr().Get() == UsdGeom.Tokens.perspective
         if mode == "top":
             frustum = camera.GetCamera(Usd.TimeCode.Default()).frustum
             # All four corners of the apartment must be inside the inspection camera.

@@ -7,7 +7,7 @@ from typing import Any
 
 from .usd import pxr_modules
 
-VIEW_MODES = ("top", "roofless", "exterior")
+VIEW_MODES = ("human", "top", "roofless", "exterior")
 CAMERA_PATH = "/InspectionCamera"
 
 
@@ -36,6 +36,24 @@ def configure_inspection_view(
     ranges = [cache.ComputeWorldBound(prim).ComputeAlignedRange() for prim in floors]
     low = [min(box.GetMin()[i] for box in ranges) for i in range(3)]
     high = [max(box.GetMax()[i] for box in ranges) for i in range(3)]
+    if mode == "human":
+        human = stage.GetPrimAtPath("/World/Human")
+        if human and human.IsValid():
+            human_range = cache.ComputeWorldBound(human).ComputeAlignedRange()
+            human_low = human_range.GetMin()
+            human_high = human_range.GetMax()
+            # Keep a generous margin so hands and feet remain visible after a
+            # small physics update, while using the human rather than the whole
+            # apartment to determine the camera scale.
+            margin = 0.35
+            h_span = max(
+                float(human_high[0] - human_low[0]),
+                float(human_high[1] - human_low[1]),
+                float(human_high[2] - human_low[2]),
+            )
+            if math.isfinite(h_span) and h_span > 0:
+                low = [float(human_low[i]) - margin * h_span for i in range(3)]
+                high = [float(human_high[i]) + margin * h_span for i in range(3)]
     span = max(high[0] - low[0], high[1] - low[1])
     if not math.isfinite(span) or span <= 0:
         raise ValueError("floor bounds must have a finite positive extent")
@@ -61,11 +79,14 @@ def configure_inspection_view(
             camera.CreateVerticalApertureAttr().Set(height * 10)
             camera.CreateHorizontalApertureAttr().Set(height * aspect_ratio * 10)
         else:
-            eye = target + rt.Gf.Vec3d(span * 0.95, -span * 1.15, span * 1.6)
+            if mode == "human":
+                eye = target + rt.Gf.Vec3d(span * 1.35, -span * 1.55, span * 0.95)
+            else:
+                eye = target + rt.Gf.Vec3d(span * 0.95, -span * 1.15, span * 1.6)
             matrix = rt.Gf.Matrix4d().SetLookAt(eye, target, rt.Gf.Vec3d(0, 0, 1))
             transform.AddTransformOp().Set(matrix.GetInverse())
             camera.CreateProjectionAttr().Set(rt.UsdGeom.Tokens.perspective)
-            camera.CreateFocalLengthAttr().Set(24)
+            camera.CreateFocalLengthAttr().Set(32 if mode == "human" else 24)
             camera.CreateHorizontalApertureAttr().Set(36)
             camera.CreateVerticalApertureAttr().Set(36 / aspect_ratio)
     return CAMERA_PATH

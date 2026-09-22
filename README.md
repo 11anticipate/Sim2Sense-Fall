@@ -24,6 +24,7 @@
   说明、运行方式和 GUI 查看指令见 [`docs/indoor-scene.md`](docs/indoor-scene.md)。
 - GitHub 上游核对：`origin/main` 与本地 `main` 同为 `c77a37d`，无差异；场景工作提交在
   `feature/indoor-scene` 分支（未 push）。
+- 阶段 7 已完成 SMPL v1.1.0 neutral 的 CPU 加载、蒙皮、逐帧 NPZ、USD `Human/Skin` 写入及 CPU/USD/Isaac 分层验收；AMASS 本地导入、SMPL-H→SMPL 重定向和摔倒候选筛选已接入并通过合成数据 smoke test。最新 headless Isaac PD 最大误差 1.540°（容限 15°）；真实 AMASS 序列、自由站立/行走和 GPU 渲染仍未完成。详见 [`docs/human-simulation.md`](docs/human-simulation.md)。
 
 待完成：
 
@@ -102,7 +103,7 @@ Isaac Sim 和 Sionna 是可选运行时，不在基础安装中强制拉取。�
 
 ## 室内场景
 
-场景声明在 `configs/scenes/indoor_apartment.yaml`（8.4 m × 7.0 m，两室一厅一厨一卫加走廊）。
+场景声明在 `configs/scenes/indoor_apartment.yaml`（实际导出 18.48 m × 15.40 m；原始参数平面为 8.4 m × 7.0 m，两室一厅一厨一卫加走廊）。
 规划部分是纯 Python，不需要 Isaac Sim；USD 落地需要 Isaac Sim 的运行时。
 
 ```bash

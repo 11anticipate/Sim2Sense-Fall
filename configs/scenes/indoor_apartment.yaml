@@ -1,6 +1,7 @@
 # 典型中国城市住宅平面：两室一厅一厨一卫 + 入户走廊
 #
-# 平面为 8.4 m x 7.0 m，Z 轴向上，单位为米。每个房间用左下角 origin 和 size 描述，
+# 原始平面为 8.4 m x 7.0 m；layout_scale_xy=2.20 后实际导出约 18.48 m x 15.40 m。
+# Z 轴向上，单位为米。每个房间用左下角 origin 和 size 描述，
 # 可以直接对照建筑平面图读数。
 #
 # 墙体归属约定：共享墙只由一侧房间生成，避免重复几何。
@@ -20,6 +21,9 @@ description: >-
   次卧的成套家具。
 frequency_hz: 2.4e+9   # YAML 1.1 的浮点指数必须带符号；写成 2.4e9 会被解析成字符串
 seed: 20260921
+# Horizontal layout scale applied consistently to rooms, openings and furniture.
+# Heights remain unchanged so the apartment is slightly larger without becoming taller.
+layout_scale_xy: 2.20
 foundation: true
 foundation_margin_m: 0.5
 foundation_thickness_m: 0.30
