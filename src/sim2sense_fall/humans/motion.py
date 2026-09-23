@@ -54,7 +54,11 @@ __all__ = [
     "MotionClip",
     "MotionProvenance",
     "PHASE_LABELS",
+    "PIPELINE_FORWARD_AXIS",
+    "PIPELINE_LEFT_AXIS",
+    "PIPELINE_UP_AXIS",
     "axis_angle_change_rad",
+    "body_frame_conversion",
     "compile_scripted_clip",
     "load_motion_library",
     "motion_library_from_mapping",
@@ -127,6 +131,14 @@ def up_axis_conversion(source_up: str, target_up: str) -> np.ndarray:
     The returned matrix is a proper rotation, so axis-angle vectors transform by
     a plain matrix product and the rotation angle is preserved -- no
     pseudo-vector sign flipping is needed.
+
+    .. warning::
+       This only fixes the **up** axis. It assumes both frames agree on their
+       horizontal convention, so it cannot express a yaw. It was previously used
+       by the SMPL loader as a whole-body basis, which silently put the template's
+       lateral axis (the shoulder span) onto the pipeline's forward axis and made
+       every exported mesh lie on its side. When the source frame's forward or
+       lateral axis is unknown, use :func:`body_frame_conversion` instead.
     """
 
     frames = {
@@ -145,6 +157,76 @@ def up_axis_conversion(source_up: str, target_up: str) -> np.ndarray:
     matrix = frames[(source, target)]
     if abs(float(np.linalg.det(matrix)) - 1.0) > 1e-12:
         raise ValueError("up-axis conversion must be a proper rotation")
+    return matrix
+
+
+#: The pipeline's own body frame, as documented on RestSkeleton: forward, left, up.
+PIPELINE_FORWARD_AXIS = "x"
+PIPELINE_LEFT_AXIS = "y"
+PIPELINE_UP_AXIS = "z"
+
+
+def body_frame_conversion(
+    *,
+    up: str,
+    forward: str,
+    left: str,
+    source: str = "body model",
+) -> np.ndarray:
+    """Change-of-basis matrix for a frame given as an anatomical axis triple.
+
+    ``up`` / ``forward`` / ``left`` name the source frame's own axes -- e.g.
+    ``up="y", forward="z", left="x"`` for a template whose ``+Y`` is up, ``+Z`` is
+    forward and ``+X`` points left. The returned matrix carries source coordinates
+    into the pipeline frame (forward ``+X``, left ``+Y``, up ``+Z``).
+
+    This exists because :func:`up_axis_conversion` cannot express a yaw: it pins the
+    up axis and silently assumes the two frames agree horizontally. A body model
+    whose lateral axis sits where the pipeline expects forward would keep "up is up"
+    and still be exported lying on its side, which is exactly the defect this
+    function was added to fix.
+
+    Each token must be one of ``x``/``y``/``z`` with an optional ``-`` prefix, all
+    three must be distinct axes, and the triple must be right-handed. A left-handed
+    triple describes a mirrored body and is rejected rather than silently flipped,
+    because mirroring a skeleton swaps its left and right limbs.
+    """
+
+    def parse(token: str, role: str) -> tuple[int, float]:
+        text = str(token).strip().lower()
+        sign = -1.0 if text.startswith("-") else 1.0
+        letter = text[1:] if text[:1] in "+-" else text
+        if letter not in "xyz":
+            raise ValueError(
+                f"{source}: {role} axis must be one of x/y/z (optionally '-'-prefixed), "
+                f"got {token!r}"
+            )
+        return "xyz".index(letter), sign
+
+    up_index, up_sign = parse(up, "up")
+    forward_index, forward_sign = parse(forward, "forward")
+    left_index, left_sign = parse(left, "left")
+    if len({up_index, forward_index, left_index}) != 3:
+        raise ValueError(
+            f"{source}: the up/forward/left axes must be three distinct axes, got "
+            f"up={up!r}, forward={forward!r}, left={left!r}"
+        )
+
+    # Rows of B are the pipeline axes expressed in source coordinates: the pipeline
+    # forward row reads the source's forward component and so on. Building it this
+    # way means B @ v_source = v_pipeline directly.
+    matrix = np.zeros((3, 3), dtype=np.float64)
+    matrix["xyz".index(PIPELINE_FORWARD_AXIS), forward_index] = forward_sign
+    matrix["xyz".index(PIPELINE_LEFT_AXIS), left_index] = left_sign
+    matrix["xyz".index(PIPELINE_UP_AXIS), up_index] = up_sign
+
+    determinant = float(np.linalg.det(matrix))
+    if abs(determinant - 1.0) > 1e-9:
+        raise ValueError(
+            f"{source}: the frame (up={up!r}, forward={forward!r}, left={left!r}) has "
+            f"determinant {determinant:+.3f}; a right-handed body frame needs +1. A -1 "
+            "means the triple is left-handed (mirrored), which would swap left and right"
+        )
     return matrix
 
 
@@ -322,9 +404,7 @@ class MotionClip:
         root_deltas = np.asarray(
             [
                 axis_angle_change_rad(left, right)
-                for left, right in zip(
-                    self.root_rotation[:-1], self.root_rotation[1:], strict=True
-                )
+                for left, right in zip(self.root_rotation[:-1], self.root_rotation[1:], strict=True)
             ],
             dtype=np.float64,
         )

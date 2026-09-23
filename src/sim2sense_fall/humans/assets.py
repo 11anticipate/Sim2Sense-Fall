@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import pickle
 from collections.abc import Mapping, Sequence
@@ -34,7 +35,7 @@ from typing import Any
 import numpy as np
 import yaml
 
-from .motion import up_axis_conversion
+from .motion import body_frame_conversion
 from .skeleton import SMPL_JOINT_NAMES, SkeletonTopology, skeleton_from_kintree_table
 
 __all__ = [
@@ -865,6 +866,10 @@ class SmplModel:
     shape_directions: np.ndarray | None = None
     up_axis_source: str = "y"
     up_axis_target: str = "z"
+    #: The source file's full axis triple, e.g. ``up=y forward=z left=x``. Unlike a bare
+    #: up axis this pins the horizontal convention, so it is what makes the import
+    #: reproducible; a consumer can rebuild the same basis from it.
+    source_frame: str = ""
     stature_m: float = 0.0
     beta_count: int = 0
 
@@ -930,6 +935,7 @@ class SmplModel:
             "pickle_python_major": self.pickle_python_major,
             "has_mesh": self.has_mesh,
             "up_axis": f"{self.up_axis_source}->{self.up_axis_target}",
+            "source_frame": self.source_frame,
             "stature_m": round(self.stature_m, 6),
             "beta_count": self.beta_count,
         }
@@ -1047,12 +1053,12 @@ def _as_float_array(value: Any, name: str, *, ndim: int | None = None) -> np.nda
 def _coerce_array(value: Any, name: str, *, depth: int = 0) -> np.ndarray:
     """Turn one stored model value into a plain NumPy array.
 
-    The released v1.1.0 pickles do not store everything as arrays: ``J_regressor`` is a
-    ``scipy`` sparse matrix and several entries are ``chumpy`` nodes. A sparse matrix
-    also converts to a zero-dimensional object array, so the object branch below would
- otherwise recurse into the same object forever -- which is exactly what happened on the
-    first load of a real model file. Sparse is therefore expanded first, and the object
-    branch is depth-bounded so an unexpected layout fails with a message.
+       The released v1.1.0 pickles do not store everything as arrays: ``J_regressor`` is a
+       ``scipy`` sparse matrix and several entries are ``chumpy`` nodes. A sparse matrix
+       also converts to a zero-dimensional object array, so the object branch below would
+    otherwise recurse into the same object forever -- which is exactly what happened on the
+       first load of a real model file. Sparse is therefore expanded first, and the object
+       branch is depth-bounded so an unexpected layout fails with a message.
     """
 
     if hasattr(value, "toarray") and not isinstance(value, np.ndarray):
@@ -1087,8 +1093,7 @@ def _coerce_array(value: Any, name: str, *, depth: int = 0) -> np.ndarray:
     shapes = {entry.shape for entry in flat}
     if len(shapes) != 1:
         raise ValueError(
-            f"{name}: object array holds inconsistent shapes {sorted(shapes)}; cannot "
-            "assemble it"
+            f"{name}: object array holds inconsistent shapes {sorted(shapes)}; cannot assemble it"
         )
     return np.stack(flat).reshape((*array.shape, *flat[0].shape))
 
@@ -1182,19 +1187,24 @@ def load_smpl_model(
     if "shapedirs" in payload:
         shape_directions = _as_float_array(payload["shapedirs"], "shapedirs", ndim=3)
         if shape_directions.shape[:2] != (template.shape[0], 3):
-            raise ValueError(
-                f"shapedirs must be (V, 3, B), got {shape_directions.shape}"
-            )
+            raise ValueError(f"shapedirs must be (V, 3, B), got {shape_directions.shape}")
 
     topology = skeleton_from_kintree_table(payload["kintree_table"])
     joints = regressor @ template
 
-    # The file's own up axis is measured from the pelvis-to-head joint vector rather than
-    # assumed: the released template is Y-up, but its X extent (1.745 m across the
-    # outstretched arms) is larger than its Y extent (1.717 m tall), so "longest axis"
-    # would pick the wrong one.
-    source_up = _dominant_axis(joints[_HEAD_INDEX] - joints[_PELVIS_INDEX], model_path)
-    basis = up_axis_conversion(source_up, TARGET_UP_AXIS)
+    # Re-express the file in the pipeline body frame. Measuring only the up axis is not
+    # enough: the released template's *lateral* axis (the shoulder span) is where the
+    # pipeline expects forward, so a basis that only guarantees "up is up" yaws the body
+    # 90 degrees and every exported mesh lies on its side while still being human-sized.
+    # The frame is therefore derived from three independent anatomical directions, all
+    # read off the joint positions.
+    source_frame = _derive_body_frame(joints, topology, model_path)
+    basis = body_frame_conversion(
+        up=source_frame.up,
+        forward=source_frame.forward,
+        left=source_frame.left,
+        source=str(model_path),
+    )
     template = (basis @ template.T).T
     joints = (basis @ joints.T).T
     if shape_directions is not None:
@@ -1207,14 +1217,14 @@ def load_smpl_model(
             f"{TARGET_UP_AXIS.upper()}-up axis. A human body model should span roughly 1.7 m; "
             "a centimetres-scale or unit-mismatched file must not be imported silently."
         )
+    _check_standing_frame(joints, topology, model_path, source_frame)
     LOGGER.info(
-        "loaded %s: %d vertices, %d faces, %d joints, up axis %s->%s, stature %.3f m",
+        "loaded %s: %d vertices, %d faces, %d joints, body frame %s, stature %.3f m",
         model_path,
         template.shape[0],
         faces.shape[0],
         topology.joint_count,
-        source_up,
-        TARGET_UP_AXIS,
+        source_frame.describe(),
         stature,
     )
     return SmplModel(
@@ -1232,10 +1242,11 @@ def load_smpl_model(
         faces=faces,
         weights=weights,
         shape_directions=shape_directions,
-        up_axis_source=source_up,
+        up_axis_source=source_frame.up,
         up_axis_target=TARGET_UP_AXIS,
         stature_m=stature,
         beta_count=0 if shape_directions is None else int(shape_directions.shape[2]),
+        source_frame=source_frame.describe(),
     )
 
 
@@ -1246,34 +1257,198 @@ _HEAD_INDEX = 15
 TARGET_UP_AXIS = "z"
 
 
-def _dominant_axis(vector: np.ndarray, source: Path | str) -> str:
-    """Which positive world axis ``vector`` lies along, refusing anything else.
+@dataclass(frozen=True, slots=True)
+class _BodyFrame:
+    """The axis triple a body file is authored in, measured from its joints.
 
-    The pelvis-to-head direction of an upright body must be axis-aligned and pointing
-    up. A diagonal vector means the file is pre-rotated, and a downward one means it is
-    upside down; either way, guessing here would silently misalign every later pose.
+    ``up``/``forward``/``left`` are ``x``/``y``/``z`` tokens naming the file's own
+    axes, so they can be handed straight to
+    :func:`~sim2sense_fall.humans.motion.body_frame_conversion`.
+    """
+
+    up: str
+    forward: str
+    left: str
+    evidence: tuple[str, ...] = ()
+
+    def describe(self) -> str:
+        return f"up={self.up} forward={self.forward} left={self.left}"
+
+
+def _axis_token(vector: np.ndarray, source: Path | str, role: str) -> str:
+    """Which signed axis ``vector`` lies along, refusing a diagonal or zero vector.
+
+    Axis-alignment is required rather than assumed because a diagonal vector means the
+    file is pre-rotated, and silently picking its largest component would bake that
+    rotation into every pose downstream.
     """
 
     row = np.asarray(vector, dtype=np.float64)
     norm = float(np.linalg.norm(row))
-    if norm < 1e-9:
-        raise ValueError(f"{source}: the pelvis and head joints coincide; no up axis to derive")
+    if not math.isfinite(norm) or norm < 1e-9:
+        raise ValueError(f"{source}: the {role} reference vector is degenerate; no axis to derive")
     unit = row / norm
     index = int(np.argmax(np.abs(unit)))
-    name = "xyz"[index]
     if abs(unit[index]) < 0.99:
         raise ValueError(
-            f"{source}: the pelvis-to-head direction {np.round(unit, 3).tolist()} is not "
-            f"axis-aligned (best fit {name} at {abs(unit[index]):.3f}); this template is "
-            "pre-rotated or malformed, and the up axis cannot be derived from it"
+            f"{source}: the {role} reference direction {np.round(unit, 3).tolist()} is not "
+            f"axis-aligned (best fit {'xyz'[index]} at {abs(unit[index]):.3f}); this template "
+            "is pre-rotated or malformed, and the body frame cannot be derived from it"
         )
-    if unit[index] < 0:
-        raise ValueError(
-            f"{source}: the head sits below the pelvis along -{name.upper()}; the template is "
-            "upside down and will not be silently flipped"
-        )
-    return name
+    sign = "" if unit[index] > 0 else "-"
+    return f"{sign}{'xyz'[index]}"
 
+
+def _joint(joints: np.ndarray, topology: Any, name: str, source: Path | str) -> np.ndarray:
+    """Look a joint up by name, raising rather than silently using index 0."""
+
+    try:
+        index = topology.index(name)
+    except (KeyError, ValueError) as error:
+        raise ValueError(
+            f"{source}: the model has no {name!r} joint, so its body frame cannot be "
+            f"derived; joints present: {list(topology.joint_names)}"
+        ) from error
+    return np.asarray(joints[index], dtype=np.float64)
+
+
+def _derive_body_frame(joints: np.ndarray, topology: Any, source: Path | str) -> _BodyFrame:
+    """Measure the file's body frame from its rest joint positions.
+
+    Three independent anatomical directions are used, so a single misleading vector
+    cannot rotate the body:
+
+    ``up``
+        The pelvis-to-head vector, cross-checked against hip-to-knee, which must agree
+        after sign correction. A body whose torso and thigh disagree about which way is
+        up is not something this loader will guess about.
+    ``left``
+        The left-hip-to-right-hip vector, reversed. The shoulder line is checked to be
+        parallel to it.
+    ``forward``
+        The remaining axis, fixed by the right-handedness of the triple and verified
+        against the ankle-to-foot vector, which points forward on an upright body.
+
+    The frame is derived rather than assumed because body models disagree: the released
+    SMPL template is Y-up with its *lateral* axis on X, while this pipeline authors
+    ``+X`` forward / ``+Y`` left / ``+Z`` up. Measuring only the up axis, as an earlier
+    version of this loader did, silently yawed every body 90 degrees.
+    """
+
+    pelvis = _joint(joints, topology, "pelvis", source)
+    head = _joint(joints, topology, "head", source)
+    left_hip = _joint(joints, topology, "left_hip", source)
+    right_hip = _joint(joints, topology, "right_hip", source)
+    left_shoulder = _joint(joints, topology, "left_shoulder", source)
+    right_shoulder = _joint(joints, topology, "right_shoulder", source)
+
+    evidence: list[str] = []
+
+    up = _axis_token(head - pelvis, source, "pelvis-to-head")
+    hip_to_knee = _axis_token(
+        _joint(joints, topology, "left_knee", source)
+        - _joint(joints, topology, "left_hip", source),
+        source,
+        "hip-to-knee",
+    )
+    # hip->knee points down, so it must be the exact negation of the up token.
+    expected_down = up.lstrip("-") if up.startswith("-") else f"-{up}"
+    if hip_to_knee != expected_down:
+        raise ValueError(
+            f"{source}: the torso says up is {up!r} but the thigh points {hip_to_knee!r} "
+            f"(expected {expected_down!r}); the rest pose is not a plausible upright body "
+            "and the frame will not be guessed"
+        )
+    evidence.append(f"up={up} (pelvis->head, thigh agrees)")
+
+    hip_axis = _axis_token(right_hip - left_hip, source, "hip line (right relative to left)")
+    left = f"-{hip_axis.lstrip('-')}" if not hip_axis.startswith("-") else hip_axis.lstrip("-")
+    shoulder_axis = _axis_token(
+        right_shoulder - left_shoulder, source, "shoulder line (right relative to left)"
+    )
+    if shoulder_axis != hip_axis:
+        raise ValueError(
+            f"{source}: the hip line points {hip_axis!r} but the shoulder line points "
+            f"{shoulder_axis!r}; the rest pose is twisted, not upright"
+        )
+    evidence.append(f"left=-{hip_axis} (hip and shoulder lines agree)")
+
+    axes = {"x", "y", "z"}
+    remaining = axes - {up.lstrip("-"), left.lstrip("-")}
+    if len(remaining) != 1:
+        raise ValueError(f"{source}: up={up!r} and left={left!r} do not leave one axis for forward")
+    forward_axis = remaining.pop()
+
+    # Right-handedness fixes the forward sign. A right-handed triple has the up axis
+    # equal to left x forward, so pick the sign that satisfies it.
+    for sign in ("", "-"):
+        candidate = f"{sign}{forward_axis}"
+        triple = body_frame_conversion(up=up, forward=candidate, left=left, source=str(source))
+        if abs(float(np.linalg.det(triple)) - 1.0) <= 1e-9:
+            forward = candidate
+            break
+    else:  # pragma: no cover - one of the two signs is always right-handed
+        raise ValueError(
+            f"{source}: no right-handed forward axis found for up={up!r}, left={left!r}"
+        )
+
+    # The ankle-to-foot vector is a poor axis probe -- a foot is a short, angled segment
+    # (measured 0.888 on its dominant axis), so axis-alignment is not required here.
+    # Only the sign of its forward component is meaningful, and it is used to confirm the
+    # forward direction the right-handedness argument already chose.
+    ankle_to_foot = _joint(joints, topology, "left_foot", source) - _joint(
+        joints, topology, "left_ankle", source
+    )
+    forward_index = "xyz".index(forward_axis)
+    forward_sign = -1.0 if forward.startswith("-") else 1.0
+    toe_component = forward_sign * float(ankle_to_foot[forward_index])
+    if toe_component <= 0:
+        raise ValueError(
+            f"{source}: with forward on {forward!r}, the toes point backwards "
+            f"(component {toe_component:+.3f}); the rest pose is inconsistent"
+        )
+    evidence.append(f"forward={forward} (toes lead by {toe_component:+.3f} m)")
+
+    return _BodyFrame(up=up, forward=forward, left=left, evidence=tuple(evidence))
+
+
+def _check_standing_frame(
+    joints: np.ndarray, topology: Any, source: Path | str, frame: _BodyFrame
+) -> None:
+    """Reject a body that is not upright in the frame that was just applied.
+
+    This is the guard the old up-axis check lacked: an up-only basis could yaw the body
+    90 degrees and still pass every extent test, because a yawed body is human-sized
+    along *some* axis. Here the vertical extent is required to come from the joints that
+    actually describe height -- the pelvis-to-head rise -- and the lateral span from the
+    shoulders, rather than from whichever axis happens to be longest.
+    """
+
+    pelvis = _joint(joints, topology, "pelvis", source)
+    head = _joint(joints, topology, "head", source)
+    left_foot = _joint(joints, topology, "left_foot", source)
+    left_shoulder = _joint(joints, topology, "left_shoulder", source)
+    right_shoulder = _joint(joints, topology, "right_shoulder", source)
+
+    rise = float(head[2] - pelvis[2])
+    if rise < 0.4:
+        raise ValueError(
+            f"{source}: the head rises only {rise:.3f} m above the pelvis along the declared "
+            f"up axis ({frame.up!r}); an upright body model needs roughly 0.5 m of torso. "
+            "The body frame is wrong and downstream meshes would be exported lying down"
+        )
+    drop = float(pelvis[2] - left_foot[2])
+    if drop < 0.4:
+        raise ValueError(
+            f"{source}: the foot hangs only {drop:.3f} m below the pelvis along the declared "
+            f"up axis ({frame.up!r}); the body is not upright"
+        )
+    span = float(np.linalg.norm(right_shoulder - left_shoulder))
+    if span < 0.15:
+        raise ValueError(
+            f"{source}: the shoulders are only {span:.3f} m apart in the rest pose, so the "
+            "lateral axis cannot be identified"
+        )
 
 
 @dataclass(frozen=True, slots=True)

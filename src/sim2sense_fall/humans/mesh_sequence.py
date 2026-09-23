@@ -199,9 +199,7 @@ def _capsule_vertices_and_faces(
     vertices += np.asarray(capsule.center, dtype=np.float64)
     offsets = np.cumsum([0, *[len(ring) for ring in local_rings[:-1]]])
     faces: list[tuple[int, int, int]] = []
-    for lower, upper in zip(
-        range(len(local_rings) - 1), range(1, len(local_rings)), strict=True
-    ):
+    for lower, upper in zip(range(len(local_rings) - 1), range(1, len(local_rings)), strict=True):
         a, b = int(offsets[lower]), int(offsets[upper])
         n_a, n_b = len(local_rings[lower]), len(local_rings[upper])
         if n_a == 1:
@@ -209,10 +207,7 @@ def _capsule_vertices_and_faces(
         elif n_b == 1:
             faces.extend((a + index, b, a + (index + 1) % n_a) for index in range(n_a))
         else:
-            faces.extend(
-                (a + index, b + index, b + (index + 1) % n_b)
-                for index in range(segments)
-            )
+            faces.extend((a + index, b + index, b + (index + 1) % n_b) for index in range(segments))
             faces.extend(
                 (a + index, b + (index + 1) % n_b, a + (index + 1) % n_a)
                 for index in range(segments)
@@ -273,21 +268,122 @@ def pose_capsule_proxy_mesh(
     return output
 
 
-def fit_mesh_to_rest_joints(mesh: SmplMesh, target_joints: np.ndarray) -> SmplMesh:
-    """Apply the rig's uniform body scale and local translation to a loaded mesh.
+def joint_row_alignment(mesh: SmplMesh, target_joints: np.ndarray) -> np.ndarray:
+    """Permutation taking ``mesh.rest_joints`` rows onto the rig's joint rows.
 
-    The imported SMPL file is measured in its native stature, while the rig config
-    may request another standing height.  Skinning an unscaled mesh with scaled link
-    poses makes the surface detach from the capsules, so the same least-squares
-    scalar fit used by the rig is applied to both vertices and rest joint centres.
+    Both arrays are indexed by the same *names* -- the mesh through
+    ``mesh.topology.joint_names``, the rig through
+    :attr:`~sim2sense_fall.humans.rig.HumanRigPlan.rest_joint_positions` -- and the names
+    are the correspondence that actually carries meaning, so identity is the pairing.
+    Geometry is used only to *confirm* it.
+
+    Why the confirmation is worth having. The rig is rescaled to the configured standing
+    height while the licensed file keeps its native stature, so a correct pairing leaves
+    the raw arrays tens of millimetres apart -- 53 mm at the neutral file's ankle and
+    91 mm at the foot. Those gaps are wide enough that a nearest-row search starts
+    picking the wrong row: measured at a 1.75 m configuration, a bare ``argmin`` over
+    rows returns a *non-injective* map and therefore a body scale of ``1.0794`` where the
+    true uniform scale is ``1.0459``. Nothing raises; the exported skin just shrinks away
+    from the links it is skinned to. A future rig that reorders its rows would fail the
+    same way, silently.
+
+    The confirmation compares **inter-joint distances**, which a uniform scale changes by
+    one common factor and which are invariant under the translation between the two sets.
+    Absolute positions are unusable for this: scaling about the origin moves the root
+    itself, so a pure ``1.08`` scale legitimately puts the spine joints nearer to the
+    mesh's pelvis than to their own counterparts. Bone *directions* alone are also
+    insufficient, because a spine is collinear -- three joints share one direction and
+    a direction test cannot tell them apart. Pairwise distances do distinguish them.
+
+    Returns ``indices`` with ``mesh.rest_joints[indices[k]]`` corresponding to
+    ``target_joints[k]``.
     """
 
     if mesh.rest_joints is None:
-        raise ValueError("mesh rest joints are required to fit a mesh to the rig")
+        raise ValueError("mesh rest joints are required to align a mesh to the rig")
     target = np.asarray(target_joints, dtype=np.float64)
     source = np.asarray(mesh.rest_joints, dtype=np.float64)
-    if target.shape != source.shape or target.ndim != 2 or target.shape[1] != 3:
-        raise ValueError(f"target_joints must have shape {source.shape}, got {target.shape}")
+    if target.ndim != 2 or target.shape[1] != 3:
+        raise ValueError(f"target_joints must be (K, 3), got {target.shape}")
+    if source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError(f"mesh rest joints must be (K, 3), got {source.shape}")
+    if target.shape[0] != source.shape[0]:
+        raise ValueError(
+            f"the rig has {target.shape[0]} joints but the mesh has {source.shape[0]}; "
+            "a per-joint correspondence cannot be built"
+        )
+
+    names = tuple(mesh.topology.joint_names)
+    if len(names) != source.shape[0]:
+        raise ValueError(
+            f"the mesh topology names {len(names)} joints but its rest joints are "
+            f"{source.shape[0]} rows; a name-to-row correspondence is undefined"
+        )
+    indices = np.arange(source.shape[0])
+
+    source_distances = np.linalg.norm(source[:, None, :] - source[None, :, :], axis=2)
+    target_distances = np.linalg.norm(target[:, None, :] - target[None, :, :], axis=2)
+    spread = float(source_distances.max())
+    if spread <= 1e-12 or float(target_distances.max()) <= 1e-12:
+        raise ValueError(
+            "joint positions have no spread; a row correspondence cannot be recognised"
+        )
+    # Pairwise distances are equal up to the single unknown scale, so normalising each
+    # set by its own diameter makes them directly comparable and scale-free. The row
+    # being tested and the joint being matched are masked out of each comparison,
+    # because both self-distances are structurally zero and would otherwise dominate.
+    scale = float(target_distances.max())
+    keep = ~np.eye(len(names), dtype=bool)
+    residual = np.empty((len(names), len(names)), dtype=np.float64)
+    for row in range(len(names)):
+        for joint in range(len(names)):
+            shared = keep[row] & keep[joint]
+            residual[row, joint] = float(
+                np.abs(
+                    source_distances[row, shared] / spread - target_distances[joint, shared] / scale
+                ).mean()
+            )
+    chosen = residual.argmin(axis=0)
+    mismatched = np.where(chosen != indices)[0]
+    if mismatched.size:
+        index = int(mismatched[0])
+        row = int(chosen[index])
+        raise ValueError(
+            f"joint {index} ({names[index]}) corresponds to mesh row {index} by name, but "
+            f"mesh row {row} ({names[row]}) reproduces the rig's joint geometry far better "
+            f"(mean relative distance residual {residual[row, index]:.2e} against "
+            f"{residual[index, index]:.2e}); the mesh and the rig disagree about which "
+            "joint is which"
+        )
+    if len(set(chosen.tolist())) != len(chosen):
+        raise ValueError(
+            "the mesh and the rig do not correspond one-to-one: two rig joints share the "
+            "same best-matching mesh row, so the joint sets are not comparable"
+        )
+    return indices
+
+
+def fit_mesh_to_rest_joints(mesh: SmplMesh, target_joints: np.ndarray) -> SmplMesh:
+    """Apply the rig's uniform body scale and local translation to a loaded mesh.
+
+    The imported SMPL file is measured in its native stature, while the rig config may
+    request another standing height. Skinning an unscaled mesh with scaled link poses
+    makes the surface detach from the capsules, so a least-squares scalar fit is applied
+    to both vertices and rest joint centres.
+
+    The fit is computed over the name-matched correspondence from
+    :func:`joint_row_alignment`, and the residual is then checked: "uniform body scale
+    plus local translation" is a *similarity*, so the joint offsets must map onto each
+    other by a single scalar. If they do not, the two joint sets disagree about the
+    body's orientation and applying the scalar anyway would rotate the exported skin
+    away from the links. Measured on the shipped neutral file the residual is 0 um, so
+    the check costs nothing and catches a frame mismatch the instant one is introduced.
+    """
+
+    indices = joint_row_alignment(mesh, target_joints)
+    target = np.asarray(target_joints, dtype=np.float64)
+    assert mesh.rest_joints is not None
+    source = np.asarray(mesh.rest_joints, dtype=np.float64)[indices]
     source_centered = source - source[0]
     target_centered = target - target[0]
     denominator = float(np.sum(source_centered * source_centered))
@@ -296,6 +392,17 @@ def fit_mesh_to_rest_joints(mesh: SmplMesh, target_joints: np.ndarray) -> SmplMe
     scale = float(np.sum(source_centered * target_centered) / denominator)
     if not np.isfinite(scale) or scale <= 0:
         raise ValueError(f"mesh-to-rig scale must be finite and positive, got {scale}")
+    residual = target_centered - scale * source_centered
+    worst = float(np.linalg.norm(residual, axis=1).max())
+    spread = float(np.linalg.norm(target_centered, axis=1).max())
+    if spread > 0 and worst / spread > 1e-3:
+        raise ValueError(
+            "the mesh-to-rig fit is not a uniform scale: worst residual is "
+            f"{worst * 1e3:.2f} mm on a body whose joints span {spread:.3f} m "
+            f"({worst / spread:.1%} of the span). The mesh and the rig disagree about "
+            "the body frame, so scaling the vertices would rotate the skin away from "
+            "the links it is skinned to."
+        )
     offset = target[0] - scale * source[0]
     return SmplMesh(
         vertices=mesh.vertices * scale + offset,
@@ -303,9 +410,7 @@ def fit_mesh_to_rest_joints(mesh: SmplMesh, target_joints: np.ndarray) -> SmplMe
         weights=mesh.weights,
         topology=mesh.topology,
         rest_joints=target,
-        shape_directions=None
-        if mesh.shape_directions is None
-        else mesh.shape_directions * scale,
+        shape_directions=None if mesh.shape_directions is None else mesh.shape_directions * scale,
         source=mesh.source,
     )
 

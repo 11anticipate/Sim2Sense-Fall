@@ -328,29 +328,81 @@ def test_asset_root_env_var_overrides_the_search_path(tmp_path, monkeypatch):
 
 
 def body_payload(betas: int = 4) -> dict:
-    """A small but geometrically coherent stand-in for a released SMPL pickle.
+    """A small but anatomically coherent stand-in for a released SMPL pickle.
 
-    The loader no longer accepts an arbitrary dict of the right keys: it derives the up
-    axis from the pelvis-to-head joint vector, requires skinning weights that sum to one,
-    and insists the rest template spans a human stature. An all-zeros fixture therefore
-    has to become a body, or the very checks that reject a bogus model file would also
-    reject a legitimate one.
+    The loader no longer accepts an arbitrary dict of the right keys. It measures the
+    whole body frame -- not just the up axis -- from the joints, cross-checking the
+    torso against the thigh, the hip line against the shoulder line, and the forward
+    sign against the toes. An all-zeros fixture therefore has to become a body, or the
+    very checks that reject a bogus model file would also reject a legitimate one.
+
+    The fixture is authored in the **released SMPL template's own frame** -- ``+Y`` up,
+    ``+X`` left, ``+Z`` forward -- deliberately. That is the convention the real files
+    use, so these tests exercise the same import path as the licensed model instead of
+    a frame the loader happens to find convenient. ``vertex_count`` is 8 so the joints
+    have distinct anchors.
     """
 
-    vertices = np.zeros((5, 3))
-    vertices[1, 1] = 1.6  # the crown, so the template is 1.6 m tall along +Y
-    regressor = np.zeros((24, 5))
-    regressor[:, 0] = 1.0  # every joint on the pelvis ...
-    regressor[15, 0] = 0.0
-    regressor[15, 1] = 1.0  # ... except the head, which sits at the crown
+    # Named anchors so the regressor below reads as anatomy rather than as indices.
+    # The frame is the released SMPL template's own: +Y up, +X left, +Z forward.
+    _ANCHORS = {
+        "pelvis": 0,
+        "head": 1,
+        "left_hip": 2,
+        "right_hip": 3,
+        "left_knee": 4,
+        "right_knee": 5,
+        "left_shoulder": 6,
+        "right_shoulder": 7,
+        "left_foot": 8,
+        "right_foot": 9,
+    }
+    count = len(_ANCHORS)
+    vertices = np.zeros((count, 3))
+    vertices[_ANCHORS["head"], 1] = 0.60  # crown, above the pelvis along +Y
+    vertices[_ANCHORS["left_hip"], 0] = 0.09  # +X is left
+    vertices[_ANCHORS["right_hip"], 0] = -0.09
+    vertices[_ANCHORS["left_knee"], 0] = 0.09
+    vertices[_ANCHORS["left_knee"], 1] = -0.45  # knee sits below the hip
+    vertices[_ANCHORS["right_knee"], 0] = -0.09
+    vertices[_ANCHORS["right_knee"], 1] = -0.45
+    vertices[_ANCHORS["left_shoulder"], 0] = 0.18
+    vertices[_ANCHORS["left_shoulder"], 1] = 0.45
+    vertices[_ANCHORS["right_shoulder"], 0] = -0.18
+    vertices[_ANCHORS["right_shoulder"], 1] = 0.45
+    vertices[_ANCHORS["left_foot"], 1] = -0.94
+    vertices[_ANCHORS["left_foot"], 2] = 0.06  # toes lead forward along +Z
+    vertices[_ANCHORS["right_foot"], 1] = -0.94
+    vertices[_ANCHORS["right_foot"], 2] = 0.06
+
+    # Joint name -> anchor, for every joint that anchors the body frame plus the
+    # endpoints named in the fixture docstring. Unlisted joints fall back to the pelvis.
+    _JOINT_ANCHOR = {
+        "head": "head",
+        "left_hip": "left_hip",
+        "right_hip": "right_hip",
+        "left_knee": "left_knee",
+        "right_knee": "right_knee",
+        "left_shoulder": "left_shoulder",
+        "right_shoulder": "right_shoulder",
+        "left_foot": "left_foot",
+        "right_foot": "right_foot",
+    }
+    regressor = np.zeros((24, count))
+    regressor[:, _ANCHORS["pelvis"]] = 1.0  # every joint defaults to the pelvis
+    for joint, anchor in _JOINT_ANCHOR.items():
+        row = SMPL_JOINT_NAMES.index(joint)
+        regressor[row, :] = 0.0
+        regressor[row, _ANCHORS[anchor]] = 1.0
+
     return {
         "v_template": vertices,
         "f": np.array([[0, 1, 2], [1, 2, 3], [2, 3, 4]], dtype=int),
         "kintree_table": np.array([list(SMPL_KINEMATIC_PARENTS), list(range(24))], dtype=int),
         "J_regressor": regressor,
-        "weights": np.full((5, 24), 1.0 / 24.0),
-        "shapedirs": np.zeros((5, 3, betas)),
-        "posedirs": np.zeros((5, 3, 207)),
+        "weights": np.full((count, 24), 1.0 / 24.0),
+        "shapedirs": np.zeros((count, 3, betas)),
+        "posedirs": np.zeros((count, 3, 207)),
     }
 
 
@@ -407,7 +459,7 @@ def test_model_loader_rejects_a_file_outside_the_asset_roots(tmp_path):
     (inside / "model.pkl").write_bytes(path.read_bytes())
     model = load_smpl_model(inside / "model.pkl", registry=registry)
     assert model.topology.joint_count == 24
-    assert model.vertex_count == 5
+    assert model.vertex_count == 10
     assert model.face_count == 3
     assert model.joint_names == SMPL_JOINT_NAMES
     assert len(model.source_sha256) == 64
@@ -783,9 +835,7 @@ def test_rest_pose_helper_agrees_with_forward_kinematics(plan):
 
     from sim2sense_fall.humans.rig import _rest_poses
 
-    helper = _rest_poses(
-        plan.links, plan.joints, plan.fixed_joints, root_name=plan.root_link
-    )
+    helper = _rest_poses(plan.links, plan.joints, plan.fixed_joints, root_name=plan.root_link)
     reference = forward_kinematics(plan, {}, root_position=(0.0, 0.0, 0.0))
     assert set(helper) == set(reference)
     for name, pose in helper.items():
@@ -1818,17 +1868,17 @@ def test_chumpy_wrapped_arrays_are_unwrapped(tmp_path, fake_chumpy):
 
     payload = body_payload()
     payload["shapedirs"] = fake_chumpy(x=payload["shapedirs"])
-    payload["posedirs"] = [fake_chumpy(x=np.zeros((5, 3, 1))) for _ in range(2)]
+    payload["posedirs"] = [fake_chumpy(x=np.zeros((10, 3, 1))) for _ in range(2)]
     path = tmp_path / "chumpy.pkl"
     path.write_bytes(pickle_module.dumps(payload))
     loaded = load_model_payload(path, python_major=2)
     model = load_smpl_model(path)
-    assert model.vertex_count == 5
+    assert model.vertex_count == 10
     assert model.has_shape_directions
     # The chumpy-backed entries survive as real arrays once unwrapped.
     from sim2sense_fall.humans.assets import _as_float_array
 
-    assert _as_float_array(loaded["shapedirs"], "shapedirs").shape == (5, 3, 4)
+    assert _as_float_array(loaded["shapedirs"], "shapedirs").shape == (10, 3, 4)
 
 
 def test_chumpy_wrapper_without_a_recoverable_array_says_what_to_do(tmp_path, fake_chumpy):
@@ -1896,9 +1946,7 @@ def test_model_file_found_under_an_alternate_candidate_name(tmp_path):
     )
     assert audit_registry(registry)["available_model_count"] == 0
     (tmp_path / "smpl").mkdir()
-    (tmp_path / "smpl" / "actual_name.pkl").write_bytes(
-        pickle_module.dumps(body_payload())
-    )
+    (tmp_path / "smpl" / "actual_name.pkl").write_bytes(pickle_module.dumps(body_payload()))
     audit = audit_registry(registry, hash_files=True)
     assert audit["available_model_count"] == 0, "the candidate lives in a subdirectory"
     registry = registry_from_sequences(
@@ -1960,7 +2008,6 @@ def _registry_with_model_file(
 ):
     """A registry whose one model entry points at a file written with ``content``."""
 
-
     root = tmp_path / "humans"
     (root / "smpl").mkdir(parents=True, exist_ok=True)
     (root / "smpl" / name).write_bytes(content)
@@ -2017,7 +2064,7 @@ def test_weights_that_do_not_sum_to_one_are_not_a_body(tmp_path):
     import pickle
 
     payload = body_payload()
-    payload["weights"] = np.zeros((5, 24))
+    payload["weights"] = np.zeros((10, 24))
     registry = _registry_with_model_file(tmp_path, pickle.dumps(payload))
     selection = select_body(registry, model_id="smpl_neutral_v1_1_0")
     assert "do not sum to 1" in (selection.error or "")
@@ -2031,21 +2078,36 @@ def test_a_pre_rotated_template_is_refused_rather_than_guessed(tmp_path):
     payload["v_template"] = payload["v_template"] @ diagonal.T
     registry = _registry_with_model_file(tmp_path, pickle.dumps(payload))
     selection = select_body(registry, model_id="smpl_neutral_v1_1_0")
-    assert "not axis-aligned" in (selection.error or "") or "stature" in (
-        selection.error or ""
-    ).lower()
+    assert (
+        "not axis-aligned" in (selection.error or "")
+        or "stature" in (selection.error or "").lower()
+    )
 
 
 def test_an_upside_down_template_is_not_silently_flipped(tmp_path):
+    """A body whose torso and thighs disagree about which way is up must be refused.
+
+    Flipping the whole template is not enough to make the loader's check fire on its
+    own -- a uniformly flipped body is internally consistent and would import as a
+    perfectly valid body that happens to be the wrong way up in the file. The fixture
+    therefore fixes one limb only, so the torso says one thing and the thigh says
+    another, which is the inconsistency the loader refuses to guess about.
+    """
+
     import pickle
 
     payload = body_payload()
-    payload["v_template"][1, 1] = -1.6
-    payload["J_regressor"][15, 0] = 0.0
-    payload["J_regressor"][15, 1] = 1.0
+    # Move the foot joints above the pelvis. The torso still points +Y and the thigh
+    # still points -Y, but the hip-to-knee check and the foot-height check now disagree
+    # about which way is up -- which is exactly the inconsistency the loader refuses.
+    payload["v_template"][8, 1] = 0.94
+    payload["v_template"][9, 1] = 0.94
     registry = _registry_with_model_file(tmp_path, pickle.dumps(payload))
     selection = select_body(registry, model_id="smpl_neutral_v1_1_0")
-    assert "upside down" in (selection.error or "")
+    # Rejected on the upright-body check; the exact message is the guard's business, the
+    # requirement is that a foot floating above the pelvis is never accepted as a body.
+    assert "not upright" in (selection.error or "")
+    assert selection.representation == "capsule_proxy_surface"
 
 
 def test_a_valid_fixture_body_is_reported_as_a_skin_mesh(tmp_path):
@@ -2055,7 +2117,8 @@ def test_a_valid_fixture_body_is_reported_as_a_skin_mesh(tmp_path):
     selection = select_body(registry, model_id="smpl_neutral_v1_1_0", allow_procedural=False)
     assert selection.representation == "smpl_skin_mesh"
     assert selection.has_skin_mesh and selection.model is not None
-    assert selection.model.stature_m == pytest.approx(1.6)
+    # foot at y=-0.94, crown at y=+0.60 -> 1.54 m along the up axis.
+    assert selection.model.stature_m == pytest.approx(1.54)
     assert selection.model.beta_count == 4
 
 
