@@ -1,11 +1,29 @@
 #!/usr/bin/env python3
-"""Preview one local AMASS sequence on the SMPL body in Isaac Sim.
+"""Preview a reference motion on the SMPL body in Isaac Sim.
 
-The command reads already-authorized local AMASS ``.npz`` files.  It does not
-download or bypass the AMASS registration gate.  The preview updates the SMPL
-surface and the articulation from the same retargeted frame, so the action is
-visible even though the capsule collision proxies remain hidden.
+Two sources, one playback loop:
 
+* **AMASS** -- pass ``--amass-root`` pointing at already-authorized local ``.npz``
+  files. The command never downloads or bypasses the AMASS registration gate.
+* **The built-in scripted library** -- omit ``--amass-root`` and it reads
+  ``configs/humans/motions.yaml`` instead. This is the source that actually works on a
+  machine without AMASS, and it is how the fall references can be watched today.
+
+Both produce the same ``MotionClip``, so the playback below is written once.
+
+The preview is a **kinematic replay**: each frame writes the joint positions and the root
+pose directly and zeroes the velocities, so the action is visible even though the capsule
+collision proxies stay hidden. That also means it is *not* evidence of collision response
+-- PhysX never gets a chance to react, because the next frame overwrites the pose. Use
+``scripts/humans/verify.py`` or a future physics replay mode for that.
+
+    # a built-in fall reference, no AMASS needed
+    ~/isaacsim/python.sh scripts/humans/view_amass.py --motion fall_forward_reference
+
+    # every fall reference in the library, back to back
+    ~/isaacsim/python.sh scripts/humans/view_amass.py --fall-only
+
+    # an authorized AMASS sequence
     ~/isaacsim/python.sh scripts/humans/view_amass.py \
         --amass-root /path/to/AMASS --fall-only
 """
@@ -29,6 +47,7 @@ for directory in (SRC_DIR, SCRIPTS_DIR):
 from common import (  # noqa: E402
     DEFAULT_ASSETS,
     DEFAULT_CONFIG,
+    DEFAULT_MOTIONS,
     DEFAULT_SCENE,
     DEFAULT_SCENE_CONFIG,
     Checks,
@@ -53,7 +72,7 @@ from sim2sense_fall.humans.mesh_sequence import (  # noqa: E402
     fit_mesh_to_rest_joints,
     skin_mesh_sequence_frame,
 )
-from sim2sense_fall.humans.motion import MotionClip  # noqa: E402
+from sim2sense_fall.humans.motion import MotionClip, load_motion_library  # noqa: E402
 from sim2sense_fall.humans.rig import (  # noqa: E402
     HumanRigPlan,
     fit_rest_skeleton,
@@ -69,17 +88,30 @@ from sim2sense_fall.humans.usd_human import (  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--amass-root", type=Path, required=True)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "--motion", default=None, help="AMASS clip id; defaults to first screened fall"
+        "--amass-root",
+        type=Path,
+        default=None,
+        help="local AMASS .npz root; omit to preview the built-in scripted library instead",
     )
     parser.add_argument(
-        "--fall-only", action="store_true", help="show only screened fall candidates"
+        "--motion",
+        default=None,
+        help="clip id to preview; an amass__ id needs --amass-root, any other id does not",
+    )
+    parser.add_argument(
+        "--fall-only",
+        action="store_true",
+        help=(
+            "restrict to fall candidates: the AMASS screen when --amass-root is given, "
+            "the fall_reference tag otherwise"
+        ),
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--assets", type=Path, default=DEFAULT_ASSETS)
+    parser.add_argument("--motions", type=Path, default=DEFAULT_MOTIONS)
     parser.add_argument("--scene", type=Path, default=DEFAULT_SCENE)
     parser.add_argument("--scene-config", type=Path, default=DEFAULT_SCENE_CONFIG)
     parser.add_argument(
@@ -96,17 +128,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--limit must be positive")
     if args.seconds < 0:
         parser.error("--seconds must be non-negative")
+    if args.amass_root is None and (args.motion or "").startswith("amass__"):
+        # Named an AMASS clip without a root to read it from. Saying so here beats
+        # failing later inside the loader with a path error that names neither.
+        parser.error(f"--motion {args.motion} is an AMASS id, which needs --amass-root")
     return args
 
 
 def _screened_library(args: argparse.Namespace, plan: HumanRigPlan) -> dict[str, MotionClip]:
+    """Resolve the clips to preview, from whichever source the arguments name.
+
+    The two sources differ only in how a clip is *loaded*; everything after this point
+    works on a ``MotionClip`` and does not care where it came from. AMASS clips need
+    their root motion anchored to the apartment frame (their root poses are
+    sequence-local), while the scripted library is already authored as local offsets.
+    """
+
+    if args.amass_root is not None:
+        return _amass_library(args, plan)
+    return _scripted_library(args)
+
+
+def _amass_library(args: argparse.Namespace, plan: HumanRigPlan) -> dict[str, MotionClip]:
     if args.motion and args.motion.startswith("amass__") and args.limit is None:
         # An explicit motion id is resolved directly.  This avoids parsing all
         # 110 Transitions files before Isaac Sim can even start.
         clips = {
-            args.motion: load_amass_clip_by_id(
-                args.amass_root, args.motion, target_up_axis="z"
-            )
+            args.motion: load_amass_clip_by_id(args.amass_root, args.motion, target_up_axis="z")
         }
     else:
         clips = load_amass_library(args.amass_root, limit=args.limit, target_up_axis="z")
@@ -124,6 +172,47 @@ def _screened_library(args: argparse.Namespace, plan: HumanRigPlan) -> dict[str,
             "no AMASS clips remain after screening; omit --fall-only to preview any clip"
         )
     return screened
+
+
+def _banner(args: argparse.Namespace) -> str:
+    """Name the report after the source that was actually read.
+
+    A check report that says "AMASS preview" while playing a scripted clip is the kind
+    of small untruth that makes provenance untrustworthy, and this project keeps its
+    replay sources apart everywhere else for the same reason.
+    """
+
+    return "AMASS preview" if args.amass_root is not None else "scripted motion preview"
+
+
+def _scripted_library(args: argparse.Namespace) -> dict[str, MotionClip]:
+    """The built-in reference motions, which need no downloaded asset at all.
+
+    ``--fall-only`` selects on the ``fall_reference`` tag rather than on the AMASS
+    screen: ``screen_amass_clip`` raises on non-AMASS provenance by design, so running
+    it here would be asking the wrong question of the wrong thing. The tag is the
+    library's own declaration of which clips are fall references, which is the same
+    criterion ``collect_fall_mesh.py --fall-only`` uses.
+    """
+
+    library = load_motion_library(args.motions, topology=load_human_config(args.config).topology)
+    if args.motion is not None:
+        if args.motion not in library:
+            raise ValueError(
+                f"unknown motion {args.motion!r}; known: {sorted(library)}. "
+                "An AMASS clip needs --amass-root."
+            )
+        return {args.motion: library[args.motion]}
+    selection = {
+        clip_id: clip
+        for clip_id, clip in library.items()
+        if not args.fall_only or "fall_reference" in clip.tags
+    }
+    if not selection:
+        raise ValueError(
+            f"no scripted clip matches (--fall-only={args.fall_only}) in {args.motions}"
+        )
+    return dict(sorted(selection.items()))
 
 
 def _joint_values(clip: MotionClip, frame: int, plan: HumanRigPlan) -> dict[str, float]:
@@ -144,7 +233,10 @@ def main(argv: list[str] | None = None) -> int:
     spawn = resolve_spawn_point(args.scene_config, None, None)
     plan = plan_human_rig(config, rest=rest, spawn_xy=spawn)
     if mesh is None:
-        raise RuntimeError("AMASS preview requires the licensed SMPL surface asset")
+        raise RuntimeError(
+            "the motion preview needs the licensed SMPL surface asset; it skins the "
+            "same body the rig drives, so without it there is nothing to show"
+        )
     mesh = fit_mesh_to_rest_joints(mesh, np.asarray(plan.rest_joint_positions))
     clips = _screened_library(args, plan)
     motion_id = args.motion or next(iter(clips))
@@ -163,10 +255,15 @@ def main(argv: list[str] | None = None) -> int:
     app = boot_isaac(args.headless)
     if app is None:
         checks.check("Isaac Sim started", False, "run through ~/isaacsim/python.sh")
-        return checks.report(banner="AMASS preview")
+        return checks.report(banner=_banner(args))
     exit_code = 1
     try:
-        target = REPO_ROOT / "artifacts" / "humans" / "amass_preview.usda"
+        target = (
+            REPO_ROOT
+            / "artifacts"
+            / "humans"
+            / ("amass_preview.usda" if args.amass_root is not None else "motion_preview.usda")
+        )
         build_human_stage(
             plan,
             target,
@@ -185,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
         skin_prim = stage.GetPrimAtPath("/World/Human/Skin")
         usd = pxr_modules()
         checks.check(
-            "AMASS clip loaded",
+            "reference clip loaded",
             reference.frame_count >= 2,
             f"{motion_id}: {reference.frame_count} frames",
         )
@@ -246,10 +343,10 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         checks.info(f"previewed {motion_id}: {clip.provenance.subject}/{clip.provenance.sequence}")
-        exit_code = checks.report(banner="AMASS preview")
+        exit_code = checks.report(banner=_banner(args))
     except Exception as exc:  # noqa: BLE001 - surfaced in the check report
-        checks.check("AMASS preview completed", False, f"{type(exc).__name__}: {exc}")
-        exit_code = checks.report(banner="AMASS preview")
+        checks.check(f"{_banner(args)} completed", False, f"{type(exc).__name__}: {exc}")
+        exit_code = checks.report(banner=_banner(args))
     finally:
         app.close(exit_code=exit_code)
     return exit_code

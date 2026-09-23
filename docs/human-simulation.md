@@ -52,10 +52,36 @@ python3 scripts/humans/fetch_assets.py --site amass --select CMU Transition --un
 ```
 
 本轮合成播放复验使用 `amass__fall` 共 241 帧，生成 `artifacts/humans/amass_preview.usda`；
-该文件用于检查播放链路，不能替代真实 AMASS 序列。`view_amass.py` 需要原始 `.npz`，
-不能把 `import_amass.py` 的 retargeted 输出目录直接当作输入。
+该文件用于检查播放链路，不能替代真实 AMASS 序列。
 
-`view_amass.py` 当前是 **kinematic replay**：每帧直接写入 DOF 和根部位姿，并清零速度；
+### 不下载 AMASS 也能在 Isaac Sim 里看动作（2026-09-23 新增）
+
+`view_amass.py` 的 `--amass-root` 现在是**可选**的。省略它就改读内置的
+`configs/humans/motions.yaml`，播放的是同一个 `MotionClip` 类型，回放循环一字未改 ——
+两种来源只差一个 loader。这是本机（没有 AMASS 授权数据）**今天就能看到摔倒动作**的入口：
+
+```bash
+# 单个内置摔倒参考
+~/isaacsim/python.sh scripts/humans/view_amass.py --motion fall_forward_reference
+
+# 库里全部 fall_reference，依次播放
+~/isaacsim/python.sh scripts/humans/view_amass.py --fall-only
+
+# 任何其它内置动作
+~/isaacsim/python.sh scripts/humans/view_amass.py --motion squat
+```
+
+`--fall-only` 的判据随来源改变：给了 `--amass-root` 用 AMASS 筛选器，否则用库自身的
+`fall_reference` 标签（与 `collect_fall_mesh.py --fall-only` 同一判据）。脚本动作的
+provenance 不是 AMASS，而 `screen_amass_clip` 按设计会对非 AMASS 输入抛错，所以不能
+对它跑筛选器。输出文件名（`motion_preview.usda` / `amass_preview.usda`）与报告横幅
+同样随来源分开 —— 不能让报告写着「AMASS preview」却播着脚本动作。
+
+**kinematic replay 与 P0-3 无关。** 查看器不跑控制环，也不依赖人体能否靠 PD 自己站住；
+它每帧直接写 DOF 与根位姿。P0-3 影响的是「物理自己能不能站住」，也就是 `simulate.py`
+的自由根试验，不是「能不能看」。
+
+`view_amass.py` 是 **kinematic replay**：每帧直接写入 DOF 和根部位姿，并清零速度；
 SMPL `/World/Human/Skin` 是 visual-only，19 个胶囊只是隐藏的碰撞代理。因此查看器适合
 确认动作重定向、根位姿、蒙皮与代理的同步，不适合用来判断墙体或地面的接触反作用。
 当前物理碰撞验收入口是 `scripts/humans/verify.py`：它已验证地面回落和不穿透；墙体代理
@@ -86,6 +112,8 @@ artifacts/humans/              rig 清单、资产审计、验证报告、真值
 | `~/isaacsim/python.sh scripts/humans/build.py --gui --view roofless` | 导出并打开 GUI；隐藏屋顶、按整套房间使用室内斜视相机 |
 | `~/isaacsim/python.sh scripts/humans/build.py --gui --view top` | 导出并打开 GUI；隐藏屋顶并使用顶视相机 |
 | `python3 scripts/humans/simulate.py --dry-run` | CPU：对参考动作做正运动学回放并标注 |
+| `~/isaacsim/python.sh scripts/humans/view_amass.py --fall-only` | 在 Isaac Sim 中预览**内置**的摔倒参考动作（不需要 AMASS） |
+| `~/isaacsim/python.sh scripts/humans/view_amass.py --motion <id>` | 在 Isaac Sim 中预览任一内置动作 |
 | `~/isaacsim/python.sh scripts/humans/view_amass.py --amass-root /path/to/AMASS --fall-only` | 在 Isaac Sim 中预览已授权的原始 AMASS 候选摔倒动作 |
 | `~/isaacsim/python.sh scripts/humans/simulate.py --headless --all` | 真实物理试验 + 真值导出 |
 | `~/isaacsim/python.sh scripts/humans/verify.py` | 分层验收（CPU / USD / 物理） |
