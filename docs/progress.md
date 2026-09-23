@@ -471,3 +471,101 @@ DISPLAY=:0 ~/isaacsim/python.sh scripts/humans/simulate.py --trial stand_neutral
 - **P0-4**：`view_amass.py` 的 physics replay mode 未实现。
 - 后果之一：`stand_neutral`（一个**站立**片段）仍被标成 `fall`（`peak_descent_speed 6.20 m/s`、
   `final_trunk_angle 95.9°`、最低点 `−0.0406 m` 穿地 41 mm）。根因就是 P0-3。
+
+---
+
+## 2026-09-23 摔倒 Mesh 采集（分支 `feature/fall-mesh-capture`）
+
+用户指令：P0 改完后提交并开新分支，采集**摔倒动作**的人体 3D Mesh + 三维坐标序列
+`(x, y, z)`，为导入 Sionna RT 做准备；**只采集摔倒**；要求「多方面确认」准确性。
+
+### 修掉的缺陷：SMPL 导入被偏航 90°（真缺陷）
+
+详见 [`mesh-orientation-defect.md`](mesh-orientation-defect.md)。摘要：
+
+- **文件帧 ≠ 管线帧**。授权 pkl 是 `X=横向(左右) Y=上 Z=前`；管线（`RestSkeleton` 文档）
+  是 `X=前 Y=左 Z=上`。两者差一个绕垂直轴的 90°。
+- 旧代码用 `up_axis_conversion("y","z")`，它**只保证 up 不变**（docstring 的前提「两帧共享
+  +X 前向」对 SMPL 文件不成立），于是把「文件 X(横向)」映射到「管线 X(前)」——人体侧着站，
+  而 up 仍朝上，所以它自己的检查全过。
+- 修为 `body_frame_conversion(up=, forward=, left=)`（完整解剖三元组，强制 `det=+1` 拒绝镜像）
+  + `_derive_body_frame()` 从关节实测三元组并交叉验证 + `_check_standing_frame()`。
+  证据记入 `SmplModel.source_frame`（现报 `up=y forward=z left=x`）。
+  `_dominant_axis` 删除；`up_axis_conversion` 保留给只需要 up 的 AMASS retarget 路径。
+- 实测：模板 extent 由 `[1.5341, 0.1546, 1.4963]` → `[0.2905, 1.7451, 1.7174]`；
+  与程序化骨架的方向余弦 ≥ 0.9965。
+
+### 顺带修掉的隐患：`fit_mesh_to_rest_joints` 的关节配对
+
+原实现按行号裸 `argmin` 配对，而 rig 缩放到配置身高、pkl 保持原身高，**正确配对**也会差
+几十毫米（踝 53 mm、脚 91 mm）。实测 ≥1.75 m 时 argmin 变成**非双射**，静默返回
+scale `1.0794` 而非真实的 `1.0459`。现改为**按共用关节名取对应** + 用**关节间距离**确认
+（绝对坐标受绕原点缩放影响会把正确配对判错；骨向量方向分不开共线脊柱关节）。
+另断言拟合残差是纯相似：实测 **0 µm**。
+
+### 导出闸门：补上「旋转看不掉」的检查
+
+**原有检查全部绕垂直轴旋转不变**（stature 范围、FK 对独立 CPU 链、身高拟合收敛、胶囊包含、
+「mesh 会动」），所以偏航 90° 全过 —— 这正是缺陷能活下来的原因。新增两条，
+**比较 mesh 与 links**（links 对 links 在坏导出上也过）：
+
+| 检查 | 钉住 | 实测 |
+| --- | --- | --- |
+| `the body stands up in the first frame` | 俯仰 | 头面顶点 z `+1.5955` > 踝面 z `+0.0907` |
+| `the mesh and the links agree on the body's facing` | 偏航（朝向） | 两者横向轴都是 `y`（1.8252 / 0.3038 m） |
+
+**正向对照已做**：把导出网格绕 Z 偏航 90°（extent 正好复现 `[1.8252, 0.3038, 1.7963]`）→
+两条都 `FAIL`，报 `mesh lateral axis 'x'` vs `links lateral axis 'y'`。
+不会失败的检查不算证据。另把 `stand_neutral` 会误判 FAIL 的「mesh 必须动」改成
+「骨架动时 mesh 必须跟着动」（静态参考不动是正确结果）。
+
+### 采集产物
+
+```bash
+PYTHONPATH=src python3 scripts/humans/collect_fall_mesh.py --fall-only --overwrite
+PYTHONPATH=src python3 scripts/humans/verify_fall_collection.py      # 独立第二实现
+PYTHONPATH=src python3 scripts/humans/preview_fall_meshes.py         # 目视确认
+```
+
+`artifacts/humans/fall_mesh/`（gitignore，不入库）：
+
+| sample | 帧 | 顶点 | 面 |
+| --- | --- | --- | --- |
+| `fall_forward_reference` | 145 | 6890 | 13776 |
+| `fall_backward_reference` | 145 | 6890 | 13776 |
+| `fall_lateral_reference` | 145 | 6890 | 13776 |
+| `reach_then_topple` | 121 | 6890 | 13776 |
+
+每样本两个文件（`<id>.mesh.npz` 几何 + `<id>.points.npz` 坐标序列）**共享一条 `time_s`**；
+顶点数/面数跨帧不变，单一拓扑 sha256 `19710f11eb74fe51…`。
+`coordinate_system: world_z_up_xyz`、`units: m`、`axis_order: xyz`。
+`fidelity: kinematic_replay` —— **纯 FK 回放，无重力/无接触**，与 `simulate.py` 的
+`physics_trial` 严格区分，不得混入同一清单。
+
+清单新增 `body_model` 块（授权文件 sha256 / 身高 / 顶点面数 / 实测 `source_frame`）与
+`points.link_names` / `joint_names`，满足 `AGENTS.md` 的模型版本要求并让 `(N,24,3)` 可定位。
+`hashes.mesh_source_sha256` 曾误灌**动作**的 provenance（脚本动作恒 null），
+已拆为 `motion_source_sha256` + `body_model_sha256`。
+
+### 本轮验收（CPU，全部实跑）
+
+```bash
+python -m compileall -q src tests scripts   # OK
+uv tool run ruff check .                    # All checks passed!
+python -m pytest -q                         # 227 passed, 8 skipped
+PYTHONPATH=src python3 scripts/humans/collect_fall_mesh.py --fall-only --overwrite
+                                            # 全部 [PASS]，含新增两条解剖检查
+PYTHONPATH=src python3 scripts/humans/verify_fall_collection.py
+                                            # ALL CHECKS PASS (4 samples)，独立实现
+```
+
+目视确认（`fall_preview.png`）：首帧为张臂站立、皮肤与连杆重合、三个片段各自向
+前/侧/后倒至平躺。
+
+### 仍未做（诚实记录）
+
+- 本轮采集**只有 `kinematic_replay`**。真正带动力学的摔倒轨迹需 `simulate.py` 的
+  `physics_trial`，而它仍被 **P0-3** 卡住（稳定期每步 `set_root_pose`，PD 撑不住 → 自由落体）。
+- AMASS 侧：`--write-slice` 已实现但**未对真实树跑过**（2198 个 npz，stem 重名）。
+- `fall_lateral_reference` 的事件标签是 `invalid`（穿地 −0.219 m）—— 纯 FK 回放不查地板，
+  这是预期结果而非新 bug；**不能**为了「全绿」放宽 `penetration_limit_m`。

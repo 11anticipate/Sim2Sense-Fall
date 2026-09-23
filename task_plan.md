@@ -49,6 +49,21 @@
 
 ## 当前状态
 
+### 摔倒 Mesh 采集（2026-09-23，分支 `feature/fall-mesh-capture`）
+
+- [x] 修掉 SMPL 导入被偏航 90° 的真缺陷（文件帧 `X=横/Y=上/Z=前` vs 管线帧
+      `X=前/Y=左/Z=上`；旧的 `up_axis_conversion` 只能保证 up 不变，表达不了这个偏航）。
+      详见 [`docs/mesh-orientation-defect.md`](docs/mesh-orientation-defect.md)。
+- [x] 修掉 `fit_mesh_to_rest_joints` 按行号裸 `argmin` 配对的隐患（≥1.75 m 时非双射，
+      静默给出错误体尺）。改为按共用关节名配对 + 关节间距离确认 + 相似性断言。
+- [x] 导出闸门补上两条「绕垂直轴旋转看不掉」的检查（俯仰 + 朝向），并用正向对照
+      （把 mesh 绕 Z 偏航 90° 必须 FAIL）证明它们真的会失败。
+- [x] `--fall-only` 采集 4 个摔倒片段的人体 3D Mesh + `(x, y, z)` 序列到
+      `artifacts/humans/fall_mesh/`；`fidelity: kinematic_replay`。
+- [x] 独立第二实现复核（`verify_fall_collection.py`，不 import 采集器）+ 目视确认图。
+- [ ] 用 `simulate.py` 的 `physics_trial` 采集**带动力学**的摔倒轨迹（被 P0-3 卡住）。
+- [ ] AMASS 真实序列导入（`--write-slice` 已实现，未对真实树跑过）。
+
 ### 人体 GUI 查看修复（2026-09-22，已完成）
 
 - [x] 确认截图原因：人体构建入口未调用场景去顶相机；SMPL 网格未传入 USD 导出。
