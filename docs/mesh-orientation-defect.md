@@ -115,30 +115,38 @@ of basis between two frames whose *horizontal* conventions differ. The shipped f
 After this fix the loader reports `source_frame = up=y forward=z left=x`, and the
 template extent moved from `[1.5341, 0.1546, 1.4963]` to `[0.2905, 1.7451, 1.7174]`.
 
-## The false alarm: mistaking a T-pose for a lying body
+## The false alarm: an extent is not a pose
 
-After the loader fix, the *exported* per-clip mesh still showed a first-frame extent of
-`[0.3038, 1.8252, 1.7963]`, which was read as "a body lying down" and prompted a hunt
-for a second defect in `fit_mesh_to_rest_joints`.
+While confirming the fix I compared the exported first-frame extent against the
+pre-fix one, saw `[0.3038, 1.8252, 1.7963]`, and read it as "a body lying down". That
+reading was wrong, and the mistake is worth recording because it is the same class of
+error as the defect itself — trusting a proxy instead of asking the anatomical question.
 
-That reading was wrong. `[0.3038, 1.8252, 1.7963]` is **thickness × arm span × height**
-for a standing SMPL template, whose T-pose has its arms out: the arm span (1.825 m)
-legitimately exceeds the height (1.796 m). The template extent of
-`[0.2905, 1.7451, 1.7174]` is the same shape with the same property — 1.7451 > 1.7174 —
-so "the arms span more than the body is tall" is true before *and* after the fix. It was
-never a defect signature.
+`[0.3038, 1.8252, 1.7963]` is **thickness × arm span × height** for a standing SMPL
+template, whose rest pose is a T-pose with the arms out: the arm span (1.825 m)
+legitimately exceeds the height (1.796 m). The template extent before skinning,
+`[0.2905, 1.7451, 1.7174]`, has the same property — 1.7451 > 1.7174 — so "the arms span
+more than the body is tall" is true of the correct body as well. It is not a defect
+signature, and no arrangement of the three extents can distinguish a standing T-pose
+from a body lying with its arms out.
 
-The two checks that settle it are anatomical, not dimensional:
+What settles a pose is anatomy, and only two questions do it:
 
-1. **Where do head and feet land?** Skinning the mesh at the rest pose puts the vertex
-   nearest the head joint at `z = +1.596` and the vertex nearest an ankle at `z = +0.091`
-   — head well above feet, i.e. standing.
-2. **What does the fall do across time?** For `fall_forward_reference`, frame 0 has
-   `z ∈ [0.031, 1.827]` with the head above the feet; by frame 72 it is `z ∈ [0.466,
-   0.770]` with extent `X = 1.796` — flat on the ground. That is a forward topple.
+1. **Where are the head and the feet?** Skinning at the rest pose puts the vertex nearest
+   the head joint at `z = +1.5955` and the vertex nearest an ankle at `z = +0.0907` —
+   head well above feet, so standing.
+2. **What happens across the clip?** For `fall_forward_reference`, frame 0 spans
+   `z ∈ [0.031, 1.827]` with the head above the feet; by the last frame it is
+   `z ∈ [0.466, 0.770]`. The body has gone from upright to flat, which is what a fall is.
 
-Both are true of the pre-fix artifact. So `fit_mesh_to_rest_joints` was **never wrong**,
-and the "defect 2" narrative in the earlier version of this document is retracted.
+The one thing the extent *did* reveal, once it was compared against the link positions
+rather than against the previous artifact, is that the two can disagree — which is the
+basis of the export check described below. Chasing the phantom also turned up a genuine
+latent hazard in `fit_mesh_to_rest_joints`, closed here.
+
+So the "defect 2" narrative in an earlier version of this document is retracted:
+`fit_mesh_to_rest_joints` was applying the right kind of transform. The extent I had
+mistaken for evidence of a lying body was the correct standing T-pose.
 
 ### What *was* worth fixing there
 
@@ -159,12 +167,26 @@ row:
 
 At a `static` configuration this would have silently rescaled the skin away from the
 capsules with nothing raising. `joint_row_alignment` now takes the correspondence from
-the shared joint names (both arrays are indexed by the same `SkeletonTopology` names),
-then *confirms* it geometrically — each rig joint's counterpart must be its nearest mesh
-row, and the map must be injective. `fit_mesh_to_rest_joints` additionally asserts the
-residual is a pure similarity, which is what "uniform body scale plus local translation"
-means. Measured on the shipped neutral file the residual is **0 µm**, so the assertion is
-free and would fire the moment a frame mismatch is introduced.
+the shared joint names — both arrays are indexed by the same `SkeletonTopology`, so
+identity *is* the name-matched pairing — and then *confirms* it against geometry using
+inter-joint distances, which a uniform scale changes by one common factor:
+
+* the row being tested and the joint being matched are masked out of each comparison,
+  because both self-distances are structurally zero and would otherwise dominate the mean;
+* each rig joint's own counterpart must reproduce the rig's geometry better than any
+  other mesh row, and the map must be injective.
+
+Absolute positions cannot serve as the confirmation, and neither can bone *directions*.
+Scaling about the origin moves the root itself, so a pure 1.08 scale legitimately puts
+the spine joints nearer to the mesh's pelvis than to their own counterparts; and a spine
+is collinear, so a direction test cannot tell `spine1` from `spine2`. Pairwise distances
+are invariant under the translation, scale by a known constant, and separate collinear
+joints — which is why they are the check that works.
+
+`fit_mesh_to_rest_joints` additionally asserts the residual is a pure similarity, which
+is what "uniform body scale plus local translation" means. Measured on the shipped
+neutral file the residual is **0 µm**, so the assertion is free and would fire the moment
+a frame mismatch is introduced.
 
 ## Why the earlier acceptance tests could not catch the real defect
 
@@ -180,8 +202,22 @@ free and would fire the moment a frame mismatch is introduced.
 Every one of these is invariant under a yaw about the vertical, which is exactly what the
 defect produced. The lesson that generalises: **a rotation-invariant check cannot detect a
 rotation, and an extent is not a pose** — at least one acceptance test has to name an
-anatomical direction explicitly, and "standing" has to be tested by asking where the head
-is relative to the feet.
+anatomical direction explicitly.
+
+Two yaw-visible checks are now enforced at the export boundary, and both compare the
+**mesh against the links** rather than links against links — a links-only check passes on
+the broken export, which is precisely how the defect survived:
+
+| check | what it pins | shipped result |
+| --- | --- | --- |
+| head above feet in the standing first frame | pitch | head surface `z = +1.5955`, ankles `z = +0.0907` |
+| mesh and links agree on the wide horizontal axis | yaw (facing) | both `y`: 1.8252 m against 0.3038 m |
+
+The second is the one that catches this defect. A **positive control** confirms it is
+load-bearing: yawing a corrective copy of the exported mesh by 90° about Z — reproducing
+the pre-fix extent `[1.8252, 0.3038, 1.7963]` exactly — makes both checks fail, with the
+message naming `mesh lateral axis 'x'` against `links lateral axis 'y'`. A check that
+cannot be made to fail is not evidence, so this control is the point of the exercise.
 
 ## Verification performed
 
@@ -197,11 +233,17 @@ Each item was measured, not inferred.
 6. Proper rotation, `det = +1` (no mirroring) — enforced by `body_frame_conversion` and
    covered by a test that feeds it a left-handed triple.
 7. Standing rest mesh extent `[0.2905, 1.7451, 1.7174]`: X is the thin axis. Measured.
-8. **Head vertex above ankle vertex in world Z** at the rest pose. Asserted as a test.
-9. **The same, re-read from the exported per-clip artifact on disk** — this is the check
-   that has to hold before any sample is called good.
-10. **The fall evolves correctly over time**: head above feet at frame 0, flat at the last
-    frame. Measured frame by frame.
-11. The trajectory is correct independently of the skin: `head-pelvis` Z goes from
-    `+0.6024` to `-0.0087` over `fall_forward_reference`, and the root drops `0.40 m` —
-    as expected, since the trajectory comes from FK, not from the skin.
+8. **Head above ankles in world Z** at the rest pose. Asserted as a test.
+9. The trajectory is correct independently of the skin: `head-pelvis` Z goes from
+   `+0.6024` to `-0.0087` over `fall_forward_reference`, and the root drops `0.40 m` —
+   as expected, since the trajectory comes from FK, not from the skin.
+10. **The exported collection passes two independent verifiers.** The collector's own
+    `--verify-only` and a separate `scripts/humans/verify_fall_collection.py` that imports
+    nothing from the collector and recomputes every value from the `.npz` files with its
+    own arithmetic. Both report all checks passing on all 4 fall samples. Agreement between
+    two independent implementations is evidence; a suite agreeing with itself is not.
+11. **The yaw control fails.** A corrective copy of the export with the mesh rotated 90°
+    about Z is rejected by both verifiers, with the failing check named.
+12. **The manifest is self-describing**: the licensed file's sha256, its stature, its
+    vertex and face counts, and the measured `source_frame` are all recorded, so the
+    import can be reproduced and audited from the manifest alone.
