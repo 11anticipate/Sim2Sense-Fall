@@ -108,6 +108,15 @@ from sim2sense_fall.humans.usd_human import (  # noqa: E402
 
 LOGGER = logging.getLogger("simulate_human")
 
+#: Largest distance the settle assist may move the pelvis in one physics step, in
+#: metres. The assist is a support, not a teleport: an unbounded write can move the body
+#: arbitrarily far per step and injects whatever energy that happens to imply.
+SETTLE_MAX_CORRECTION_M = 0.005
+#: Fraction of the settle window across which the assist's authority ramps to zero. The
+#: body is left to the solver before recording starts, rather than dropped from a pose
+#: that was being held right up to the first recorded frame.
+SETTLE_RELEASE_FRACTION = 0.35
+
 #: Physics-rate trajectories are the inner loop; the reference is resampled to the
 #: physics rate so one frame index maps to one physics step.
 MIN_REFERENCE_FRAMES = 8
@@ -401,6 +410,73 @@ def _quaternions(axis_angle: np.ndarray) -> np.ndarray:
     return np.stack([axis_angle_to_quaternion(row) for row in axis_angle], axis=0)
 
 
+def _settle_with_bounded_support(
+    runtime: object,
+    app: object,
+    *,
+    target_position: np.ndarray,
+    target_quaternion: np.ndarray,
+    steps: int,
+    step_s: float,
+) -> tuple[str, float]:
+    """Hold the pelvis toward its standing pose with a *bounded, released* assist.
+
+    The previous version teleported the root to the target on every settle step. That
+    is an unbounded constraint: it can move the body arbitrarily far in one step, it
+    leaves no residual state for the solver to work from, and the instant it stops the
+    body is nowhere near equilibrium -- which is why a standing clip still collapsed
+    and was labelled a fall.
+
+    Two properties are added:
+
+    * **bounded** -- no single step may move the pelvis more than
+      ``SETTLE_MAX_CORRECTION_M``, so the assist cannot inject arbitrary energy;
+    * **released** -- the assist's authority ramps linearly to zero across the last
+      ``SETTLE_RELEASE_FRACTION`` of the window, so the body is left to the solver
+      before recording starts rather than being dropped from a held pose.
+
+    This is still an assist, not balance, and that is recorded rather than implied: the
+    trial's provenance carries ``settle_support_kind`` and ``settle_released_at_s``.
+
+    Returns ``(support_kind, released_at_s)``.
+    """
+
+    if steps <= 0:
+        raise ValueError(f"settle steps must be positive, got {steps}")
+    release_steps = max(1, int(round(steps * SETTLE_RELEASE_FRACTION)))
+    target_position = np.asarray(target_position, dtype=np.float64)
+    target_quaternion = np.asarray(target_quaternion, dtype=np.float64)
+
+    def authority_for(remaining: int) -> float:
+        return 1.0 if remaining > release_steps else remaining / release_steps
+
+    for index in range(steps):
+        remaining = steps - index
+        authority = authority_for(remaining)
+        if authority > 0.0:
+            position, quaternion = runtime.root_pose()  # type: ignore[attr-defined]
+            current = np.asarray(position, dtype=np.float64)
+            delta = target_position - current
+            distance = float(np.linalg.norm(delta))
+            if distance > 0.0:
+                # Bounded: never move more than the cap in one step, and only as far as
+                # the current authority allows.
+                stride = min(distance, SETTLE_MAX_CORRECTION_M) * authority
+                corrected = current + delta / distance * stride
+            else:
+                corrected = current
+            orientation = np.asarray(quaternion, dtype=np.float64)
+            if np.isfinite(orientation).all():
+                blended = (1.0 - authority) * orientation + authority * target_quaternion
+                norm = float(np.linalg.norm(blended))
+                orientation = blended / norm if norm > 0 else target_quaternion
+            else:
+                orientation = target_quaternion
+            runtime.set_root_pose(corrected, orientation)  # type: ignore[attr-defined]
+        app.update()  # type: ignore[attr-defined]
+    return "bounded_released_root_assist", float(steps * step_s)
+
+
 def _contact_rows(
     samples: object,
     *,
@@ -444,9 +520,7 @@ def _contact_rows(
             separations.append(float(sample.separation_m))
             handle0.append(int(sample.collider0))
             handle1.append(int(sample.collider1))
-            limbs.append(
-                per_frame_segments[index] if index < len(per_frame_segments) else ""
-            )
+            limbs.append(per_frame_segments[index] if index < len(per_frame_segments) else "")
             is_support.append(
                 support_z is not None
                 and sample.normal[2] > _SUPPORT_NORMAL_MIN_Z
@@ -678,9 +752,7 @@ def run_trials(
                 and not set(clip.tags) & PASSIVE_MOTION_TAGS
             )
             physically_valid = ground_truth.label.label != LABEL_INVALID
-            tracking_within_tolerance = (
-                float(record["tracking_error_deg"]) <= tracking_tolerance
-            )
+            tracking_within_tolerance = float(record["tracking_error_deg"]) <= tracking_tolerance
             entry = {
                 "motion_id": clip_id,
                 "perturbation_id": perturbation_id,
@@ -708,8 +780,7 @@ def run_trials(
                         )
                     ),
                     "usable": bool(
-                        physically_valid
-                        and (not tracking_applies or tracking_within_tolerance)
+                        physically_valid and (not tracking_applies or tracking_within_tolerance)
                     ),
                 },
             }
@@ -837,7 +908,7 @@ def execute_trial(
     articulation; without it they are the capsule surface proxy. Which one happened is
     recorded rather than assumed, because a wireless sample cannot be traced back to a
     body surface that was never there.
-    
+
 
     The reference is resampled to the physics rate first, so one reference frame
     corresponds to one physics step and the recorded reference trace is exactly what
@@ -867,12 +938,24 @@ def execute_trial(
     runtime.set_joint_targets(first_values)  # type: ignore[attr-defined]
     pinned = plan.root_mode == "free"  # type: ignore[attr-defined]
     pin_during_trial = bool(pin_root)
-    for _ in range(max(1, int(round(config.simulation.settle_seconds / step_s)))):  # type: ignore[attr-defined]
-        if pinned:
-            # An anchored root already holds the pelvis, and writing its pose as well
-            # fights the world constraint (observed as a non-finite quaternion).
-            runtime.set_root_pose(pinned_root, pinned_quaternion)  # type: ignore[attr-defined]
-        app.update()  # type: ignore[attr-defined]
+    settle_seconds = float(config.simulation.settle_seconds)  # type: ignore[attr-defined]
+    settle_steps = max(1, int(round(settle_seconds / step_s)))
+    support_kind = "none"
+    released_at_s = 0.0
+    if pinned:
+        support_kind, released_at_s = _settle_with_bounded_support(
+            runtime,
+            app,
+            target_position=pinned_root,
+            target_quaternion=pinned_quaternion,
+            steps=settle_steps,
+            step_s=step_s,
+        )
+    else:
+        # An anchored root already holds the pelvis, and writing its pose as well
+        # fights the world constraint (observed as a non-finite quaternion).
+        for _ in range(settle_steps):
+            app.update()  # type: ignore[attr-defined]
 
     # The reference height a fall is measured against must be where the body actually
     # stands once the solver has settled, not the analytic spawn height. Contact
@@ -1124,6 +1207,13 @@ def execute_trial(
         "supports_removed": supports_removed,
         "settle_used_root_support": pinned,
         "settle_seconds": float(config.simulation.settle_seconds),  # type: ignore[attr-defined]
+        # What the settle support actually was, and when it stopped acting. A boolean
+        # "some support was used" cannot distinguish a bounded, released assist from a
+        # per-step teleport, and that distinction is what decides whether the body at
+        # the first recorded frame is anywhere near equilibrium.
+        "settle_support_kind": support_kind,
+        "settle_released_at_s": released_at_s,
+        "settle_max_correction_m": SETTLE_MAX_CORRECTION_M,
         "step_s": step_s,
         "measured_step_s": float(np.median(np.diff(times))) if frames > 1 else step_s,
         # In ``pd`` mode only the JOINT targets come from the reference; the pelvis is a
@@ -1220,9 +1310,7 @@ def assemble_ground_truth(
         root_anchor_used=plan.root_mode == "anchored",  # type: ignore[attr-defined]
         body_representation=str(record["body_geometry"]),
         model_asset_id=None if body is None else body.model_id,
-        model_asset_sha256=None
-        if body is None or body.model is None
-        else body.model.source_sha256,
+        model_asset_sha256=None if body is None or body.model is None else body.model.source_sha256,
         model_asset_available=bool(record["body_geometry"] == REPRESENTATION_SKIN_MESH),
         perturbation_id=perturbation.id,
         perturbation_detail={
@@ -1239,6 +1327,14 @@ def assemble_ground_truth(
             "supports_removed": record["supports_removed"],
             "settle_seconds": record["settle_seconds"],
             "settle_used_root_support": record["settle_used_root_support"],
+            # What the support was and when it let go. A boolean cannot distinguish a
+            # bounded, released assist from a per-step teleport, and that is exactly the
+            # distinction that decides whether the first recorded frame is near
+            # equilibrium -- so it has to reach the emitted provenance, not just the
+            # internal record.
+            "settle_support_kind": record["settle_support_kind"],
+            "settle_released_at_s": record["settle_released_at_s"],
+            "settle_max_correction_m": record["settle_max_correction_m"],
             "root_reference_tracked": record["root_reference_tracked"],
             "root_pinned_during_trial": record["root_pinned_during_trial"],
             "control_mode": record["control_mode"],
@@ -1249,8 +1345,7 @@ def assemble_ground_truth(
             "analytic_pelvis_height_m": round(record["analytic_pelvis_height_m"], 6),
             "pelvis_height_fraction": float(config.events.pelvis_height_fraction),  # type: ignore[attr-defined]
             "pelvis_height_threshold_m": round(
-                record["settled_pelvis_height_m"]
-                * float(config.events.pelvis_height_fraction),  # type: ignore[attr-defined]
+                record["settled_pelvis_height_m"] * float(config.events.pelvis_height_fraction),  # type: ignore[attr-defined]
                 6,
             ),
             # Contact provenance travels with the perturbation detail because it is
@@ -1381,7 +1476,9 @@ def main(argv: list[str] | None = None) -> int:
         mesh = body.model.mesh() if body.has_skin_mesh else None
         rest = fit_rest_skeleton(config, mesh.rest_skeleton()) if mesh is not None else None
         spawn = resolve_spawn_point(
-            args.scene_config, args.spawn_x, args.spawn_y,
+            args.scene_config,
+            args.spawn_x,
+            args.spawn_y,
             standing_height_m=config.skeleton.height_m,
         )
         plan = plan_human_rig(config, rest=rest, spawn_xy=spawn)
