@@ -88,6 +88,15 @@ LIFT_HEIGHT_M = 0.25
 DROP_TOLERANCE_M = 0.02
 #: A link's world position from Physics must match the CPU model within this.
 KINEMATIC_TOLERANCE_M = 5e-3
+#: How far the unactuated pelvis may end up from where it stood, as a multiple of its
+#: standing height. A topple pivots it through an arc no longer than that height, so the
+#: factor leaves room for the impact slide without permitting a launch. Measured on the
+#: shipped body: 1.3855 m against 1.0126 m of standing height, i.e. 1.37x.
+DIVERGENCE_HEIGHT_FACTOR = 2.0
+#: Window sampled at the end of the drop to separate "at rest" from "still sliding".
+REST_SAMPLE_SECONDS = 0.2
+#: Movement of the pelvis across that window that still counts as at rest, in metres.
+REST_CREEP_M = 5e-3
 #: Deepest acceptable excursion below the floor, in metres.
 PENETRATION_TOLERANCE_M = -0.05
 #: Height above the standing pose used for the airborne replay check. Chosen to sit
@@ -466,7 +475,14 @@ def check_physics(
         app.update()  # type: ignore[attr-defined]
     lifted_root_z = float(runtime.root_pose()[0][2])  # type: ignore[attr-defined]
     hold(1.5)
-    final_root = np.asarray(runtime.root_pose()[0])  # type: ignore[attr-defined]
+    # The body is unactuated here (drives are zeroed above), so it topples and slides.
+    # Sample the tail of the window so "came to rest" can be told from "still sliding",
+    # which is the difference between a fall and a divergence.
+    tail: list[np.ndarray] = []
+    for _ in range(max(1, int(round(REST_SAMPLE_SECONDS / physics_dt)))):
+        app.update()  # type: ignore[attr-defined]
+        tail.append(np.asarray(runtime.root_pose()[0]).copy())  # type: ignore[attr-defined]
+    final_root = tail[-1]
     descent = lifted_root_z - float(final_root[2])
     checks.check(
         "raised body falls back under gravity",
@@ -478,11 +494,30 @@ def check_physics(
         float(final_root[2]) > 0.0,
         f"pelvis ends at z = {float(final_root[2]):.4f} m",
     )
+    # The claim is that the body *comes to rest*, not that it stays near where it stood.
+    #
+    # An earlier version bounded the horizontal travel at 1.0 m, which passed only
+    # because the body was yawed 90 degrees and happened to topple into a wall 0.52 m
+    # away that stopped it (0.4263 m). Once the body faced forward it toppled into open
+    # floor and travelled 1.3855 m, so the check began failing -- correctly, in the sense
+    # that it was measuring the right thing for the wrong reason, and its bound had been
+    # calibrated against a defect.
+    #
+    # Two properties are asserted instead, both of which a diverging body violates:
+    # it stops moving, and it does not end up farther from where it stood than a body
+    # of its own size could reach by falling over. A topple pivots the pelvis through
+    # an arc no longer than its standing height, so `2 x` that height leaves room for
+    # the slide on impact while still catching a body that has been launched.
+    travel = float(np.linalg.norm(final_root[:2] - baseline_root[:2]))
+    tail_array = np.stack(tail)
+    creep = float(np.linalg.norm(tail_array[-1][:2] - tail_array[0][:2]))
+    allowed_travel = DIVERGENCE_HEIGHT_FACTOR * root_z
     checks.check(
         "the body does not diverge across the room",
-        float(np.linalg.norm(final_root[:2] - baseline_root[:2])) <= 1.0,
-        f"pelvis moved {float(np.linalg.norm(final_root[:2] - baseline_root[:2])):.4f} m "
-        "horizontally",
+        creep < REST_CREEP_M and travel <= allowed_travel,
+        f"pelvis moved {travel:.4f} m horizontally and crept {creep * 1e3:.3f} mm over the "
+        f"final {REST_SAMPLE_SECONDS * 1e3:.0f} ms (limit {allowed_travel:.4f} m = "
+        f"{DIVERGENCE_HEIGHT_FACTOR:g} x the {root_z:.4f} m standing pelvis height)",
     )
 
     # --- floor penetration -------------------------------------------------
