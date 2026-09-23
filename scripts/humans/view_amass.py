@@ -120,6 +120,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="headless playback duration; 0 means one clip",
     )
+    parser.add_argument(
+        "--capture-dir",
+        type=Path,
+        default=None,
+        help="write viewport screenshots here instead of playing, then exit",
+    )
+    parser.add_argument(
+        "--capture-frames",
+        type=int,
+        default=6,
+        help="how many evenly spaced frames to screenshot with --capture-dir",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--gui", dest="headless", action="store_false", default=False)
     mode.add_argument("--headless", dest="headless", action="store_true")
@@ -128,6 +140,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--limit must be positive")
     if args.seconds < 0:
         parser.error("--seconds must be non-negative")
+    if args.capture_frames < 2:
+        parser.error("--capture-frames must be at least 2")
     if args.amass_root is None and (args.motion or "").startswith("amass__"):
         # Named an AMASS clip without a root to read it from. Saying so here beats
         # failing later inside the loader with a path error that names neither.
@@ -172,6 +186,113 @@ def _amass_library(args: argparse.Namespace, plan: HumanRigPlan) -> dict[str, Mo
             "no AMASS clips remain after screening; omit --fall-only to preview any clip"
         )
     return screened
+
+
+def _apply_frame(
+    runtime: object,
+    skin_mesh: object,
+    mesh: object,
+    plan: HumanRigPlan,
+    reference: MotionClip,
+    usd: object,
+    frame: int,
+) -> None:
+    """Write one replay frame to the skin, the joints and the root together.
+
+    Kept in one place so the live loop and the capture path cannot drift: a screenshot
+    taken with the skin at frame *n* and the articulation at frame *n-1* would show the
+    surface detached from the capsules, which looks exactly like a real skinning bug.
+    """
+
+    values = _joint_values(reference, frame, plan)
+    poses = forward_kinematics(
+        plan,
+        values,
+        root_position=(0.0, 0.0, 0.0),
+        root_rotation=reference.root_rotation[frame],
+    )
+    points = skin_mesh_sequence_frame(mesh, poses)
+    skin_mesh.GetPointsAttr().Set(  # type: ignore[attr-defined]
+        [usd.Gf.Vec3f(*[float(value) for value in point]) for point in points]  # type: ignore[attr-defined]
+    )
+    ordered = [values.get(name, 0.0) for name in plan.dof_names]
+    runtime.set_joint_positions(ordered)  # type: ignore[attr-defined]
+    runtime.set_joint_targets(ordered)  # type: ignore[attr-defined]
+    runtime.set_root_pose(  # type: ignore[attr-defined]
+        np.asarray(plan.spawn_root_position) + reference.root_translation[frame],
+        axis_angle_to_quaternion(reference.root_rotation[frame]),
+    )
+    runtime.reset_velocities()  # type: ignore[attr-defined]
+
+
+def _capture_frames(
+    *,
+    app: object,
+    runtime: object,
+    skin_mesh: object,
+    mesh: object,
+    plan: HumanRigPlan,
+    reference: MotionClip,
+    usd: object,
+    count: int,
+    out_dir: Path,
+    clip_id: str,
+) -> list[Path]:
+    """Step evenly through the clip and screenshot the viewport at each step.
+
+    Deterministic rather than time-driven: the live loop picks the frame from the wall
+    clock, which is right for watching and wrong for a figure, because two runs would
+    capture different poses. Here every frame is written, the viewport is allowed to
+    render it, and only then is the image taken.
+    """
+
+    import asyncio
+
+    from omni.kit.viewport.utility import (
+        capture_viewport_to_file,
+        get_active_viewport,
+        next_viewport_frame_async,
+    )
+
+    frames = _evenly_spaced(reference.frame_count, max(2, count))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    viewport = get_active_viewport()
+    if viewport is None:
+        raise RuntimeError("Isaac Sim did not create an active viewport to capture")
+
+    async def capture() -> list[Path]:
+        written: list[Path] = []
+        for frame in frames:
+            _apply_frame(runtime, skin_mesh, mesh, plan, reference, usd, frame)
+            # The replay writes USD and PhysX state; the viewport needs a rendered frame
+            # after that write, or the capture shows the previous pose.
+            await next_viewport_frame_async(viewport, 2)
+            path = out_dir / f"{clip_id}_frame{frame:04d}.png"
+            # ``capture_viewport_to_file`` returns a capture *delegate*, not an
+            # awaitable, despite the "future-like object" wording in its docstring:
+            # awaiting it raises "object MultiAOVFileCapture can't be used in 'await'
+            # expression". It is the delegate's ``wait_for_result`` that blocks until the
+            # image has actually been written.
+            pending = capture_viewport_to_file(viewport, file_path=str(path))
+            await pending.wait_for_result()
+            written.append(path)
+        # The final capture resolves its future before the PNG is flushed, so a run that
+        # exits straight after the loop leaves the last frame as a 0-byte ``.cap-*``
+        # temporary. Pump a few more frames so the file lands before the app closes.
+        await next_viewport_frame_async(viewport, 4)
+        return written
+
+    task = asyncio.ensure_future(capture())
+    while app.is_running() and not task.done():  # type: ignore[attr-defined]
+        app.update()  # type: ignore[attr-defined]
+    return task.result()
+
+
+def _evenly_spaced(total: int, count: int) -> list[int]:
+    if total <= count:
+        return list(range(total))
+    step = total / count
+    return [min(int(round(index * step)), total - 1) for index in range(count)]
 
 
 def _banner(args: argparse.Namespace) -> str:
@@ -230,7 +351,10 @@ def main(argv: list[str] | None = None) -> int:
     body = select_body(registry, model_id=config.skeleton.model_asset, allow_procedural=True)
     mesh = body.model.mesh() if body.has_skin_mesh else None
     rest = fit_rest_skeleton(config, mesh.rest_skeleton()) if mesh is not None else None
-    spawn = resolve_spawn_point(args.scene_config, None, None)
+    spawn = resolve_spawn_point(
+        args.scene_config, None, None,
+        standing_height_m=config.skeleton.height_m,
+    )
     plan = plan_human_rig(config, rest=rest, spawn_xy=spawn)
     if mesh is None:
         raise RuntimeError(
@@ -295,38 +419,62 @@ def main(argv: list[str] | None = None) -> int:
         checks.check("physics activated", activation["active_engine"] == "physx", str(activation))
         from sim2sense_fall.scenes.view import configure_inspection_view
 
-        configure_inspection_view(stage, mode="human", aspect_ratio=1600 / 900)
-        started = time.monotonic()
-        frame = -1
-        duration = args.seconds if args.seconds > 0 else float(reference.times_s[-1])
+        # ``configure_inspection_view`` authors a camera and *returns its path*; the
+        # caller has to point the viewport at it. This call used to discard the return
+        # value, so the viewport kept whatever camera it had and every screenshot showed
+        # a corner of the room with no body in it -- a capture that "succeeded" while
+        # proving nothing about what was on screen.
+        camera_path = configure_inspection_view(stage, mode="human", aspect_ratio=1600 / 900)
+        from omni.kit.viewport.utility import get_active_viewport
+
+        active_viewport = get_active_viewport()
+        if active_viewport is not None:
+            active_viewport.camera_path = camera_path
+            checks.info(f"viewport camera set to {camera_path}")
         skin_mesh = usd.UsdGeom.Mesh(skin_prim)
-        while app.is_running():
-            elapsed = time.monotonic() - started
-            current = int(elapsed * float(reference.fps))
-            if args.headless and elapsed >= duration:
-                break
-            current %= reference.frame_count
-            if current != frame:
-                values = _joint_values(reference, current, plan)
-                poses = forward_kinematics(
-                    plan,
-                    values,
-                    root_position=(0.0, 0.0, 0.0),
-                    root_rotation=reference.root_rotation[current],
-                )
-                points = skin_mesh_sequence_frame(mesh, poses)
-                skin_mesh.GetPointsAttr().Set(
-                    [usd.Gf.Vec3f(*[float(value) for value in point]) for point in points]
-                )
-                runtime.set_joint_positions([values.get(name, 0.0) for name in plan.dof_names])
-                runtime.set_joint_targets([values.get(name, 0.0) for name in plan.dof_names])
-                runtime.set_root_pose(
-                    np.asarray(plan.spawn_root_position) + reference.root_translation[current],
-                    axis_angle_to_quaternion(reference.root_rotation[current]),
-                )
-                runtime.reset_velocities()
-                frame = current
-            app.update()
+        if args.capture_dir is not None:
+            captured = _capture_frames(
+                app=app,
+                runtime=runtime,
+                skin_mesh=skin_mesh,
+                mesh=mesh,
+                plan=plan,
+                reference=reference,
+                usd=usd,
+                count=args.capture_frames,
+                out_dir=args.capture_dir,
+                clip_id=motion_id,
+            )
+            checks.check(
+                "frames were captured from the viewport",
+                len(captured) >= 2 and all(path.is_file() for path in captured),
+                f"{len(captured)} PNGs in {args.capture_dir}; expected {args.capture_frames} "
+                f"evenly spaced frames",
+            )
+            written = sum(1 for path in captured if path.is_file())
+            missing = [path.name for path in captured if not path.is_file()]
+            checks.check(
+                "every captured frame reached the disk",
+                not missing,
+                f"{written} of {len(captured)} written"
+                + (f"; missing {missing}" if missing else ""),
+            )
+            for path in captured:
+                print(f"  {path}")
+        else:
+            started = time.monotonic()
+            frame = -1
+            duration = args.seconds if args.seconds > 0 else float(reference.times_s[-1])
+            while app.is_running():
+                elapsed = time.monotonic() - started
+                current = int(elapsed * float(reference.fps))
+                if args.headless and elapsed >= duration:
+                    break
+                current %= reference.frame_count
+                if current != frame:
+                    _apply_frame(runtime, skin_mesh, mesh, plan, reference, usd, current)
+                    frame = current
+                app.update()
         write_json(
             target.with_suffix(".json"),
             {

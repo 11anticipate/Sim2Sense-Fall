@@ -567,7 +567,10 @@ def main(argv: list[str] | None = None) -> int:
             motions_path=args.motions,
             height_m=args.height,
         )
-        spawn = resolve_spawn_point(args.scene_config, args.spawn_x, args.spawn_y)
+        spawn = resolve_spawn_point(
+            args.scene_config, args.spawn_x, args.spawn_y,
+            standing_height_m=config.skeleton.height_m,
+        )
         body = select_body(
             registry,
             model_id=config.skeleton.model_asset,

@@ -33,6 +33,7 @@ __all__ = [
     "DEFAULT_SCENE",
     "DEFAULT_SCENE_CONFIG",
     "REPO_ROOT",
+    "human_spawn_clearance_m",
     "resolve_spawn_point",
     "scene_spawn_point",
     "set_physics_dt",
@@ -210,6 +211,27 @@ def set_physics_dt(dt_s: float) -> tuple[float, bool]:
 
 #: Human footprint half-width used when choosing a spawn point, in metres.
 SPAWN_CLEARANCE_M = 0.40
+#: The rest pose is a T-pose, whose arm span slightly exceeds the stature, so the body's
+#: sideways half-extent is this fraction of its standing height. It is multiplied into
+#: the wall clearance so a spawn chosen for furniture clearance cannot also put the hands
+#: through a wall: measured at 0.39 m of arm outside the living room at the shipped
+#: 0.40 m clearance and a 1.70 m figure, whose arms span 1.83 m.
+BODY_HALF_SPAN_FRACTION = 0.55
+
+
+def human_spawn_clearance_m(standing_height_m: float) -> float:
+    """Wall clearance a standing human needs so its rest pose stays inside the room.
+
+    ``scene_spawn_point`` picks the spot furthest from *furniture*, which is a different
+    question from "is the whole body inside the walls". At the shipped clearance the
+    answer was no: the figure spawned 0.52 m from two walls and its arms reached 0.39 m
+    past the wall face, which is visible in any screenshot of the preview.
+    """
+
+    height = float(standing_height_m)
+    if not math.isfinite(height) or height <= 0.0:
+        raise ValueError(f"standing_height_m must be finite and positive, got {height!r}")
+    return SPAWN_CLEARANCE_M + BODY_HALF_SPAN_FRACTION * height
 
 
 def _linspace(start: float, stop: float, count: int) -> list[float]:
@@ -271,12 +293,29 @@ def scene_spawn_point(
 
 
 def resolve_spawn_point(
-    scene_config: Path, spawn_x: float | None, spawn_y: float | None
+    scene_config: Path,
+    spawn_x: float | None,
+    spawn_y: float | None,
+    *,
+    standing_height_m: float = 0.0,
 ) -> tuple[float, float]:
-    """Use the explicit spawn if both coordinates were given, otherwise derive one."""
+    """Use the explicit spawn if both coordinates were given, otherwise derive one.
+
+    ``standing_height_m`` widens the wall clearance by the body's own half-extent. Every
+    caller that knows the figure's stature should pass it: without it the derived spawn
+    only guarantees furniture clearance, and the T-pose arms reach outside the room.
+    Callers that do not pass it keep the old, furniture-only behaviour.
+    """
 
     if (spawn_x is None) != (spawn_y is None):
         raise ValueError("give both --spawn-x and --spawn-y, or neither")
     if spawn_x is None:
-        return scene_spawn_point(scene_config)
+        return scene_spawn_point(
+            scene_config,
+            clearance_m=(
+                human_spawn_clearance_m(standing_height_m)
+                if standing_height_m > 0.0
+                else SPAWN_CLEARANCE_M
+            ),
+        )
     return (float(spawn_x), float(spawn_y))

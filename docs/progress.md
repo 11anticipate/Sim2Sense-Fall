@@ -629,3 +629,107 @@ final pelvis height     = 0.3029 m  ← 躺平
 `scene_spawn_point` 选的是「离家具最远」的点，结果落在客厅 `(9.320, 0.520)`，而客厅 bounds 为
 `x 8.800..18.480 / y 0.000..6.600` → **离 −X 与 −Y 墙各只有 0.52 m**。向前(+X)倒有 9.16 m 空间，
 倒向 ±Y 会在 0.5 m 处撞墙。**需要空间的动作与试验（摔倒采集尤其）都受它影响**，建议优先于 P0-3 处理。
+
+---
+
+## 2026-09-23 全量验证：Isaac 显示 / 物理交互 / Mesh 检查 / Sionna 导入
+
+用户要求：动作在 Isaac Sim 里正确显示、物理世界交互正确、检查导出的 Mesh 图、
+查本机 Sionna 环境并验证导入成功。
+
+### 1. 全量测试门禁
+
+```bash
+python -m compileall -q src tests scripts   # OK
+uv tool run ruff check .                    # All checks passed!
+python3 -m pytest -q                        # 238 passed, 8 skipped
+DISPLAY=:0 ~/isaacsim/python.sh scripts/humans/verify.py    # human verify: PASSED
+DISPLAY=:0 ~/isaacsim/python.sh scripts/humans/simulate.py --headless \
+    --trial stand_neutral:none --trial fall_forward_reference:none   # human simulate: PASSED
+```
+
+### 2. Isaac Sim 里动作正确显示（新增截图能力）
+
+`view_amass.py` 新增 `--capture-dir` / `--capture-frames`：逐帧等间隔回放并截取视口，
+确定式（不看墙钟），可直接出图。修了两个让它"成功却没拍到"的坑：
+
+- `configure_inspection_view` 返回相机路径，**调用方必须把它赋给视口**；此前被丢弃，
+  视口一直用默认相机，截到的是房间一角。
+- `capture_viewport_to_file` 返回的是 capture delegate，**不是 awaitable**；
+  要等的是 `delegate.wait_for_result()`。最后一帧还要再 pump 几帧才会落盘，
+  否则留下 0 字节的 `.cap-*` 临时文件。
+
+结果：6/6 帧落盘，逐帧像素差 0.995..2.083（修复前各帧完全相同）。
+截图见 `artifacts/humans/isaac_captures/`（`fall_zoom_sheet.png`）。
+
+### 3. 截图暴露并修复：人体出生点穿墙（审计 P2-1）
+
+截图里**人体的手臂穿出了外墙**。量出来：出生点 (9.320, 0.520) 离 −X/−Y 墙各 0.52 m，
+而 1.70 m 人体的 T-pose 臂展 1.83 m（半幅 0.91 m）→ 手臂出墙 0.39 m。
+
+根因：`scene_spawn_point` 只保证**家具**间距（`SPAWN_CLEARANCE_M = 0.40`），
+没把人体自身的外延算进去。修复：新增 `human_spawn_clearance_m(standing_height_m)`
+= `SPAWN_CLEARANCE_M + 0.55 × 身高`（1.70 m → **1.335 m**），由
+`resolve_spawn_point(..., standing_height_m=...)` 传入；6 个调用点全部接上。
+新出生点 **(10.255, 1.455)**，离两墙各 1.455 m。采集数据随之重跑。
+
+### 4. 物理世界交互
+
+`simulate.py` 实跑：接触通道 18 对、接触点归因到肢体（`left_ankle`/`right_ankle`）、
+支撑面高度可读、标签由轨迹推出、`human simulate: PASSED`。
+张量接触力视图仍然不可用，按设计 `[SKIP]`（改用 `physx_contact_report`）。
+
+**P0-3 仍未做，且这次量化确认了它**：`stand_neutral`（站立）被标成 `fall`
+（0.19 s 姿态失稳、0.28 s 撞击、末态身高 0.31 m = 躺平）。原因不变：
+稳定期每步 `set_root_pose` 撑着，释放后 PD 撑不住。
+**交互本身（接触/重力/归因/不穿透）是对的；错的只是"自由站立"这一项。**
+
+### 5. 导出 Mesh 检查（数值 + 图）
+
+- **拓扑**：`V=6890 F=13776 E=20664`，**Euler = 2，边界边 0，非流形边 0**
+  → 封闭、水密、亏格 0 的曲面，无破洞/翻面/退化拓扑。
+- **面积**：全程 1.991 m²（reach_then_topple 1.981..1.991），无塌缩或爆炸；
+  最小三角形 2.4e-07 m²（非退化）。
+- **蒙皮贴着骨架**：每个顶点到最近连杆的距离 p95 = 0.172 m、max = 0.218 m，全程不变
+  （若蒙皮脱离骨架这个值会暴涨）。
+- 图：`artifacts/humans/fall_mesh/fall_preview.png`（序列）、
+  `artifacts/humans/isaac_captures/fall_zoom_sheet.png`（Isaac 视口）。
+
+### 6. Sionna RT 导入（新模块 + 已验证）
+
+环境：`/home/gsh/.local/opt/sionna/bin/python`，**sionna-rt 2.1.0**、mitsuba 3.9.1、
+torch 2.11.0+cu130、CUDA 可用（RTX 4060）。`verify_sionna.py` 全通过。
+详见 [`sionna-import.md`](sionna-import.md)。
+
+新增 `src/sim2sense_fall/sionna/`（`mesh_import.py`，运行时惰性导入）与
+`scripts/sionna/import_fall_mesh.py`。API 事实（写错会静默失败）：
+
+- 几何不能走 `Scene.add()`（只收 Tx/Rx/Material），要走 **`Scene.edit(add=...)`**；
+- `SceneObject(mi_mesh=...)` 可直接吃内存里的 `mitsuba.Mesh`（`mitsuba.traverse` 填）；
+- `RadioMaterial` 是**场景级**资源，`edit(remove=)` 不会摘掉 → 每帧新建会在第二帧撞名，
+  必须注册一次复用（`scene_radio_material`）；
+- `capture_viewport_to_file` 的返回值**不是 awaitable**，要等 `wait_for_result()`。
+
+人体电磁材质：ITU 表里**没有人体组织**（只有 19 种建材，含 `vacuum`）。
+默认取软组织常数 ε_r=51.0、σ=2.16 S/m、厚 0.02 m，
+`HumanMaterial.as_dict()` 带 `provenance: "modelling assumption, not measured"`，
+**正式出结果前需补文献**。`vacuum` 是错误选项——它让电磁意义上不存在人体。
+
+实测（12 帧，3.5 GHz，正向对照=同一场景有无人体）：
+
+```
+[PASS] the body changes the channel (positive control) -- 最大 +6.03 dB
+[PASS] the channel changes as the body falls -- 全程散布 10.15 dB
+[PASS] the ChannelSample satisfies the data contract
+```
+
+逐帧可解释：站立时 **−4.10 dB**（身体挡住直射径），倒平后 **0.00 dB**（不再遮挡，
+信道回到无人体基线），最后一帧 **+6.03 dB**（变成反射体）。
+这正是跌倒检测所依赖的"信道随姿态变化"。
+产物：`artifacts/sionna/fall_import/`（`.cir.npz` + `.import.json`）。
+
+### 明确边界
+
+- Sionna 场景用的是**内置 `floor_wall`**，不是本项目的公寓（公寓→Sionna 是另一件事）。
+- 人体几何是 `kinematic_replay`，传播是真的 Sionna RT —— 信道是非物理轨迹的函数。
+- 12 帧、max_depth=4 是**导入验证**，不是数据集生成。

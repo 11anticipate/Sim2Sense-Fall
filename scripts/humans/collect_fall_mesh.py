@@ -238,7 +238,10 @@ def load_inputs(
     )
     mesh = body.model.mesh() if body.has_skin_mesh else None
     rest = fit_rest_skeleton(config, mesh.rest_skeleton()) if mesh is not None else None
-    spawn = resolve_spawn_point(args.scene_config, args.spawn_x, args.spawn_y)
+    spawn = resolve_spawn_point(
+        args.scene_config, args.spawn_x, args.spawn_y,
+        standing_height_m=config.skeleton.height_m,
+    )
     plan = plan_human_rig(config, rest=rest, spawn_xy=spawn)
     if mesh is not None:
         mesh = fit_mesh_to_rest_joints(mesh, np.asarray(plan.rest_joint_positions))

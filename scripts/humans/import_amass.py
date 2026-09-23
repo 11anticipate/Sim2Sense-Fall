@@ -77,7 +77,10 @@ def main(argv: list[str] | None = None) -> int:
             if body.has_skin_mesh
             else None
         )
-        spawn = resolve_spawn_point(args.scene_config, None, None)
+        spawn = resolve_spawn_point(
+            args.scene_config, None, None,
+            standing_height_m=config.skeleton.height_m,
+        )
         plan = plan_human_rig(config, rest=rest, spawn_xy=spawn)
         clips = load_amass_library(
             args.root,
