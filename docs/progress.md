@@ -569,3 +569,63 @@ PYTHONPATH=src python3 scripts/humans/verify_fall_collection.py
 - AMASS 侧：`--write-slice` 已实现但**未对真实树跑过**（2198 个 npz，stem 重名）。
 - `fall_lateral_reference` 的事件标签是 `invalid`（穿地 −0.219 m）—— 纯 FK 回放不查地板，
   这是预期结果而非新 bug；**不能**为了「全绿」放宽 `penetration_limit_m`。
+
+---
+
+## 2026-09-23 查看动作与 P0-3 的边界（分支 `feature/fall-mesh-capture` 续）
+
+用户问：是否必须先做完 P0-3 才能在 Isaac Sim 里看到人物动作？
+
+**不是。** 两件事正交：
+
+- **看得到** 靠 **kinematic replay**：查看器每帧直接写 DOF 与根位姿并清零速度，不跑控制环。
+- **P0-3 管的是「物理自己能不能站住」**：`simulate.py` 稳定期每步 `set_root_pose` 传送骨盆
+  撑着人体，释放后 PD 撑不住就塌。这只影响自由根试验（`physics_trial`）。
+
+### 修掉的真实缺口：查看器只认 AMASS
+
+`view_amass.py` 的 `--amass-root` 原本是 `required=True`，因此在没有授权 AMASS 数据的机器上
+**根本无法看任何动作**——而内置动作库就在旁边，回放循环本来也不关心里来源。改为可选：
+
+```bash
+~/isaacsim/python.sh scripts/humans/view_amass.py --motion fall_forward_reference
+~/isaacsim/python.sh scripts/humans/view_amass.py --fall-only
+```
+
+`--fall-only` 判据随来源改变（AMASS 筛选器 / 库自身的 `fall_reference` 标签）；输出文件名与
+报告横幅同样分开，不允许报告写「AMASS preview」却在播脚本动作。文件未改名
+（8+ 处文档引用它）。
+
+### 顺带修掉：`verify.py` 的「不发散」判据原来在测缺陷
+
+原判据是无驱动自由落体后骨盆水平位移 ≤ **固定 1.0 m**。修复前它 PASS 是**巧合**——人体被
+偏航 90°，倒向 0.52 m 外那面墙被挡住（0.4263 m）。修复后人体按应有方向倒，位移 1.3855 m。
+
+探针实测（逐帧骨盆轨迹）：
+
+```
+direction = -2.0 deg from +X        ← 正好是管线前向 +X
+horizontal displacement = 1.3855 m  (dx +1.3846, dy -0.0495)
+final pelvis height     = 0.3029 m  ← 躺平
+```
+
+**这是帧修复正确的独立佐证**，不是新 bug。判据改为断言它名字真正声称的两件事：会停下来
+（末段 200 ms 爬行 **0.005 mm**）+ 位移不超过自身体型的可达范围
+（`2.0 ×` 站立骨盆高度 = 2.0253 m，覆盖倒伏弧 + 撞地滑移）。界由实测站立高度推出，不是照观测值调。
+
+### Isaac 侧复验（本分支首次跑 GPU）
+
+`DISPLAY=:0 ~/isaacsim/python.sh scripts/humans/verify.py` → **`human verify: PASSED`**
+
+```
+[PASS] physics pose matches the CPU model with left_knee at +55 deg -- largest link error 0.00 mm over 24 links
+[PASS] joint limits round-trip through USD degrees and Isaac radians -- largest limit mismatch 0.000007 degrees
+[PASS] the body does not diverge across the room -- pelvis moved 1.3855 m horizontally and crept 0.005 mm over the final 200 ms (limit 2.0253 m = 2 x the 1.0126 m standing pelvis height)
+[PASS] no body geometry is pushed through the floor after settling -- lowest body point -0.0000 m
+```
+
+### 新定位的开放项（属于审计 P2-1）
+
+`scene_spawn_point` 选的是「离家具最远」的点，结果落在客厅 `(9.320, 0.520)`，而客厅 bounds 为
+`x 8.800..18.480 / y 0.000..6.600` → **离 −X 与 −Y 墙各只有 0.52 m**。向前(+X)倒有 9.16 m 空间，
+倒向 ±Y 会在 0.5 m 处撞墙。**需要空间的动作与试验（摔倒采集尤其）都受它影响**，建议优先于 P0-3 处理。
