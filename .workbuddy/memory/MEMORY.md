@@ -123,3 +123,44 @@
   所以「放置后隔几步再读」的对照读数会偏低。
 - 24 连杆只有 19 个胶囊碰撞体：`left_foot/right_foot/head/left_hand/right_hand` 是叶关节，
   `_capsule_for` 返回 None。支撑接触落在踝部胶囊上，头/手可穿障。
+
+## 坐标系与姿态判定约定（2026-09-23 修复，详见 `docs/mesh-orientation-defect.md`）
+
+- **SMPL 原始文件的帧 ≠ 管线帧**，实测结论：
+  - 文件：`X = 横向(左右)`、`Y = 上`、`Z = 前`（`basicmodel_neutral_lbs_10_207_0_v1.1.0`）；
+  - 管线（`RestSkeleton` 文档）：`X = 前`、`Y = 左`、`Z = 上`；
+  - 两者差一个**绕垂直轴的 90° 偏航**。任何读模型文件的新代码都要显式说明用哪个帧。
+- **`up_axis_conversion` 只管 up，不能当整体换基**。它的 docstring 前提是「两帧共享 +X 前向」，
+  对 SMPL 文件**不成立**。整帧导入必须用 `body_frame_conversion(up=, forward=, left=)`
+  （三元组，强制 `det = +1` 拒绝镜像）；`up_axis_conversion` 只留给确实只需要 up 的路径。
+- 导入帧的实测证据记在 `SmplModel.source_frame`（如 `up=y forward=z left=x`），并写进采集
+  清单的 `body_model` 块 —— 单凭清单可以复现导入。
+- **extent 不能判姿态**。SMPL 是 T-pose，臂展（1.825 m）本来就大于身高（1.796 m），
+  所以「最高的轴是 Z」不是「站着」的判据；任何 extent 排列都分不出「站着张开手」和
+  「躺着手张开」。判姿态只问解剖问题：① 头在不在脚上方；② 全程是否从立到平。
+- **绕垂直轴旋转不变的检查全都看不见偏航**：stature 范围、FK 对独立 CPU 链、身高拟合收敛、
+  胶囊包含、「mesh 会动」全部通过一个偏航 90° 的人体。导出侧必须至少有一条检查
+  **比较 mesh 与 links**（不是 links 对 links —— 那在坏导出上也过），并点名解剖方向：
+  `the body stands up in the first frame`（俯仰）+ `the mesh and the links agree on the
+  body's facing`（偏航）。新增检查**必须配正向对照**（把 mesh 绕 Z 偏航 90° 后必须 FAIL），
+  不会失败的检查不算证据。
+- **`fit_mesh_to_rest_joints` 的配对必须取自共用关节名**，不能裸 argmin 按行号。rig 缩放到
+  配置身高而 pkl 保持原身高，正确配对也差几十毫米（踝 53 mm、脚 91 mm）；≥1.75 m 时
+  argmin 会**非双射**，静默返回 scale 1.0794 而不是 1.0459。确认配对只能用**关节间距离**：
+  绝对坐标受绕原点缩放影响（纯 1.08 缩放会把正确配对判错），骨向量方向分不开共线脊柱关节。
+  逐行比较要屏蔽被测行与配对列（自距恒为 0，否则主导均值）。
+- **清单字段别按名字猜**：`hashes.mesh_source_sha256` 曾灌的是**动作**的 provenance
+  （脚本动作恒 null，读起来像「皮肤不可标识」）。已拆成 `motion_source_sha256` +
+  `body_model_sha256`，并新增 `body_model` 块。`points.link_names` / `joint_names` 也补上了 ——
+  没有它们，（N, 24, 3）里定位不到某个连杆。
+
+## 摔倒 Mesh 采集（`artifacts/humans/fall_mesh`，2026-09-23）
+
+- 采集器 `scripts/humans/collect_fall_mesh.py`，`--fall-only` 取 `fall_reference` 标签的片段。
+  产物每样本 `<id>.mesh.npz` + `<id>.points.npz`，**共享一条 `time_s`**。
+- `fidelity` 只有两个合法值：`kinematic_replay`（纯 FK 回放，无重力/接触）与
+  `physics_trial`（`simulate.py`）。**不得混入同一清单**。
+- 独立复核用 `scripts/humans/verify_fall_collection.py`（第二实现，不 import 采集器）。
+  「自 agree」不是证据，两边都过才是。
+- 静态参考（`stand_neutral`）**不动是正确结果**；检查要写成「骨架动时 mesh 必须跟着动」，
+  不能写成「mesh 必须动」。
