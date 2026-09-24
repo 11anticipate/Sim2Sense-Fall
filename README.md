@@ -12,26 +12,18 @@
 - 评测重点：漏报率、误报率、F1、报警延迟、跨域性能、仿真到真实差距。
 - 隐私表述：项目以“不采集视频、最小化保存人体网格、限制原始无线数据访问”为隐私目标；不能把无线感知直接宣称为绝对零隐私风险。
 
-## 当前状态
+## 当前状态（2026-09-24）
 
-已完成：
+固定公寓、SMPL 蒙皮、多轴 PhysX 人体和真实 AMASS 导入已运行；键盘可控制前进、后退、
+转向和停止，并显示实际物理姿态。当前使用有限根外力辅助，**整体动作质量尚未通过验收**：
+仍有滑步、皮肤穿地/穿墙，以及用户新反馈的右臂摆动异常。
 
-- 本地 Zotero 文献核对和项目证据笔记（见 [`notes.md`](notes.md)）。
-- `src/` 包、样本 schema、窗口化基线和仿真适配器接口。
-- 仓库目录、配置、测试、文档和阶段日志。
-- Isaac Sim 室内场景：两室一厅一厨一卫加走廊，6 个房间、46 段墙、11 处门窗开口、
-  34 件家具/灯具，含墙体/地板/家具的碰撞、摩擦、密度与电磁属性，可导出为 USD。
-  说明、运行方式和 GUI 查看指令见 [`docs/indoor-scene.md`](docs/indoor-scene.md)。
-- GitHub 上游核对：`origin/main` 与本地 `main` 同为 `c77a37d`，无差异；场景工作提交在
-  `feature/indoor-scene` 分支（未 push）。
-- 阶段 7 已完成 SMPL v1.1.0 neutral 的 CPU 加载、蒙皮、逐帧 NPZ、USD `Human/Skin` 写入及 CPU/USD/Isaac 分层验收；AMASS 本地导入、SMPL-H→SMPL 重定向和摔倒候选筛选已接入并通过合成数据 smoke test。最新 headless Isaac PD 最大误差 1.540°（容限 15°）；真实 AMASS 序列、自由站立/行走和 GPU 渲染仍未完成。详见 [`docs/human-simulation.md`](docs/human-simulation.md)。
+后续只新增蹲下、起立和摔倒及其切换；路线由用户键盘控制，不做主动避障。
+起立按蹲姿回站姿规划，R 仍是显式复位。任务与验收顺序见 [当前计划](task_plan.md)。
 
-待完成：
-
-- 推送 `feature/indoor-scene` 并开 PR（待确认）。
-- Sionna RT 接入、人体轨迹与 CSI/CIR 生成。
-- 场景领域随机化、真实 CSI/CIR 数据导入、跨域实验和仿真到真实验证。
-- 上游没有 LICENSE，需要先与仓库所有者确认许可范围。
+固定公寓 + 单类实际物理后推跌倒 → Sionna 复数 CIR 已完成 smoke；规模数据、
+动态家具同步、检测训练、域随机化与真实数据验证仍未完成。
+现行指南、证据记录与历史文档统一从 [文档索引](docs/README.md) 查阅。
 
 ## 目录
 
@@ -44,15 +36,22 @@
 ├── pyproject.toml            # Python 工具与依赖边界
 ├── configs/
 │   ├── baseline.yaml              # 可复现实验默认配置
+│   ├── humans/                    # 人体、动作、键盘与根辅助配置
 │   └── scenes/
 │       └── indoor_apartment.yaml  # 室内场景声明（房间/墙/门窗/家具/材质）
 ├── data/                     # 原始/生成/处理数据边界说明
 ├── artifacts/                # 本地实验产物边界说明（导出的 USD 场景写在这里）
 ├── docs/
+│   ├── README.md             # 全部工程文档索引与证据使用规则
 │   ├── architecture.md       # 组件边界、数据流和评测设计
 │   ├── data-contract.md      # CSI/CIR 样本契约
 │   ├── indoor-scene.md       # 室内场景构建、导出与 GUI 查看
+│   ├── human-simulation.md   # 当前人体链路与边界
+│   ├── keyboard-control.md   # 键盘操作与实际证据
+│   ├── history/              # 旧计划和旧指南，保留历史语境
 │   └── progress.md           # 阶段日志、验证结果和阻塞项
+├── scripts/humans/           # 预览、物理试验、键盘与人体检验
+├── scripts/sionna/           # 公寓/人体网格到无线传播入口
 ├── scripts/scenes/           # 场景操作入口
 │   ├── build.py              # 构建（CPU dry-run / headless / GUI）
 │   ├── view.py               # 查看（俯视去顶 / 斜视去顶 / 外观）
@@ -62,6 +61,8 @@
 │   ├── validation.py         # 数据契约检查
 │   ├── windowing.py          # 流式窗口和报警事件聚合
 │   ├── simulators.py         # Isaac/Sionna 适配器协议与 dry-run
+│   ├── humans/               # SMPL/AMASS、PhysX、控制与真值
+│   ├── sionna/               # 几何导入、公寓转换与信道
 │   └── scenes/               # 可复用场景实现
 │       ├── __init__.py       # CPU 公共接口
 │       ├── spec.py           # 场景 schema、YAML 加载与校验
@@ -75,6 +76,7 @@
 │       └── verification.py   # USD 与清单逐项核对
 ├── tests/
 │   ├── test_core.py
+│   ├── humans/               # 人体数据、控制与回归
 │   └── scenes/               # 场景单测与回归
 │       ├── test_scenes.py
 │       ├── test_scene_regressions.py
@@ -99,7 +101,20 @@ python -m sim2sense_fall.windowing --help
 uv tool run ruff check .
 ```
 
-Isaac Sim 和 Sionna 是可选运行时，不在基础安装中强制拉取。后续适配器会通过环境检查和版本记录接入，避免在没有 GPU 的机器上导入失败。
+Isaac Sim 和 Sionna 是可选运行时，不在基础安装中强制拉取。实际入口分别使用 Isaac Python
+和独立 Sionna 环境；CPU dry-run 不应依赖 GPU。环境与命令见对应指南。
+
+## 键盘人体
+
+公寓 USD 已导出后，在仓库根目录执行：
+
+```bash
+python3 scripts/humans/keyboard.py --dry-run --out artifacts/humans/keyboard_dry
+~/isaacsim/python.sh scripts/humans/keyboard.py
+```
+
+W/S 前后移动，A/D 转向，空格停止，R 复位，Esc 退出。蹲下、起立和摔倒键位仍待实现。
+当前操作说明、记录文件及已知问题见 [键盘控制](docs/keyboard-control.md)。
 
 ## 室内场景
 
@@ -128,26 +143,17 @@ python3 scripts/scenes/build.py --dry-run
 
 目标地址为 `git@github.com:11anticipate/Sim2Sense-Fall.git`。
 
-早前会话读不到该地址（`Temporary failure in name resolution`），且工作树 `.git` 只读；
-这两条**已经解除**。当前状态：
-
-- `origin/main` = 本地 `main` = `c77a37d`（*chore: scaffold Sim2Sense fall sensing project*），
-  0 ahead / 0 behind，顶层目录树一致 —— 上游目前只有脚手架提交，没有需要合并的内容。
-- 室内场景工作提交在 `feature/indoor-scene` 分支（3 个 Conventional Commits），
-  `main` 未被改动。**尚未 push**，也未开 PR。
-- 上游**没有 LICENSE 文件**，默认即「保留所有权利」。在确认许可范围前，不要假设代码可以
-  对外分发。
-- `.workbuddy/`（Agent 工作记忆）目前未跟踪，是否纳入版本管理待定。
-
-按项目分支约定，功能开发不直接落在 `main` 上：
+历史 Git 状态见 [阶段日志](docs/progress.md)。分支、HEAD、远程差异须现场查询，
+不要按历史指南切换分支或覆盖当前改动：
 
 ```bash
-git checkout feature/indoor-scene
-git log --oneline --decorate -4
-git push -u origin feature/indoor-scene     # 确认后再执行
+git status --short --branch
+git remote -v
+git log -1 --oneline
 ```
 
-同步后先检查上游目录和许可证，再决定是否合并；不要覆盖用户未审阅的上游文件。
+提交遵循 Conventional Commits；本次文档整理不包含提交或推送。
+代码和人体资产的许可分别核对，SMPL/AMASS 原文件、人体网格和原始无线数据默认不入 Git。
 
 ## 文献依据
 

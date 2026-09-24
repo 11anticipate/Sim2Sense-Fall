@@ -192,6 +192,7 @@ class SegmentConfig:
     mass_weight: float
     aim: str | None = None
     tags: tuple[str, ...] = ()
+    terminal_center_m: tuple[float, float, float] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.joint, str) or not self.joint.strip():
@@ -207,6 +208,11 @@ class SegmentConfig:
             )
         if self.aim is not None and (not isinstance(self.aim, str) or not self.aim.strip()):
             raise ValueError(f"{self.joint}: aim must be a non-empty joint name or omitted")
+        if self.terminal_center_m is not None:
+            if len(self.terminal_center_m) != 3:
+                raise ValueError(f"{self.joint}: terminal_center_m must contain three coordinates")
+            for value in self.terminal_center_m:
+                finite_number(value, f"{self.joint}.terminal_center_m")
         for tag in self.tags:
             if not isinstance(tag, str) or not tag.strip():
                 raise ValueError(f"{self.joint}: segment tags must be non-empty strings")
@@ -315,6 +321,7 @@ class RigConfig:
     angular_damping: float
     segments: Mapping[str, SegmentConfig]
     joints: Mapping[str, JointConfig]
+    horizontal_foot_capsules: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.root_joint, str) or not self.root_joint.strip():
@@ -327,6 +334,7 @@ class RigConfig:
                 f"authors), got {self.collider!r}"
             )
         strict_bool(self.self_collisions, "rig.self_collisions")
+        strict_bool(self.horizontal_foot_capsules, "rig.horizontal_foot_capsules")
         for name in ("contact_offset_m", "rest_offset_m", "linear_damping", "angular_damping"):
             finite_number(getattr(self, name), f"rig.{name}")
         if self.contact_offset_m < 0 or self.rest_offset_m < 0:
@@ -378,6 +386,9 @@ class ControlConfig:
     tracking_tolerance_deg: float
     pose_hold_seconds: float
     max_root_linear_velocity_m_s: float
+    standing_max_drop_m: float = 0.05
+    standing_max_tilt_deg: float = 15.0
+    standing_max_drift_m: float = 0.05
 
     def __post_init__(self) -> None:
         if self.mode not in CONTROL_MODES:
@@ -387,10 +398,16 @@ class ControlConfig:
             "tracking_tolerance_deg",
             "pose_hold_seconds",
             "max_root_linear_velocity_m_s",
+            "standing_max_drop_m",
+            "standing_max_tilt_deg",
+            "standing_max_drift_m",
         ):
             finite_number(getattr(self, name), f"control.{name}")
             if getattr(self, name) < 0:
                 raise ValueError(f"control.{name} must be non-negative")
+        for name in ("standing_max_drop_m", "standing_max_tilt_deg", "standing_max_drift_m"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"control.{name} must be positive")
         if self.tracking_tolerance_deg <= 0:
             raise ValueError("control.tracking_tolerance_deg must be positive")
         if self.max_root_linear_velocity_m_s <= 0:
@@ -653,7 +670,12 @@ class HumanConfig:
                     f"visualization pose names unknown or non-revolute DOF {name!r}"
                 )
             joint = self.rig.joints[name]
-            low_deg, high_deg = joint.limits_deg[0]
+            # A joint declaring several axes becomes a chain whose **real link**
+            # carries the last declared axis and keeps the joint's own name; earlier
+            # axes belong to proxy links named ``<joint>__dofN``. The pose is applied
+            # to the named DOF, so those are the limits that must admit it. Reading
+            # ``[0]`` checked the wrong axis as soon as a chain had more than one.
+            low_deg, high_deg = joint.limits_deg[-1]
             low_rad, high_rad = math.radians(low_deg), math.radians(high_deg)
             if not low_rad <= value <= high_rad:
                 raise ValueError(
@@ -728,7 +750,7 @@ class HumanConfig:
 # parsing
 # ---------------------------------------------------------------------------
 
-_SEGMENT_FIELDS = {"joint", "radius_m", "mass_weight", "aim", "tags"}
+_SEGMENT_FIELDS = {"joint", "radius_m", "mass_weight", "aim", "tags", "terminal_center_m"}
 _JOINT_FIELDS = {"joint", "dof", "rotations", "limits_deg", "drive", "tags"}
 _DRIVE_FIELDS = {"stiffness", "damping", "max_force", "drive_type"}
 
@@ -749,6 +771,8 @@ def _segment_from_mapping(key: str, payload: Any) -> SegmentConfig:
         mass_weight=_as_float(mapping, "mass_weight"),
         aim=None if aim is None else str(aim).strip(),
         tags=tuple(str(tag) for tag in tags_payload),
+        terminal_center_m=(None if mapping.get("terminal_center_m") is None
+                           else tuple(mapping["terminal_center_m"])),
     )
 
 
@@ -876,6 +900,7 @@ def human_config_from_mapping(
     _reject_unknown(
         rig_payload,
         {
+            "horizontal_foot_capsules",
             "root_joint",
             "root_mode",
             "collider",
@@ -898,6 +923,7 @@ def human_config_from_mapping(
         str(key): _joint_from_mapping(str(key), value) for key, value in joints_payload.items()
     }
     rig = RigConfig(
+        horizontal_foot_capsules=_as_bool(rig_payload, "horizontal_foot_capsules", default=False),
         root_joint=_as_str(rig_payload, "root_joint"),
         root_mode=_as_str(rig_payload, "root_mode", default="free"),
         collider=_as_str(rig_payload, "collider", default="capsule"),
@@ -919,10 +945,16 @@ def human_config_from_mapping(
             "tracking_tolerance_deg",
             "pose_hold_seconds",
             "max_root_linear_velocity_m_s",
+            "standing_max_drop_m",
+            "standing_max_tilt_deg",
+            "standing_max_drift_m",
         },
         where="control",
     )
     control = ControlConfig(
+        standing_max_drop_m=_as_float(control_payload, "standing_max_drop_m", default=0.05),
+        standing_max_tilt_deg=_as_float(control_payload, "standing_max_tilt_deg", default=15.0),
+        standing_max_drift_m=_as_float(control_payload, "standing_max_drift_m", default=0.05),
         mode=_as_str(control_payload, "mode", default="pd"),
         warmup_seconds=_as_float(control_payload, "warmup_seconds", default=0.3),
         tracking_tolerance_deg=_as_float(control_payload, "tracking_tolerance_deg", default=15.0),

@@ -1,0 +1,45 @@
+# Keyboard mode is explicitly assisted physics, not autonomous balance.
+rig: configs/humans/human_smpl_multiaxis.yaml
+assets: configs/humans/assets.yaml
+scene: artifacts/scenes/indoor_apartment.usda
+root_assist: configs/humans/root_assist.yaml
+spawn_xy: [10.255, 1.455]
+heading_deg: 90.0
+speed_m_s: 0.4
+acceleration_m_s2: 0.8
+turn_speed_deg_s: 30.0
+turn_acceleration_deg_s2: 90.0
+transition_s: 0.35
+max_joint_speed_rad_s: 4.0
+max_target_lead_m: 0.10
+max_heading_lead_deg: 15.0
+render_hz: 30.0
+record_frames: 14400
+camera_distance_m: 4.5
+camera_elevation_deg: 50.0
+camera_azimuth_deg: -55.0
+slip_min_impulse_ns: 0.01
+slip_speed_tolerance_m_s: 0.15
+skin_penetration_tolerance_m: 0.005
+gaits:
+  forward:
+    file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/walkbackwards_stand_poses.npz
+    start_s: 3.9166666666666665
+    duration_s: 1.0416666666666667
+  backward:
+    file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/walkbackwards_stand_poses.npz
+    start_s: 0.8
+    duration_s: 0.7916666666666666
+idle:
+  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/walkbackwards_stand_poses.npz
+  start_s: 3.4
+  duration_s: 0.1
+demo:
+  - {duration_s: 1.0, keys: []}
+  - {duration_s: 3.0, keys: [W]}
+  - {duration_s: 1.0, keys: [SPACE]}
+  - {duration_s: 1.5, keys: [A]}
+  - {duration_s: 1.2, keys: [S]}
+  - {duration_s: 1.5, keys: []}
+  - {duration_s: 0.1, keys: [R]}
+  - {duration_s: 1.0, keys: []}

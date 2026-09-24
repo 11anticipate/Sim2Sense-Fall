@@ -45,7 +45,7 @@ def configure_inspection_view(
             # Keep a generous margin so hands and feet remain visible after a
             # small physics update, while using the human rather than the whole
             # apartment to determine the camera scale.
-            margin = 0.35
+            margin = 0.10
             h_span = max(
                 float(human_high[0] - human_low[0]),
                 float(human_high[1] - human_low[1]),
@@ -55,9 +55,14 @@ def configure_inspection_view(
                 low = [float(human_low[i]) - margin * h_span for i in range(3)]
                 high = [float(human_high[i]) + margin * h_span for i in range(3)]
     span = max(high[0] - low[0], high[1] - low[1])
+    if mode == "human":
+        span = max(span, high[2] - low[2])
     if not math.isfinite(span) or span <= 0:
         raise ValueError("floor bounds must have a finite positive extent")
-    target = rt.Gf.Vec3d((low[0] + high[0]) / 2, (low[1] + high[1]) / 2, high[2])
+    target = rt.Gf.Vec3d(
+        (low[0] + high[0]) / 2, (low[1] + high[1]) / 2,
+        (low[2] + high[2]) / 2 if mode == "human" else high[2],
+    )
     with rt.Usd.EditContext(stage, stage.GetSessionLayer()):
         for prim in stage.Traverse():
             if prim.GetAttribute("sim2sense:category").Get() in {"ceiling", "lighting_fixture"}:
@@ -80,7 +85,7 @@ def configure_inspection_view(
             camera.CreateHorizontalApertureAttr().Set(height * aspect_ratio * 10)
         else:
             if mode == "human":
-                eye = target + rt.Gf.Vec3d(span * 1.35, -span * 1.55, span * 0.95)
+                eye = target + rt.Gf.Vec3d(span * 0.95, span * 1.05, span * 0.80)
             else:
                 eye = target + rt.Gf.Vec3d(span * 0.95, -span * 1.15, span * 1.6)
             matrix = rt.Gf.Matrix4d().SetLookAt(eye, target, rt.Gf.Vec3d(0, 0, 1))
@@ -90,3 +95,41 @@ def configure_inspection_view(
             camera.CreateHorizontalApertureAttr().Set(36)
             camera.CreateVerticalApertureAttr().Set(36 / aspect_ratio)
     return CAMERA_PATH
+
+
+def apply_inspection_view(
+    stage: Any,
+    *,
+    mode: str = "top",
+    aspect_ratio: float = 16 / 9,
+    require_viewport: bool = False,
+) -> str:
+    """Configure an inspection view *and* point the viewport at the camera it authored.
+
+    The second half is the part that keeps getting dropped:
+    :func:`configure_inspection_view` only authors a camera and returns its path, so a
+    caller that ignores the return value leaves the viewport on whatever camera Isaac Sim
+    created -- which for this project means a walled room seen from outside, roof and all,
+    with the body hidden inside it. The run reports success and proves nothing about what
+    is on screen.
+
+    ``require_viewport`` fails loudly instead of quietly leaving that default camera in
+    place, for callers whose whole purpose is a human looking at a window.
+    """
+
+    camera_path = configure_inspection_view(stage, mode=mode, aspect_ratio=aspect_ratio)
+    try:
+        from omni.kit.viewport.utility import get_active_viewport
+    except ImportError as exc:
+        if not require_viewport:
+            return camera_path
+        raise RuntimeError(
+            "this view needs an Isaac Sim viewport; run with ~/isaacsim/python.sh"
+        ) from exc
+    viewport = get_active_viewport()
+    if viewport is None:
+        if require_viewport:
+            raise RuntimeError("Isaac Sim did not create an active viewport")
+        return camera_path
+    viewport.camera_path = camera_path
+    return camera_path

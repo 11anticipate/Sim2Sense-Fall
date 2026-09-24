@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260923T154142994Z-159022-6630f3fe1ca6",
+  "runId": "20260923T154142994Z-159022-6630f3fe1ca6",
+  "runStatus": "inconclusive",
+  "coverage": {
+    "status": "partial",
+    "reasons": [
+      {
+        "code": "baseline_partial",
+        "stage": "baseline",
+        "target": ".",
+        "detail": "baseline capture had enumeration or snapshot errors",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "baseline",
+        "target": ".",
+        "detail": "baseline_partial: baseline capture had enumeration or snapshot errors",
+        "affectsCompletion": true
+      }
+    ]
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": "6084df8bc74e6b8fc499dfe6de93a1731002623d",
+  "diffHash": "10b995f7d3380725c98e6b0b7ca02f51bfa0e51ee7a0c3c2015d8bc1a9a4e5c5",
+  "rulesVersion": "unavailable",
+  "sessionHash": "551653059d095c27c554a752dab0bde7e563e7930de9164e71d96fab5ca23e8b",
+  "reportRef": ".mimosa/reports/task-review-sess_58955f08-6a22-42f0-b377-7da2bd4eaee6-20260923T154142994Z-159022-6630f3fe1ca6.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [
+    {
+      "file": "scripts/humans/simulate.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "scripts/humans/verify.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/sim2sense_fall/humans/usd_human.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    }
+  ],
+  "recordedAt": "2026-09-23T15:41:43.355Z"
+}

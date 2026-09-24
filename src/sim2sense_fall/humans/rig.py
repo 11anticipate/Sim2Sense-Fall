@@ -47,24 +47,31 @@ import json
 import logging
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
 
 from .config import HumanConfig, RigConfig, SegmentConfig
+from .motion import FRAME_SOURCE_SCRIPTED, MotionClip
 from .rotations import (
     axis_angle_to_matrix,
     quaternion_to_matrix,
+    split_rotation,
     validate_axis,
 )
 from .skeleton import RestSkeleton, SkeletonTopology, default_rest_skeleton
 
 __all__ = [
+    "AXIS_PROJECTION_TOLERANCE_RAD",
     "CapsuleSpec",
     "HumanRigPlan",
     "JointSpec",
     "LinkTransform",
+    "apply_neutral_pose",
+    "authors_deviations",
+    "axis_residuals",
+    "dof_groups",
     "forward_kinematics",
     "plan_human_rig",
     "pose_surface_points",
@@ -85,6 +92,13 @@ PROXY_NOMINAL_LENGTH_M = 0.08
 #: error. Not zero: the spawn z is rounded to 1e-6 m for a readable plan, and a
 #: sub-micron dip costs nothing while a real convention error is millimetres.
 _SPAWN_CLEARANCE_TOLERANCE_M = 1e-5
+#: Largest off-axis rotation :func:`joint_values_from_clip` will project away, in
+#: radians. 1e-6 rad is 5.7e-5 degrees, so this admits solver noise and nothing else:
+#: the shipped rig is single-axis and its authored references are axis-aligned, so a
+#: larger residual means a motion and a rig have drifted apart, and projecting it would
+#: replay a different motion than the one recorded. The AMASS candidate screen tests
+#: this same bound rather than inventing a looser one.
+AXIS_PROJECTION_TOLERANCE_RAD = 1e-6
 
 _PROXY_MARKER = "__dof"
 
@@ -539,6 +553,15 @@ def _capsule_for(
     """Build the capsule covering the bone from ``joint`` to its primary child."""
 
     children = topology.children_of(joint)
+    if segment.terminal_center_m is not None:
+        if children or segment.aim is not None:
+            raise ValueError(f"{joint}: terminal_center_m is only valid for a leaf joint")
+        return CapsuleSpec(
+            link=joint, path=path, center=segment.terminal_center_m,
+            orientation_wxyz=(1.0, 0.0, 0.0, 0.0), axis="z",
+            radius_m=segment.radius_m, cylinder_length_m=0.0,
+            bone_from=joint, bone_to=joint,
+        )
     if not children:
         if segment.aim is not None:
             raise ValueError(
@@ -647,6 +670,16 @@ def fit_rest_skeleton(
         )
     fitted = base.scaled_by(scale, name=f"fitted to {target:g} m standing height")
     achieved = standing_height_for(config, fitted)
+    # Capsule authoring rounds coordinates to micrometres. Correct the resulting
+    # slope-extrapolation residual before enforcing the existing height tolerance.
+    for _ in range(4):
+        if abs(achieved - target) <= 1e-6:
+            break
+        scale += (target - achieved) / slope
+        if not 0.2 <= scale <= max_scale:
+            raise ValueError("refined height scale is outside the supported range")
+        fitted = base.scaled_by(scale, name=f"fitted to {target:g} m standing height")
+        achieved = standing_height_for(config, fitted)
     if abs(achieved - target) > 1e-6:
         raise ValueError(
             f"height fit did not converge: target {target:g} m, achieved {achieved:.9f} m"
@@ -736,6 +769,20 @@ def plan_human_rig(
             if role != "dof_proxy"
             else None
         )
+        if rig.horizontal_foot_capsules and chain_joint in {"left_ankle", "right_ankle"}:
+            if capsule is None:
+                raise ValueError("horizontal foot support requires an ankle capsule")
+            # Explicit sole proxy: lower the heel to the toe, retaining the original
+            # lowest surface, radius, skeleton and skin. This is not an anatomy edit.
+            direction = capsule.direction * capsule.cylinder_length_m
+            direction[2] = 0.0
+            center = list(capsule.center)
+            center[2] = capsule.lowest_point_z() + capsule.radius_m
+            capsule = replace(
+                capsule, center=tuple(center),
+                orientation_wxyz=tuple(float(x) for x in quaternion_from_z(direction)),
+                cylinder_length_m=float(np.linalg.norm(direction)),
+            )
         mass = total_mass * weights[link_name] / weight_total
         if capsule is not None:
             inertia = _cylinder_inertia(mass, capsule.radius_m, capsule.total_length_m)
@@ -775,7 +822,19 @@ def plan_human_rig(
             index = int(link_name.rsplit(_PROXY_MARKER, 1)[1])
             axis = joint_config.rotations[index - 1]
             low, high = joint_config.limits_deg[index - 1]
-            anchor = (0.0, 0.0, 0.0)
+            # The FIRST proxy is the one that hangs off the joint's own SMPL parent, so
+            # it is the only link in the chain that has to carry the bone offset. The
+            # rest of the chain sits on the same point. Dropping this anchor collapsed
+            # the whole body onto the root: every chain link ended up at the origin,
+            # which is invisible in a link count and obvious only in the kinematics.
+            anchor = (
+                _rounded(
+                    np.asarray(skeleton.position(chain_joint), dtype=np.float64)
+                    - np.asarray(skeleton.position(link.parent_link), dtype=np.float64)
+                )
+                if index == 1
+                else (0.0, 0.0, 0.0)
+            )
             is_proxy = True
         elif joint_config is not None and joint_config.dof_count:
             axis = joint_config.rotations[-1]
@@ -1100,8 +1159,16 @@ def validate_plan_geometry(
                 f"{joint.name}: parent link {joint.parent_link!r} has no collider; a chain "
                 "link without collision geometry is a planning mistake"
             )
-        if joint.local_pos0 != (0.0, 0.0, 0.0) and joint.proxy:
-            raise ValueError(f"{joint.name}: a proxy joint must sit at its parent's origin")
+        if joint.proxy and joint.local_pos0 != (0.0, 0.0, 0.0):
+            # The first proxy of a chain hangs off the joint's own SMPL parent, so it
+            # is the one link that must carry the bone offset; every later proxy sits
+            # on that same point. Requiring zero of every proxy is what let a whole
+            # chain collapse onto the root without anything noticing.
+            if not joint.name.endswith(f"{_PROXY_MARKER}1"):
+                raise ValueError(
+                    f"{joint.name}: only the first proxy of a chain may carry a bone "
+                    f"offset, got {joint.local_pos0}"
+                )
 
 
 def forward_kinematics(
@@ -1183,6 +1250,167 @@ def _axis_rotation(axis: str, angle_rad: float) -> np.ndarray:
     vector = np.zeros(3)
     vector["xyz".index(validate_axis(axis))] = float(angle_rad)
     return axis_angle_to_matrix(vector)
+
+
+def authors_deviations(clip: MotionClip) -> bool:
+    """Whether a clip's joint angles are offsets from the rig's neutral pose.
+
+    Scripted clips are authored as deviations, so the neutral pose the human config
+    declares has to be added before anything drives the joints from them. AMASS is the
+    opposite case: its local joint rotations are absolute against the model's own
+    T-pose rest, so the arm-down adduction is already inside the data. Adding the
+    neutral to those would count the same rotation twice and quietly fold the body in
+    half, which is why the two entry points ask this instead of deciding separately.
+    """
+
+    return clip.provenance.kind == FRAME_SOURCE_SCRIPTED
+
+
+def apply_neutral_pose(
+    clip: MotionClip, plan: HumanRigPlan, neutral_rad: Mapping[str, float]
+) -> MotionClip:
+    """Add the rig's declared neutral joint angles to a reference that authors deviations.
+
+    A motion should say how far a joint moves from the body's own neutral pose, not
+    from whatever the skeleton file happens to rest at. Those differ here: the released
+    SMPL template rests in a T-pose, so its zero leaves the arms out to the sides, while
+    the procedural skeleton rests with them hanging. Without one declared neutral, the
+    same clip would mean a different pose on each skeleton, and the arms-at-the-sides
+    angle would have to be copy-pasted into every motion file -- where it would then be
+    quietly wrong the next time the rest pose changes.
+
+    Angles are added into the slot of each joint's declared axis, so a clip that authors
+    off-axis rotation is still rejected by :func:`joint_values_from_clip` rather than
+    being rescued by the offset.
+    """
+
+    rotations = np.array(clip.joint_rotations, dtype=np.float64, copy=True)
+    by_name = {joint.name: joint for joint in plan.joints}
+    for name, value in neutral_rad.items():
+        joint = by_name.get(name)
+        if joint is None:
+            raise ValueError(
+                f"neutral pose names {name!r}, which is not a DOF of this plan; DOFs: "
+                + ", ".join(plan.dof_names)
+            )
+        angle = float(value)
+        if not math.isfinite(angle):
+            raise ValueError(f"neutral pose {name} must be finite, got {value!r}")
+        if joint.chain_joint not in clip.joint_names:
+            raise ValueError(f"neutral pose {name}: the clip does not drive {joint.chain_joint}")
+        index = clip.joint_index(joint.chain_joint)
+        slot = "xyz".index(joint.axis)
+        shifted = rotations[:, index, slot] + angle
+        low, high = plan.limits_deg()[joint.name]
+        if float(np.degrees(shifted.min())) < low - 1e-9 or float(
+            np.degrees(shifted.max())
+        ) > high + 1e-9:
+            raise ValueError(
+                f"neutral pose {name}={math.degrees(angle):.3f} deg would drive the "
+                f"reference to [{np.degrees(shifted.min()):.3f}, "
+                f"{np.degrees(shifted.max()):.3f}] deg, outside the authored limits "
+                f"[{low}, {high}] deg"
+            )
+        rotations[:, index, slot] = shifted
+    return replace(clip, joint_rotations=rotations)
+
+
+def dof_groups(plan: HumanRigPlan) -> dict[str, tuple[JointSpec, ...]]:
+    """The plan's DOFs grouped by the skeleton joint they retarget, in chain order.
+
+    A joint with several declared rotation axes became a chain of revolute joints
+    (proxies then the real link), which is the order the chain applies them in, so
+    the tuple is exactly the axis order a decomposition needs. A single-axis joint
+    yields a one-element tuple, which keeps the old single-DOF behaviour reachable
+    through the same code path.
+    """
+
+    groups: dict[str, list[JointSpec]] = {}
+    for joint in plan.joints:
+        groups.setdefault(joint.chain_joint, []).append(joint)
+    return {name: tuple(joints) for name, joints in groups.items()}
+
+
+def axis_residuals(
+    clip: MotionClip, frame: int, plan: HumanRigPlan
+) -> dict[str, tuple[float, float]]:
+    """Per-DOF ``(value_rad, residual_rad)`` for one clip frame.
+
+    This is the projection :func:`joint_values_from_clip` applies, exposed so a caller
+    can see *which* joint a motion disagrees with rather than only that it disagrees.
+
+    DOFs belonging to the same skeleton joint share one residual, because they are
+    decomposed together: a three-axis chain can reproduce any rotation exactly, so
+    its residual is zero, while a two-axis chain cannot and reports the geodesic
+    angle it genuinely misses by. A single-axis DOF keeps the historical
+    definition -- its axis-angle component, with the off-axis part as the residual
+    -- so an unchanged single-axis rig reads exactly as it always did.
+    """
+
+    if not 0 <= frame < clip.frame_count:
+        raise ValueError(f"frame {frame} is outside the clip's {clip.frame_count} frames")
+    residuals: dict[str, tuple[float, float]] = {}
+    for chain_joint, joints in dof_groups(plan).items():
+        if chain_joint not in clip.joint_names:
+            raise ValueError(
+                f"{chain_joint}: the clip does not drive this joint; every plan DOF "
+                "must be present in the reference motion"
+            )
+        vector = np.asarray(clip.rotation_of(frame, chain_joint), dtype=np.float64)
+        split = split_rotation(
+            vector,
+            tuple(joint.axis for joint in joints),
+            axis_angle=vector,
+            # Passing the limits lets the solver pick, among the equivalent angle sets
+            # that reproduce this rotation equally exactly, the one the rig can hold.
+            limits_deg=tuple(
+                (joint.lower_deg, joint.upper_deg) for joint in joints
+            ),
+        )
+        for joint, angle in zip(joints, split.angles, strict=True):
+            residuals[joint.name] = (float(angle), float(split.residual_rad))
+    return residuals
+
+
+def joint_values_from_clip(
+    clip: MotionClip,
+    frame: int,
+    plan: HumanRigPlan,
+    *,
+    axis_tolerance_rad: float = AXIS_PROJECTION_TOLERANCE_RAD,
+) -> tuple[np.ndarray, float]:
+    """Map one clip frame onto the rig's scalar DOFs.
+
+    A revolute joint can only express rotation about its own axis, so a joint
+    rotation that is not reachable by the declared chain cannot be replayed
+    exactly. Instead of silently projecting and pretending the motion was
+    reproduced, this returns the residual and the caller decides. One axis is the
+    historical case -- the reference motions are authored axis-aligned and a
+    non-zero residual means a motion and a rig have drifted apart. Several axes
+    are decomposed as a chain, so a three-axis joint can express an arbitrary
+    rotation and a two-axis joint reports only what it genuinely cannot reach.
+
+    This is the one rule for "can the rig express this frame". The AMASS candidate
+    screen calls it too, so a clip cannot be reported as usable by one path and
+    rejected by another.
+
+    Returns ``(values_rad, residual_rad)`` in plan DOF order.
+    """
+
+    residuals = axis_residuals(clip, frame, plan)
+    values = np.array(
+        [residuals[joint.name][0] for joint in plan.joints], dtype=np.float64
+    )
+    worst = max((residuals[joint.name][1] for joint in plan.joints), default=0.0)
+    if worst > axis_tolerance_rad:
+        binding = max(plan.joints, key=lambda joint: residuals[joint.name][1])
+        raise ValueError(
+            f"the reference motion rotates a joint about an axis the rig cannot express "
+            f"(residual {math.degrees(worst):.3f} degrees at frame {frame}, at "
+            f"{binding.name!r}); projecting it would reproduce a different motion than "
+            "the reference"
+        )
+    return values, worst
 
 
 def pose_surface_points(

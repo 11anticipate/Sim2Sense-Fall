@@ -83,10 +83,10 @@ from sim2sense_fall.humans.motion import load_motion_library  # noqa: E402
 from sim2sense_fall.humans.rig import (  # noqa: E402
     fit_rest_skeleton,
     forward_kinematics,
+    joint_values_from_clip,
     plan_human_rig,
     pose_surface_points,
 )
-from sim2sense_fall.humans.usd_human import joint_values_from_clip  # noqa: E402
 
 LOGGER = logging.getLogger("collect_fall_mesh")
 
@@ -351,7 +351,15 @@ def load_amass_library_slice(root: Path, *, limit: int | None) -> dict[str, Any]
 
     from sim2sense_fall.humans.amass import load_amass_library
 
-    return load_amass_library(directory, limit=limit, target_up_axis="z")
+    loaded = load_amass_library(directory, limit=limit)
+    if loaded.failures:
+        LOGGER.warning(
+            "skipped %d of %d AMASS sequences that could not be read; first failure: %s",
+            len(loaded.failures),
+            loaded.scanned,
+            loaded.failures[0][1],
+        )
+    return loaded.clips
 
 
 def write_amass_slice(source: Path, destination: Path) -> int:

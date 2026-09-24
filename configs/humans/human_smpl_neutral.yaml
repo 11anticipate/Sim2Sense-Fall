@@ -117,24 +117,32 @@ rig:
     neck:          {dof: revolute, rotations: [y], limits_deg: [[-40, 50]],
                     drive: {stiffness: 120, damping: 12, max_force: 120}}
 
-    left_shoulder: {dof: revolute, rotations: [y], limits_deg: [[-170, 110]],
+    # An arm only hangs along -Z once it has been adducted, so the shoulder's single
+    # DOF is adduction/abduction about the body's +X (forward) axis -- not pitch about
+    # +Y, which the legs correctly use because they already point down. Measured on the
+    # planned rig with forward_kinematics: 90 deg of shoulder about +Y moves the wrist
+    # 0.034 m (a twist about the arm's own axis), while about +X it moves it 0.536 m.
+    # Arms at the sides are -105 deg left / +105 deg right, the wrist-to-hip minimum;
+    # the elbow brings the forearm forward at -60 deg left / +60 deg right about +Z.
+    left_shoulder: {dof: revolute, rotations: [x], limits_deg: [[-120, 75]],
                     drive: {stiffness: 200, damping: 20, max_force: 200}}
-    right_shoulder: {dof: revolute, rotations: [y], limits_deg: [[-170, 40]],
+    right_shoulder: {dof: revolute, rotations: [x], limits_deg: [[-75, 120]],
                     drive: {stiffness: 200, damping: 20, max_force: 200}}
-    left_elbow:    {dof: revolute, rotations: [y], limits_deg: [[-150, 5]],
+    left_elbow:    {dof: revolute, rotations: [z], limits_deg: [[-145, 10]],
                     drive: {stiffness: 150, damping: 15, max_force: 150}}
-    right_elbow:   {dof: revolute, rotations: [y], limits_deg: [[-150, 5]],
+    right_elbow:   {dof: revolute, rotations: [z], limits_deg: [[-10, 145]],
                     drive: {stiffness: 150, damping: 15, max_force: 150}}
 
-# The imported SMPL neutral asset has a horizontal rest arm.  These display-only
-# targets rotate both shoulders down beside the torso and relax the elbows, so the
-# authored skin and the PhysX capsules start from the same natural pose.
+# The imported SMPL neutral asset has a horizontal rest arm, so "arms at the sides"
+# is a commanded joint angle rather than a property of the rig, and the reference
+# motion has to carry it. These display targets match those reference baselines so
+# the authored skin, the PhysX capsules and every trial start from one pose.
 visualization:
   default_pose_rad:
-    left_shoulder: 1.5707963267948966
-    right_shoulder: -1.5707963267948966
+    left_shoulder: -1.8325957145940459
+    right_shoulder: 1.8325957145940459
     left_elbow: -0.20
-    right_elbow: -0.20
+    right_elbow: 0.20
 
 control:
   # pd          -> joints track the reference with the configured drive gains.
@@ -148,6 +156,10 @@ control:
   tracking_tolerance_deg: 15.0
   pose_hold_seconds: 0.2
   max_root_linear_velocity_m_s: 3.0
+  # Independent stationary-standing gate; no_fall alone does not pass it.
+  standing_max_drop_m: 0.05
+  standing_max_tilt_deg: 15.0
+  standing_max_drift_m: 0.05
 
 simulation:
   physics_dt_s: 0.008333333333333333

@@ -42,6 +42,7 @@ from sim2sense_fall.humans.assets import (  # noqa: E402
     select_body,
 )
 from sim2sense_fall.humans.config import load_human_config  # noqa: E402
+from sim2sense_fall.humans.motion import AMASS_BODY_FRAME  # noqa: E402
 from sim2sense_fall.humans.rig import fit_rest_skeleton, plan_human_rig  # noqa: E402
 
 
@@ -56,8 +57,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fall-only", action="store_true", help="write only screened fall candidates"
     )
-    parser.add_argument("--source-up-axis", choices=("y", "z"), default="y")
-    parser.add_argument("--target-up-axis", choices=("y", "z"), default="z")
     return parser.parse_args(argv)
 
 
@@ -72,6 +71,20 @@ def main(argv: list[str] | None = None) -> int:
             model_id=config.skeleton.model_asset,
             allow_procedural=bool(config.skeleton.allow_procedural_skeleton),
         )
+        if body.has_skin_mesh:
+            # AMASS pose parameters live in the body model's own canonical frame, so a
+            # frame measured from the template that disagrees with the one used to read
+            # the sequences means every joint rotation is being interpreted in the wrong
+            # basis -- which still produces a human-sized body, and only shows up as
+            # motion that cannot be replayed.
+            derived = str(body.model.source_frame)
+            if derived != AMASS_BODY_FRAME.describe():
+                raise ValueError(
+                    f"AMASS sequences are retargeted assuming {AMASS_BODY_FRAME.describe()}, "
+                    f"but the loaded body model {config.skeleton.model_asset} was measured in "
+                    f"{derived}. Reconcile the two before importing; screening either way "
+                    "would report a candidate count for a body nobody simulated."
+                )
         rest = (
             fit_rest_skeleton(config, body.model.mesh().rest_skeleton())
             if body.has_skin_mesh
@@ -82,12 +95,8 @@ def main(argv: list[str] | None = None) -> int:
             standing_height_m=config.skeleton.height_m,
         )
         plan = plan_human_rig(config, rest=rest, spawn_xy=spawn)
-        clips = load_amass_library(
-            args.root,
-            limit=args.limit,
-            source_up_axis=args.source_up_axis,
-            target_up_axis=args.target_up_axis,
-        )
+        loaded = load_amass_library(args.root, limit=args.limit)
+        clips = loaded.clips
     except (OSError, ValueError) as exc:
         checks.check("AMASS import inputs", False, f"{type(exc).__name__}: {exc}")
         return checks.report(banner="AMASS import")
@@ -120,13 +129,23 @@ def main(argv: list[str] | None = None) -> int:
             checks.info(f"{tagged.clip_id}: skipped by --fall-only")
         manifest.append(item)
     output = write_json(
-        args.out / "manifest.json", {"root": str(args.root.resolve()), "clips": manifest}
+        args.out / "manifest.json",
+        {
+            "root": str(args.root.resolve()),
+            "source_body_frame": AMASS_BODY_FRAME.describe(),
+            "files_read": loaded.scanned,
+            "unreadable": [{"path": path, "error": error} for path, error in loaded.failures],
+            "clips": manifest,
+        },
     )
     accepted = sum(bool(item["screen"]["accepted"]) for item in manifest)
+    candidates = sum(bool(item["screen"]["fall_candidate"]) for item in manifest)
     checks.check(
         "AMASS sequences imported",
         bool(manifest),
-        f"{len(manifest)} sequences scanned, {accepted} fall candidates",
+        f"{loaded.scanned} files read ({len(loaded.failures)} unreadable), {len(manifest)} "
+        f"screened, {candidates} fall candidates, {accepted} of those expressible by the "
+        "shipped single-axis rig",
     )
     checks.info(f"wrote {output}")
     return checks.report(banner="AMASS import")

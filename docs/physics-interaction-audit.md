@@ -1,5 +1,16 @@
 # 人体—世界物理交互审计（2026-09-22）
 
+> 历史审计及追加修复记录，代码行号、环境和开放项仅对应当轮。
+> 09-24 后续已完成接触路径解码、末端碰撞体、辅助 AMASS 跟踪及键盘实时显示；
+> 当前未完成项见 [计划](../task_plan.md)，实际质量见 [AMASS 审计](amass-physics-audit-2026-09-24.md)
+> 与 [键盘实测](keyboard-control.md)。[文档索引](README.md)。
+
+> 2026-09-23复审更新：以下保留历史试验记录。当前结果以
+> [独立复核报告](verification-2026-09-23.md) 为准。旧Sionna dB值因丢弃虚部已撤回；
+> 5秒自由静态站立和后推物理跌倒已通过新配置，公寓→复数CIR已实跑。
+> 部分前推/控制失效仍因网格穿地被剔除，不能声称所有物理交互无穿透。
+
+
 > 目的：在实现可靠摔倒检测之前，先把「人体模型与世界模型之间是否存在真实且稳定的物理交互」
 > 这件事查清。本文只给根因、修复方案和验证标准，不重构无关模块。
 >
@@ -474,6 +485,15 @@ ground_offset = -min(
 改为 `HumanRuntime(stage, plan, enable_contact_views=True)`；
 `build.py:249`、`view_amass.py:181` 保持 `False`（只做外观，不需要接触）。
 
+> **2026-09-23 已回退该步。** 请求这个视图只换来刷屏：`omni.physics.tensors` 为每条过滤路径
+> 打一条 `[Error]`（单次运行 4,368 行），且 `RigidPrim._on_physics_ready` 里
+> `PhysxRigidContactView.check()` 解引用空 `_backend` 抛出的 `AttributeError` 是由
+> `SimulationManager` 以 weakref proxy 异步派生的，**脚本的 try/except 结构上接不住**，
+> 时间线停止后还会再触发一次——即按中断时看到的那一屏。第二步（轮询通道）才是真正的修复，
+> 它不依赖 tensor 视图。现 `simulate.py` / `verify.py` 均传 `enable_contact_views=False`，
+> `HumanRuntime` 增加 `contact_tensor_view_reason` 区分「没请求 / 请求了但坏了 / 无可请求对象」。
+> 真机对照：请求 4,368 行 `[Error]` vs 不请求 0 行；详见 `docs/progress.md` 同日条目。
+
 **第二步（真正的修复）**：在 `HumanRuntime` 里加一条不依赖 `omni.physics.tensors` 的
 接触来源，并**显式记录用的是哪一条**。
 
@@ -623,13 +643,13 @@ python3 scripts/humans/plan.py
 
 | 编号 | 检查 | 量化门限 | 当前值 |
 | --- | --- | --- | --- |
-| V2a | 静止停留：把人体放到 `spawn_root_position`、DOF 归零、drives 开启，跑 1.0 s | 全程最低胶囊 ∈ [−0.005, +0.020] m，且骨盆下降 < 0.05 m | 起步 **+0.196 m** → FAIL（P0-3 未做） |
+| V2a | 静止停留：把人体放到 `spawn_root_position`、DOF 归零、drives 开启，跑 1.0 s | 全程最低胶囊 ∈ [−0.005, +0.020] m，且骨盆下降 < 0.05 m | **仍 FAIL**：P0-3 改完后 `stand_neutral` 已能标 `no_fall`，但骨盆仍沉降约 0.29 m（1.01 → 0.72 m）、峰值躯干角 48.7°。剩下的不是稳定期问题，是**自由根人体没有平衡控制器** |
 | V2b | 不穿透：全程无胶囊低于 −0.05 m | 与现有一致 | PASS（−0.0000 m） |
 | V2c | 抬升回落正对照：抬高 0.25 m | 下落 ≥ 0.23 m，且 `lifted_root_z` 与指令值差 < 1 mm | 下落 1.3079 m（读数差 37 mm） |
 | V2d | 接触可读：贴地状态下 | ≥ 1 对接触，接触点 z ∈ [−0.02, +0.02] m，法向与 +Z 夹角 < 5° | 实测可拿到：点 (8.5901, 2.137, 0.0)、法向 (0,0,1) |
 | V2e | 接触负对照：把人体整体抬高 1.0 m 悬空 | 接触对 **= 0**（防止把常驻噪声当成接触） | 待补 |
 | V2f | 接触归因 | 每条接触都能落到一个 `contact_segment`（连杆名）；`contact_attribution == "geometry"`；`support_surface_height_m` 可读且等于实测支撑面 | **PASS（GPU 实跑）**：`verify.py` 报 `attribution=geometry, limbs=['left_ankle','right_ankle']`；`support_surface_height_m = −1.34e−9`（地板真值 0.0，与实测接触点 `z = 0.00000` 吻合）；单次试验 632 行接触跨 121 帧，`is_support` True=456 / False=176 |
-| V2g | 稳定期不传送 | `settle_support_kind != "kinematic_teleport"`，或 `settle_released_at_s` 到首帧 ≥ 0.3 s 且释放后骨盆竖直速度 < 阈值 | **仍未做（P0-3）**：当前恒为传送 |
+| V2g | 稳定期不传送 | `settle_support_kind != "kinematic_teleport"`，或 `settle_released_at_s` 到首帧 ≥ 0.3 s 且释放后骨盆竖直速度 < 阈值 | **PASS（2026-09-23 实跑）**：`settle_support_kind = "bounded_released_root_assist"`、`settle_released_at_s = 0.6`、`settle_max_correction_m = 0.005`，不再是传送 |
 | V2h | 保留现有 31 项 | 全部 PASS | 31 PASS / 0 FAIL |
 
 ### V3 — 试验层（`scripts/humans/simulate.py --headless`）

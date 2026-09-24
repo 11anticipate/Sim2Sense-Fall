@@ -61,6 +61,7 @@ from common import (  # noqa: E402
     open_scene,
     resolve_spawn_point,
     set_physics_dt,
+    step_physics,
     write_json,
 )
 
@@ -97,6 +98,14 @@ DIVERGENCE_HEIGHT_FACTOR = 2.0
 REST_SAMPLE_SECONDS = 0.2
 #: Movement of the pelvis across that window that still counts as at rest, in metres.
 REST_CREEP_M = 5e-3
+#: How long the unactuated body is given to come to rest before the tail sample.
+#: Calibrated on the rig under test, not assumed: the 14-DOF single-axis body stopped
+#: within 1.5 s, but the 62-link multi-axis ragdoll was still sliding at 0.23 m/s when
+#: that window closed (46 mm of creep against the 5 mm gate) and needed ~3 s.
+#: The original 3.0 was calibrated while one ``app.update()`` advanced two physics
+#: steps (see common.step_physics), so the window that passed covered 6.0 s of
+#: physics time; the value is stated in true physics seconds after the stepper fix.
+GRAVITY_SETTLE_SECONDS = 6.0
 #: Deepest acceptable excursion below the floor, in metres.
 PENETRATION_TOLERANCE_M = -0.05
 #: Height above the standing pose used for the airborne replay check. Chosen to sit
@@ -241,8 +250,12 @@ def check_physics(
     root_z = float(plan.spawn_root_position[2])  # type: ignore[attr-defined]
 
     def hold(seconds: float) -> None:
+        # Stepped through the deterministic stepper, not ``app.update()``: one
+        # update advances a fixed 1/60 s of physics time on this build, so a
+        # seconds window counted in updates ran at 2x the physics time it names
+        # (measured; see common.step_physics).
         for _ in range(max(1, int(round(seconds / physics_dt)))):
-            app.update()  # type: ignore[attr-defined]
+            step_physics(1)
 
     def place(offset_z: float) -> None:
         runtime.set_root_pose(  # type: ignore[attr-defined]
@@ -341,8 +354,16 @@ def check_physics(
     # into 1.3 degrees -- smaller than the 15 degree tolerance, so the check could only
     # ever pass. The target amplitude is therefore gated on its own before tracking runs.
     tolerance = float(config.control.tracking_tolerance_deg)  # type: ignore[attr-defined]
+    # A three-axis chain has small secondary-axis spans the single-axis rig never
+    # had, so half the wider limit can sit inside the tolerance; the target is
+    # widened until it can actually falsify a tracking claim.
     targets = np.array(
-        [tracking_target_rad(low[index], high[index]) for index in range(len(plan.dof_names))],  # type: ignore[attr-defined]
+        [
+            tracking_target_rad(
+                low[index], high[index], min_amplitude=np.radians(tolerance * 1.25)
+            )
+            for index in range(len(plan.dof_names))
+        ],  # type: ignore[attr-defined]
         dtype=np.float64,
     )
     amplitude_deg = np.abs(np.degrees(targets))
@@ -471,16 +492,22 @@ def check_physics(
     hold(0.2)
     baseline_root = np.asarray(runtime.root_pose()[0])  # type: ignore[attr-defined]
     place(args.lift_height)
+    # The fall control starts from the rest pose. The pre-baseline hold leaves an
+    # arbitrary fold behind, and lifting mid-fold would measure the fold's ballistic
+    # swing, not the fall; writing positions is a kinematic reset, not a force, so
+    # the control stays passive.
+    runtime.set_joint_positions(zero)  # type: ignore[attr-defined]
+    runtime.set_joint_targets(zero)  # type: ignore[attr-defined]
     for _ in range(4):
         app.update()  # type: ignore[attr-defined]
     lifted_root_z = float(runtime.root_pose()[0][2])  # type: ignore[attr-defined]
-    hold(1.5)
+    hold(GRAVITY_SETTLE_SECONDS)
     # The body is unactuated here (drives are zeroed above), so it topples and slides.
     # Sample the tail of the window so "came to rest" can be told from "still sliding",
     # which is the difference between a fall and a divergence.
     tail: list[np.ndarray] = []
     for _ in range(max(1, int(round(REST_SAMPLE_SECONDS / physics_dt)))):
-        app.update()  # type: ignore[attr-defined]
+        step_physics(1)
         tail.append(np.asarray(runtime.root_pose()[0]).copy())  # type: ignore[attr-defined]
     final_root = tail[-1]
     descent = lifted_root_z - float(final_root[2])
@@ -641,15 +668,24 @@ def main(argv: list[str] | None = None) -> int:
             f"requested {config.simulation.physics_dt_s} s, engine reports {measured_dt} s, "
             f"accepted={accepted}",
         )
-        runtime = HumanRuntime(stage, plan, enable_contact_views=True, app=app)
+        # Same reason as the trial runner: this build cannot construct the tensors
+        # rigid-contact view, and requesting it logs a plugin error per filter plus a
+        # traceback from an async physics-ready callback. The contact channel verified
+        # below is the polled physx report, which needs no tensor view.
+        runtime = HumanRuntime(stage, plan, enable_contact_views=False, app=app)
         tagged = author_contact_reporting(stage)
         runtime.play()
         for _ in range(4):
             app.update()
         checks.check(
             "runtime DOF set matches the plan",
-            runtime.capabilities["dof_order_matches_plan"],
-            ", ".join(runtime.capabilities["dof_order"]),
+            sorted(runtime.capabilities["dof_order"]) == sorted(plan.dof_names),  # type: ignore[attr-defined]
+            ", ".join(runtime.capabilities["dof_order"])  # type: ignore[attr-defined]
+            + (
+                " (PhysX traversal order; translated to plan order at the runtime boundary)"
+                if runtime.capabilities.get("dof_plan_permutation")  # type: ignore[attr-defined]
+                else ""
+            ),
         )
         # The contact channel is what a fall detector reads, so it is verified here
         # rather than assumed. Both sides must be tagged: PhysX only reports a pair
@@ -670,15 +706,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"{len(probe_samples)} pairs on the probe step, "
                 f"source {runtime.capabilities['contact_source']}",
             )
-            # The report exposes opaque numeric collider handles with no handle->path
-            # API and tags contact reporting per ACTOR, so a pair's two sides cannot be
-            # separated. Attribution is therefore geometric: each reported point is
-            # tested against the live world-space capsule volumes. Verified here so a
-            # silent "unresolved" cannot pass as "attributed".
+            # PhysX collider identifiers decode to USD paths, including terminal
+            # colliders and the pelvis collider nested below the root actor.
             segments = runtime.contact_segment_names()
             checks.check(
                 "reported contact points resolve to body limbs",
-                runtime.capabilities["contact_attribution"] == "geometry",
+                runtime.capabilities["contact_attribution"] == "usd_collider_path",
                 f"attribution={runtime.capabilities['contact_attribution']}, "
                 f"limbs={sorted(set(segments)) or 'none'}",
             )

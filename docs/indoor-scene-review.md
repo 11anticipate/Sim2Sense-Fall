@@ -1,5 +1,7 @@
 # 室内 USD 与代码批判性验收
 
+> 历史问题报告（2026-09-21），不作为现行待办。现行 [场景指南](indoor-scene.md)、[计划](../task_plan.md) 与 [文档索引](README.md)。
+
 > 目录迁移说明（2026-09-21）：场景实现现位于 `src/sim2sense_fall/scenes/`，入口位于 `scripts/scenes/`。下文历史缺陷的路径、行号和哈希保留为当时证据；当前命令见 [场景指南](indoor-scene.md)。
 
 **整改更新：R1–R6 已修复并复验，见 [整改记录](indoor-scene-remediation.md)。下文保留修复前的验收事实、旧源码行号和旧资产哈希，不能当作当前缺陷状态。**

@@ -47,10 +47,12 @@ from .rotations import (
 from .skeleton import SkeletonTopology, smpl_skeleton
 
 __all__ = [
+    "AMASS_BODY_FRAME",
     "FRAME_SOURCE_AMASS",
     "FRAME_SOURCE_SCRIPTED",
     "MAX_FRAME_DELTA_RAD",
     "MAX_JOINT_ANGLE_RAD",
+    "BodyFrame",
     "MotionClip",
     "MotionProvenance",
     "PHASE_LABELS",
@@ -228,6 +230,49 @@ def body_frame_conversion(
             "means the triple is left-handed (mirrored), which would swap left and right"
         )
     return matrix
+
+
+@dataclass(frozen=True, slots=True)
+class BodyFrame:
+    """The anatomical axes a body file is authored in.
+
+    ``up``/``forward``/``left`` name the *file's own* axes, so the triple can be handed
+    straight to :func:`body_frame_conversion`. It is a value, not a preference: either
+    the file is authored that way or it is not, and getting it wrong yaws the body while
+    leaving every "is up up" check passing.
+    """
+
+    up: str
+    forward: str
+    left: str
+
+    def basis(self, *, source: str = "body frame") -> np.ndarray:
+        """Change-of-basis matrix carrying this frame into the pipeline frame."""
+
+        return body_frame_conversion(
+            up=self.up, forward=self.forward, left=self.left, source=source
+        )
+
+    def describe(self) -> str:
+        return f"up={self.up} forward={self.forward} left={self.left}"
+
+
+#: The frame AMASS pose parameters are authored in.
+#:
+#: AMASS stores SMPL/SMPL-H *local* joint rotations, and SMPL gives its joints no
+#: per-joint canonical offset, so those numbers live in the model's own rest frame --
+#: which is not the pipeline frame. Three measurements on the local corpus fix it:
+#:
+#: * the released template's rest joints put the crown on ``+Y``, the face on ``+Z``
+#:   and the shoulder span on ``+X``, which is what ``assets._derive_body_frame``
+#:   re-measures from the file on every load;
+#: * pose slots 10 and 11 are identically zero in every sampled sequence, the signature
+#:   of SMPL's two leaf foot joints, so slot ``k`` names joint ``k`` with no reordering;
+#: * with this basis the hip/knee/ankle/spine flexion energy lands on the pipeline's
+#:   ``Y``, which is the axis the rig declares. The up-only conversion this replaces
+#:   put that flexion on ``X`` instead, so every real sequence read as "rotating about
+#:   an axis the rig cannot express" and the whole library screened out.
+AMASS_BODY_FRAME = BodyFrame(up="y", forward="z", left="x")
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,8 +659,7 @@ def retarget_amass_clip(
     fps: float,
     provenance: MotionProvenance,
     betas: object | None = None,
-    source_up_axis: str = "y",
-    target_up_axis: str = "z",
+    source_frame: BodyFrame = AMASS_BODY_FRAME,
     body_joints: int = 22,
     total_joints: int = 52,
     topology: SkeletonTopology | None = None,
@@ -627,6 +671,11 @@ def retarget_amass_clip(
     ``3 * (body_joints - 1)`` values become joints 1..21; everything after is
     finger motion and is dropped, with the drop recorded in the clip metadata.
     SMPL's hand joints have no AMASS counterpart and stay at rest.
+
+    ``source_frame`` describes the model's local rest frame. AMASS's capture world
+    is Z-up, already matching the pipeline world. Local rotations change basis
+    with B R B.T; the root maps model to world, so it becomes R_root B.T.
+    World translations must not be transformed by the model-local basis.
     """
 
     skeleton = topology or smpl_skeleton()
@@ -651,19 +700,24 @@ def retarget_amass_clip(
     if not np.all(np.isfinite(pose_array)) or not np.all(np.isfinite(trans_array)):
         raise ValueError("AMASS sequence contains non-finite values")
 
-    basis = up_axis_conversion(source_up_axis, target_up_axis)
-    root_rotation = (basis @ pose_array[:, :3].T).T
+    if not isinstance(source_frame, BodyFrame):
+        raise ValueError(f"source_frame must be a BodyFrame, got {source_frame!r}")
+    basis = source_frame.basis(source=clip_id)
+    root_rotation = np.stack([
+        matrix_to_axis_angle(axis_angle_to_matrix(value) @ basis.T)
+        for value in pose_array[:, :3]
+    ])
     joint_rotations = np.zeros((pose_array.shape[0], skeleton.joint_count, 3), dtype=np.float64)
     body_block = pose_array[:, 3 : 3 * body_joints].reshape(pose_array.shape[0], body_joints - 1, 3)
     joint_rotations[:, 1:body_joints] = (basis @ body_block.transpose(0, 2, 1)).transpose(0, 2, 1)
-    root_translation = (basis @ trans_array.T).T
+    root_translation = trans_array.copy()
 
     dropped_joints = joint_total - body_joints
     notes = (
         f"retargeted from {provenance.representation} ({total_joints} joints); "
         f"dropped {dropped_joints} finger joints; "
         "SMPL hand joints 22/23 have no SMPL-H counterpart and stay at rest; "
-        f"up axis converted {source_up_axis}->{target_up_axis}"
+        f"body frame {source_frame.describe()} converted to the pipeline frame"
     )
     return MotionClip(
         clip_id=clip_id,
@@ -688,7 +742,10 @@ def retarget_amass_clip(
             "retarget": "amass_smplh_to_smpl",
             "source_joint_count": joint_total,
             "dropped_finger_joints": dropped_joints,
-            "up_axis_conversion": f"{source_up_axis}->{target_up_axis}",
+            "source_body_frame": source_frame.describe(),
+            "source_world_frame": "z_up",
+            "root_transform": "R_source @ B_model.T; t_source unchanged",
+            "retarget_version": 2,
         },
     )
 

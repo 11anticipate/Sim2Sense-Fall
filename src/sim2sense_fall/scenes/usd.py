@@ -449,8 +449,16 @@ def activate_physics() -> dict[str, Any]:
 def step_simulation(app: Any, seconds: float) -> int:
     """Play the timeline and advance the app for ``seconds``, returning step count.
 
-    ``app.update()`` must drive the loop: with ``omni.kit.loop-isaac`` active each
-    update advances the physics clock by one ``physics_dt``.
+    TIMING CAVEAT (measured 2026-09-24, Isaac Sim 6.0.1-rc.7): one ``app.update()``
+    advances a FIXED 1/60 s of physics time on this build regardless of the
+    configured ``physics_dt`` -- with and without ``omni.kit.loop-isaac``, and with
+    the GUI kit's ``runLoops`` manual-mode settings injected
+    (``scripts/humans/probe_loop_timing.py``, ``artifacts/humans/probe_loop_*.log``).
+    The ``frames = seconds / dt`` count below therefore advances 2x the named
+    physics time when ``dt < 1/60``. The humans pipeline bypasses this with
+    ``SimulationManager.step`` (``scripts/humans/common.py:step_physics``); scene-side
+    windows are still calibrated against the 2x behaviour and must be re-measured
+    before anything quotes seconds from this function.
     """
 
     import omni.timeline

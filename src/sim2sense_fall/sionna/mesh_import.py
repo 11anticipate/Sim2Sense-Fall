@@ -58,10 +58,15 @@ class HumanMaterial:
     conductivity_s_per_m: float
     thickness_m: float
     source: str
+    reference_frequency_hz: float = 3.5e9
 
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("material name must be non-empty")
+        if not self.source.strip():
+            raise ValueError("material source must be non-empty")
+        if not np.isfinite(self.reference_frequency_hz) or self.reference_frequency_hz <= 0:
+            raise ValueError("reference frequency must be finite and positive")
         if not np.isfinite(self.relative_permittivity) or self.relative_permittivity < 1.0:
             raise ValueError(
                 "relative permittivity must be finite and at least 1 "
@@ -83,18 +88,21 @@ class HumanMaterial:
             "model": "sionna.rt.RadioMaterial (single-layer slab, Fresnel)",
             "provenance": "modelling assumption, not measured",
             "source": self.source,
+            "reference_frequency_hz": self.reference_frequency_hz,
+            "thickness_provenance": "effective slab modelling assumption; not tissue anatomy",
         }
 
 
 def human_tissue_material(
     *,
-    relative_permittivity: float = 51.0,
-    conductivity_s_per_m: float = 2.16,
+    relative_permittivity: float = 51.444229951809085,
+    conductivity_s_per_m: float = 2.557518249544951,
     thickness_m: float = 0.02,
     source: str = (
-        "high-water-content soft tissue at ~3.5 GHz; Sionna's ITU-R P.2040 table has no "
-        "body-tissue entry, so these are tissue constants entered by hand and need a "
-        "literature citation before they are used for reported results"
+        "Gabriel et al. 1996 Phys Med Biol 41:2271-2293, doi:10.1088/0031-9155/41/11/003; "
+        "IFAC-CNR Andreuccetti/Fossi/Petrucci tissue calculator, Muscle at 3.5 GHz; "
+        "https://webnir.eu/04-Dosimetry/01-webapp.php?lang=gb, retrieved 2026-09-23. "
+        "Whole-body homogeneous muscle slab is an approximation; ITU has no body-tissue entry."
     ),
 ) -> HumanMaterial:
     """The default body material, with its assumption stated rather than implied."""
@@ -159,6 +167,14 @@ def candidate_mesh_arrays(vertices: Any, faces: Any) -> tuple[np.ndarray, np.nda
         raise ValueError(
             f"face index {int(triangles.max())} is outside the {points.shape[0]} vertices"
         )
+    if np.max(np.abs(points)) > np.finfo(np.float32).max:
+        raise ValueError("vertices exceed float32 range")
+    normal = np.cross(
+        points[triangles[:, 1]] - points[triangles[:, 0]],
+        points[triangles[:, 2]] - points[triangles[:, 0]],
+    )
+    if np.any(np.linalg.norm(normal, axis=1) == 0):
+        raise ValueError("mesh contains zero-area triangles")
     return (
         np.ascontiguousarray(points, dtype=np.float32),
         np.ascontiguousarray(triangles, dtype=np.uint32),
@@ -204,6 +220,14 @@ def scene_radio_material(scene: Any, material: HumanMaterial) -> Any:
     radio_material_module = _sionna_rt()
     existing = scene.radio_materials.get(material.name)
     if existing is not None:
+        for attribute, expected in (
+            ("relative_permittivity", material.relative_permittivity),
+            ("conductivity", material.conductivity_s_per_m),
+            ("thickness", material.thickness_m),
+        ):
+            actual = np.asarray(getattr(existing, attribute)).reshape(-1)
+            if not np.allclose(actual, expected, rtol=1e-5, atol=1e-8):
+                raise ValueError(f"material name {material.name!r} has conflicting {attribute}")
         return existing
     radio_material = radio_material_module.RadioMaterial(
         name=material.name,

@@ -7,6 +7,7 @@ Kit (which replaces ``sys.stdout``), and JSON writing that refuses NaN.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sys
 from dataclasses import replace
@@ -24,6 +25,8 @@ DEFAULT_MOTIONS = REPO_ROOT / "configs" / "humans" / "motions.yaml"
 DEFAULT_SCENE = REPO_ROOT / "artifacts" / "scenes" / "indoor_apartment.usda"
 DEFAULT_SCENE_CONFIG = REPO_ROOT / "configs" / "scenes" / "indoor_apartment.yaml"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "artifacts" / "humans"
+
+LOGGER = logging.getLogger("humans_common")
 
 __all__ = [
     "DEFAULT_ASSETS",
@@ -124,7 +127,15 @@ def load_inputs(
     if amass_root is not None:
         from sim2sense_fall.humans.amass import load_amass_library
 
-        imported = load_amass_library(amass_root, limit=amass_limit, target_up_axis="z")
+        loaded = load_amass_library(amass_root, limit=amass_limit)
+        if loaded.failures:
+            LOGGER.warning(
+                "skipped %d of %d AMASS sequences that could not be read; first failure: %s",
+                len(loaded.failures),
+                loaded.scanned,
+                loaded.failures[0][1],
+            )
+        imported = loaded.clips
         overlap = sorted(set(motions).intersection(imported))
         if overlap:
             raise ValueError(f"AMASS motion ids collide with scripted motions: {overlap}")
@@ -207,6 +218,38 @@ def set_physics_dt(dt_s: float) -> tuple[float, bool]:
     except Exception:  # noqa: BLE001 - reported through the return value
         accepted = False
     return float(SimulationManager.get_physics_dt()), accepted
+
+
+def step_physics(steps: int) -> None:
+    """Advance the physics clock by exactly ``steps`` steps of the configured dt.
+
+    ``app.update()`` is NOT a unit of physics time on this build: each call advances a
+    fixed 1/60 s of physics time regardless of the configured step. Measured at
+    dt = 1/120 s: two steps per update, byte-identical with ``omni.kit.loop-isaac``
+    enabled and with the GUI kit's ``runLoops`` manual-mode settings injected
+    (``artifacts/humans/probe_loop_*.log``). Every window this pipeline quotes in
+    seconds must therefore be stepped here, not by counting updates. The engine's
+    step counter is read back afterwards so a silently failing stepper cannot pass
+    as a completed window -- the same discipline as the raised-then-dropped gravity
+    control, because "the loop ran" and "the clock moved" are different claims.
+
+    Fabric is deliberately left stale (``update_fabric=False``): every physics read
+    in this pipeline goes through tensor views, the headless trials render nothing,
+    and the viewport replay paths still call ``app.update()`` themselves.
+    """
+
+    from isaacsim.core.simulation_manager import SimulationManager
+
+    if steps <= 0:
+        raise ValueError(f"steps must be positive, got {steps!r}")
+    before = int(SimulationManager.get_num_physics_steps())
+    SimulationManager.step(steps=int(steps), update_fabric=False)
+    advanced = int(SimulationManager.get_num_physics_steps()) - before
+    if advanced != int(steps):
+        raise RuntimeError(
+            f"requested {steps} physics steps but the engine advanced {advanced}; "
+            "the clock cannot be trusted, so a seconds-based window would be wrong"
+        )
 
 
 #: Human footprint half-width used when choosing a spawn point, in metres.

@@ -85,6 +85,29 @@ def test_every_configured_dof_clears_the_tracking_tolerance() -> None:
     )
 
 
+def test_widening_clears_the_tolerance_on_a_small_span_axis() -> None:
+    """A three-axis chain has small secondary spans a single-axis rig never had.
+
+    ``spine3``'s secondary axis spans ``[-25, 25]`` degrees, so half the wider side is
+    12.5 degrees -- inside the 15 degree tolerance, which made the verification's
+    falsifiability gate fail on the multi-axis rig. Widening until the amplitude
+    clears ``min_amplitude`` is the fix; the target must still stop short of the
+    limit so the drive has room to settle.
+    """
+
+    low, high = _rad(-25.0), _rad(25.0)
+    target = tracking_target_rad(low, high, min_amplitude=_rad(18.75))
+    amplitude = abs(np.degrees(target))
+    assert amplitude == pytest.approx(18.75)
+    margin = 0.05 * (high - low)
+    assert low + margin <= target <= high - margin
+
+    # An already-large target is left where it was.
+    assert tracking_target_rad(_rad(0.0), _rad(150.0), min_amplitude=_rad(18.75)) == (
+        pytest.approx(_rad(75.0))
+    )
+
+
 # ---------------------------------------------------------------------------
 # Drive scaling, against a duck-typed articulation view
 # ---------------------------------------------------------------------------
@@ -130,6 +153,7 @@ def test_scaling_is_relative_to_the_original_gains_not_the_current_ones() -> Non
     for _ in range(180):
         assert HumanRuntime.set_control_scale(runtime, 0.5)
     np.testing.assert_allclose(runtime.articulation.stiffness, np.full(14, 125.0))
+    np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 50.0))
     assert runtime.control_scale == pytest.approx(0.5)
 
 
@@ -142,6 +166,28 @@ def test_zeroing_and_restoring_the_scale_returns_the_original_gains() -> None:
     np.testing.assert_array_equal(runtime.articulation.stiffness, np.zeros(14))
     assert HumanRuntime.set_control_scale(runtime, 1.0)
     np.testing.assert_allclose(runtime.articulation.stiffness, original)
+    np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 50.0))
+
+
+def test_zero_scale_keeps_the_passive_damping() -> None:
+    """A body that lost active control is a damped ragdoll, not a frictionless one.
+
+    The verification's gravity control and the drives-off negative control both run
+    at scale 0. With damping zeroed too, the 57-DOF multi-axis ragdoll folded
+    ballistically (975 deg/s within the 0.2 s hold, 2864 deg/s mid-fall) and its
+    floor impact NaN'd the PhysX solver -- the "non-finite world position for link
+    'pelvis'" that kept the multi-axis verification red. Damping only opposes
+    velocity: it cannot track a target and cannot hold a pose, so both controls
+    stay honest with it retained.
+    """
+
+    runtime = _runtime(stiffness=250.0, damping=50.0)
+    assert HumanRuntime.set_control_scale(runtime, 0.0)
+    np.testing.assert_array_equal(runtime.articulation.stiffness, np.zeros(14))
+    np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 50.0))
+    # Repeated calls must not compound or erode the damping either.
+    for _ in range(10):
+        assert HumanRuntime.set_control_scale(runtime, 0.0)
     np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 50.0))
 
 
@@ -158,3 +204,51 @@ def test_scaling_reports_failure_instead_of_claiming_it_was_applied() -> None:
 
     runtime = SimpleNamespace(articulation=_Refusing(), _base_gains=None, control_scale=1.0)
     assert HumanRuntime.set_control_scale(runtime, 0.5) is False
+
+
+def test_dof_permutation_round_trips_a_shuffled_articulation_order() -> None:
+    """PhysX keeps multi-axis chains in traversal order, not plan order.
+
+    The verify probes commanded left_knee and actually bent spine2 -- both probes
+    were indexed positionally across that boundary. The permutation is what the
+    runtime now applies on every read and write; this pins its round-trip.
+    """
+
+    from sim2sense_fall.humans.usd_human import dof_permutation
+
+    plan_names = (
+        "left_hip__dof1",
+        "left_hip__dof2",
+        "left_hip",
+        "right_hip__dof1",
+        "right_hip__dof2",
+        "right_hip",
+        "spine1__dof1",
+        "spine1__dof2",
+        "spine1",
+    )
+    # PhysX interleaves the chains breadth-first.
+    runtime_names = (
+        "left_hip__dof1",
+        "right_hip__dof1",
+        "spine1__dof1",
+        "left_hip__dof2",
+        "right_hip__dof2",
+        "spine1__dof2",
+        "left_hip",
+        "right_hip",
+        "spine1",
+    )
+    permutation = dof_permutation(plan_names, runtime_names)
+    plan_values = np.arange(len(plan_names), dtype=np.float64) * 3.0
+
+    to_runtime = plan_values[permutation]
+    assert to_runtime[0] == plan_values[0], "left_hip__dof1 leads both orders"
+    assert to_runtime[1] == plan_values[3], "slot 1 is right_hip__dof1, not left_hip__dof2"
+
+    back = np.empty_like(to_runtime)
+    back[permutation] = to_runtime
+    np.testing.assert_allclose(back, plan_values)
+
+    with pytest.raises(Exception, match="plan does not declare"):
+        dof_permutation(plan_names, (*runtime_names[:8], "phantom_dof"))

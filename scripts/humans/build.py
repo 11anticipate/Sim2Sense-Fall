@@ -265,15 +265,11 @@ def main(argv: list[str] | None = None) -> int:
             steps = step_simulation(app, args.settle_seconds)
             checks.info(f"settled {args.settle_seconds:g} s of physics ({steps} steps)")
         if not args.headless:
-            from omni.kit.viewport.utility import get_active_viewport
+            from sim2sense_fall.scenes.view import apply_inspection_view
 
-            from sim2sense_fall.scenes.view import configure_inspection_view
-
-            camera_path = configure_inspection_view(stage, mode=args.view, aspect_ratio=1600 / 900)
-            viewport = get_active_viewport()
-            if viewport is None:
-                raise RuntimeError("Isaac Sim did not create an active viewport")
-            viewport.camera_path = camera_path
+            apply_inspection_view(
+                stage, mode=args.view, aspect_ratio=1600 / 900, require_viewport=True
+            )
             checks.info(f"inspection view: {args.view} (temporary session layer)")
             print("GUI is open. Close the window or press Ctrl-C to exit.")
             while app.is_running():

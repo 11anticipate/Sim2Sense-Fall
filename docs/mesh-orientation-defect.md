@@ -1,5 +1,9 @@
 # SMPL rest-pose orientation defect — root cause and repair
 
+> Historical model-frame repair evidence. The later AMASS world/local-frame correction is recorded in
+> [the 2026-09-24 audit](amass-physics-audit-2026-09-24.md). See [current human usage](human-simulation.md)
+> and [documentation index](README.md) for present status; do not apply a model basis to world translations.
+
 Status: **root-caused and fixed** (2026-09-23)
 Scope: the SMPL body model loader and everything downstream (rig, skinning, mesh
 export for the Sionna RT hand-off). No unrelated modules touched.

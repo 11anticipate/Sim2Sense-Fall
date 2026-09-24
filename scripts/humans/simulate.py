@@ -29,7 +29,8 @@ import hashlib
 import json
 import logging
 import sys
-from dataclasses import replace
+import time
+from dataclasses import asdict, replace
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -54,10 +55,18 @@ from common import (  # noqa: E402
     open_scene,
     resolve_spawn_point,
     set_physics_dt,
+    step_physics,
     write_json,
 )
 
-from sim2sense_fall.humans.amass import annotate_clip, screen_amass_clip  # noqa: E402
+from sim2sense_fall.humans.amass import (  # noqa: E402
+    annotate_clip,
+    crop_amass_clip,
+    ground_amass_clip,
+    load_amass_clip,
+    normalize_root_motion,
+    screen_amass_clip,
+)
 from sim2sense_fall.humans.assets import (  # noqa: E402
     REPRESENTATION_PROXY,
     REPRESENTATION_SKIN_MESH,
@@ -88,12 +97,21 @@ from sim2sense_fall.humans.mesh_sequence import (  # noqa: E402
     skin_mesh_sequence_frame,
 )
 from sim2sense_fall.humans.rig import (  # noqa: E402
+    apply_neutral_pose,
+    authors_deviations,
     fit_rest_skeleton,
     forward_kinematics,
+    joint_values_from_clip,
     plan_human_rig,
     pose_surface_points,
 )
+from sim2sense_fall.humans.root_control import RootAssistConfig, root_wrench  # noqa: E402
+from sim2sense_fall.humans.rotations import (  # noqa: E402
+    matrix_to_axis_angle,
+    quaternion_to_matrix,
+)
 from sim2sense_fall.humans.skinning import sample_skin_points  # noqa: E402
+from sim2sense_fall.humans.standing import standing_metrics  # noqa: E402
 from sim2sense_fall.humans.usd_human import (  # noqa: E402
     _SUPPORT_HEIGHT_TOLERANCE_M,
     _SUPPORT_NORMAL_MIN_Z,
@@ -102,20 +120,12 @@ from sim2sense_fall.humans.usd_human import (  # noqa: E402
     HumanRuntime,
     author_contact_reporting,
     build_human_stage,
-    joint_values_from_clip,
     perturbed_trial_notes,
+    write_display_skin,
 )
+from sim2sense_fall.scenes.view import VIEW_MODES, apply_inspection_view  # noqa: E402
 
 LOGGER = logging.getLogger("simulate_human")
-
-#: Largest distance the settle assist may move the pelvis in one physics step, in
-#: metres. The assist is a support, not a teleport: an unbounded write can move the body
-#: arbitrarily far per step and injects whatever energy that happens to imply.
-SETTLE_MAX_CORRECTION_M = 0.005
-#: Fraction of the settle window across which the assist's authority ramps to zero. The
-#: body is left to the solver before recording starts, rather than dropped from a pose
-#: that was being held right up to the first recorded frame.
-SETTLE_RELEASE_FRACTION = 0.35
 
 #: Physics-rate trajectories are the inner loop; the reference is resampled to the
 #: physics rate so one frame index maps to one physics step.
@@ -180,18 +190,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument(
         "--gui", dest="headless", action="store_false", help="show the viewport while trials run"
     )
+    parser.add_argument(
+        "--view",
+        choices=VIEW_MODES,
+        default="human",
+        help=(
+            "viewport framing with --gui: 'human' (default) frames the body, 'top' looks "
+            "down over the whole apartment, 'roofless' is an oblique outside view -- all "
+            "three hide the roof, because the apartment is closed and the body is "
+            "otherwise invisible from outside. 'exterior' keeps the roof on. Headless: ignored."
+        ),
+    )
+    parser.add_argument(
+        "--hold-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "with --gui, keep the window open this long after the last trial so the run "
+            "can be watched rather than only read; -1 waits until the window is closed. "
+            "Without this the app shuts down the moment the trials end."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="CPU only; no Isaac Sim")
     parser.add_argument("--dump-raw", action="store_true", help="also write the raw npz arrays")
     parser.add_argument(
         "--amass-root", type=Path, default=None, help="local AMASS .npz root; never downloads data"
     )
     parser.add_argument("--amass-limit", type=int, default=None)
+    parser.add_argument("--amass-file", type=Path, default=None)
+    parser.add_argument("--amass-start", type=float, default=0.0)
+    parser.add_argument("--amass-duration", type=float, default=None)
+    parser.add_argument("--root-position-tolerance-m", type=float, default=0.15)
+    parser.add_argument("--root-angle-tolerance-deg", type=float, default=20.0)
+    parser.add_argument("--root-assist", type=Path, default=None,
+                        help="finite external pelvis actuator YAML; recorded as assisted physics")
     parser.add_argument(
         "--amass-fall-only",
         action="store_true",
         help="after screening local AMASS clips, expose only fall candidates",
     )
     args = parser.parse_args(argv)
+    if args.amass_file is not None and args.amass_root is not None:
+        parser.error("choose --amass-file or --amass-root, not both")
+    if args.root_assist is not None and args.pin_root:
+        parser.error("finite root assistance cannot be combined with --pin-root")
+    if not all(np.isfinite(v) and v > 0 for v in (
+        args.root_position_tolerance_m, args.root_angle_tolerance_deg
+    )):
+        parser.error("root tracking tolerances must be finite and positive")
     return args
 
 
@@ -214,6 +260,12 @@ def selection(args: argparse.Namespace, motions: dict, config: object) -> list[t
         config.perturbation(perturbation_id)
         pairs.append((clip_id.strip(), perturbation_id.strip()))
     if not pairs:
+        if getattr(args, "amass_file", None) is not None:
+            pairs = [(name, "none") for name, clip in motions.items()
+                     if clip.provenance.kind == "amass"]
+            if not pairs:
+                raise ValueError("the selected AMASS file did not pass the requested filter")
+            return pairs
         fall_ids = [
             clip_id
             for clip_id, clip in motions.items()
@@ -227,10 +279,20 @@ def selection(args: argparse.Namespace, motions: dict, config: object) -> list[t
     return pairs
 
 
-def build_reference(clip: object, physics_dt_s: float) -> object:
-    """Resample a clip to the physics rate using the configured method."""
+def build_reference(clip: object, plan: object, physics_dt_s: float, neutral_rad: dict) -> object:
+    """Offset a deviation-only clip by the rig's neutral pose, then resample it.
 
-    reference = clip.resample(1.0 / physics_dt_s, method="slerp")  # type: ignore[attr-defined]
+    The offset goes on before the resample so the interpolation moves between the poses
+    the controller will actually hold, rather than between deviations that only mean
+    something once the neutral is added back afterwards.
+    """
+
+    posed = (
+        apply_neutral_pose(clip, plan, neutral_rad)  # type: ignore[arg-type]
+        if authors_deviations(clip)
+        else clip
+    )
+    reference = posed.resample(1.0 / physics_dt_s, method="slerp")  # type: ignore[attr-defined]
     if reference.frame_count < MIN_REFERENCE_FRAMES:
         raise ValueError(
             f"clip {reference.clip_id} resamples to {reference.frame_count} frames at "
@@ -326,7 +388,7 @@ def dry_run(
     index: list[dict] = []
     for clip_id, perturbation_id in pairs:
         clip = motions[clip_id]
-        reference = build_reference(clip, physics_dt)
+        reference = build_reference(clip, plan, physics_dt, config.visualization.pose_dict())
         (
             values,
             root_positions,
@@ -374,6 +436,10 @@ def dry_run(
                 "perturbation_id": perturbation_id,
                 "frames": int(reference.frame_count),
                 "duration_s": round(float(times[-1]), 6),
+                "motion_source": clip.provenance.as_dict(),
+                "motion_metadata": dict(clip.metadata),
+                "seed": config.export.surface_point_seed,
+                "rig_plan_sha256": sha256_text(plan.to_json()),
                 "label": label.as_dict(),
                 "mesh": {
                     "representation": (
@@ -410,73 +476,6 @@ def _quaternions(axis_angle: np.ndarray) -> np.ndarray:
     return np.stack([axis_angle_to_quaternion(row) for row in axis_angle], axis=0)
 
 
-def _settle_with_bounded_support(
-    runtime: object,
-    app: object,
-    *,
-    target_position: np.ndarray,
-    target_quaternion: np.ndarray,
-    steps: int,
-    step_s: float,
-) -> tuple[str, float]:
-    """Hold the pelvis toward its standing pose with a *bounded, released* assist.
-
-    The previous version teleported the root to the target on every settle step. That
-    is an unbounded constraint: it can move the body arbitrarily far in one step, it
-    leaves no residual state for the solver to work from, and the instant it stops the
-    body is nowhere near equilibrium -- which is why a standing clip still collapsed
-    and was labelled a fall.
-
-    Two properties are added:
-
-    * **bounded** -- no single step may move the pelvis more than
-      ``SETTLE_MAX_CORRECTION_M``, so the assist cannot inject arbitrary energy;
-    * **released** -- the assist's authority ramps linearly to zero across the last
-      ``SETTLE_RELEASE_FRACTION`` of the window, so the body is left to the solver
-      before recording starts rather than being dropped from a held pose.
-
-    This is still an assist, not balance, and that is recorded rather than implied: the
-    trial's provenance carries ``settle_support_kind`` and ``settle_released_at_s``.
-
-    Returns ``(support_kind, released_at_s)``.
-    """
-
-    if steps <= 0:
-        raise ValueError(f"settle steps must be positive, got {steps}")
-    release_steps = max(1, int(round(steps * SETTLE_RELEASE_FRACTION)))
-    target_position = np.asarray(target_position, dtype=np.float64)
-    target_quaternion = np.asarray(target_quaternion, dtype=np.float64)
-
-    def authority_for(remaining: int) -> float:
-        return 1.0 if remaining > release_steps else remaining / release_steps
-
-    for index in range(steps):
-        remaining = steps - index
-        authority = authority_for(remaining)
-        if authority > 0.0:
-            position, quaternion = runtime.root_pose()  # type: ignore[attr-defined]
-            current = np.asarray(position, dtype=np.float64)
-            delta = target_position - current
-            distance = float(np.linalg.norm(delta))
-            if distance > 0.0:
-                # Bounded: never move more than the cap in one step, and only as far as
-                # the current authority allows.
-                stride = min(distance, SETTLE_MAX_CORRECTION_M) * authority
-                corrected = current + delta / distance * stride
-            else:
-                corrected = current
-            orientation = np.asarray(quaternion, dtype=np.float64)
-            if np.isfinite(orientation).all():
-                blended = (1.0 - authority) * orientation + authority * target_quaternion
-                norm = float(np.linalg.norm(blended))
-                orientation = blended / norm if norm > 0 else target_quaternion
-            else:
-                orientation = target_quaternion
-            runtime.set_root_pose(corrected, orientation)  # type: ignore[attr-defined]
-        app.update()  # type: ignore[attr-defined]
-    return "bounded_released_root_assist", float(steps * step_s)
-
-
 def _contact_rows(
     samples: object,
     *,
@@ -491,12 +490,8 @@ def _contact_rows(
     column keeps its declared dtype even when empty, so a reader can index it without
     a special case.
 
-    The contact pair is *not* split into human and environment sides here. Neither
-    side's identity is recoverable from the report: it carries opaque numeric handles
-    with no path lookup, and measurement shows the report API is applied per actor,
-    so untagging individual body colliders does not narrow the pair set. What the
-    export can state truthfully is the **limb** the point landed on (from containment)
-    and whether that point was resting on a surface (from its height and normal).
+    Both decoded collider paths are retained alongside the encoded identifiers.
+    The body segment comes from collider identity; support remains a geometric flag.
     """
 
     frames: list[int] = []
@@ -506,6 +501,8 @@ def _contact_rows(
     separations: list[float] = []
     handle0: list[int] = []
     handle1: list[int] = []
+    path0: list[str] = []
+    path1: list[str] = []
     limbs: list[str] = []
     is_support: list[bool] = []
     for frame, per_frame in enumerate(samples or ()):  # type: ignore[union-attr]
@@ -520,6 +517,8 @@ def _contact_rows(
             separations.append(float(sample.separation_m))
             handle0.append(int(sample.collider0))
             handle1.append(int(sample.collider1))
+            path0.append(sample.collider0_path)
+            path1.append(sample.collider1_path)
             limbs.append(per_frame_segments[index] if index < len(per_frame_segments) else "")
             is_support.append(
                 support_z is not None
@@ -532,14 +531,68 @@ def _contact_rows(
         "normal": np.asarray(normals, dtype=np.float64).reshape(-1, 3),
         "impulse": np.asarray(impulses, dtype=np.float64).reshape(-1, 3),
         "separation": np.asarray(separations, dtype=np.float64),
-        # PhysX collider handles. These are NOT prim paths: the report exposes no
-        # mapping, so they are kept only as an opaque fingerprint of the pair.
         "handle0": np.asarray(handle0, dtype=np.int64),
         "handle1": np.asarray(handle1, dtype=np.int64),
+        "path0": np.asarray(path0, dtype=str),
+        "path1": np.asarray(path1, dtype=str),
         # Body segment the contact point fell inside, or "" when unattributed.
         "segment": np.asarray(limbs, dtype="U64"),
         "is_support": np.asarray(is_support, dtype=bool),
     }
+
+
+def hold_viewport(app: object, *, seconds: float) -> None:
+    """Keep the viewport open after the report so a fall can be watched at human speed.
+
+    ``-1`` waits until the window is closed. The trials themselves run at the physics
+    rate, which is faster than the eye and over before the report is printed, so the run
+    that produced the numbers was never the run anyone could see.
+    """
+
+    if seconds < 0:
+        while app.is_running():  # type: ignore[attr-defined]
+            app.update()  # type: ignore[attr-defined]
+        return
+    deadline = time.monotonic() + seconds
+    while app.is_running() and time.monotonic() < deadline:  # type: ignore[attr-defined]
+        app.update()  # type: ignore[attr-defined]
+
+
+#: Frames per second a finished trial is replayed to the viewport at. Physics runs at
+#: 120 Hz; nobody can read a fall at that speed and the renderer cannot keep up either.
+PLAYBACK_FPS = 20.0
+
+
+def play_back_trial(app: object, stage: object, record: dict, *, fps: float) -> int:
+    """Replay a completed trial's recorded skin into the viewport.
+
+    Deliberately after the physics has stopped. Writing 6890 mesh points *between*
+    physics steps was tried first: in a GUI session it occasionally invalidated PhysX's
+    tensor views one trial later, so a run failed over a picture, and the failure had
+    nothing to do with the motion being recorded. Playing back from the arrays also means
+    the viewport cannot disagree with the evidence -- it is showing the same numbers.
+    """
+
+    times = np.asarray(record["time_s"], dtype=np.float64)
+    vertices = record.get("mesh_vertices_xyz")
+    faces = record.get("mesh_faces")
+    if vertices is None or faces is None or len(vertices) < 2 or times[-1] <= times[0]:
+        return 0
+    stride = max(1, int(round((len(times) - 1) / max(1.0, (times[-1] - times[0]) * fps))))
+    played = 0
+    # Pace the replay by the recorded clock. Writing every frame as fast as the renderer
+    # takes one plays a 5 s fall in a quarter second, which is a data dump with a
+    # viewport attached rather than something a person can watch and judge.
+    started = time.monotonic()
+    for index in range(0, len(times), stride):
+        write_display_skin(stage, vertices[index], faces)
+        app.update()  # type: ignore[attr-defined]
+        played += 1
+        due = started + float(times[index] - times[0])
+        remaining = due - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+    return played
 
 
 def run_trials(
@@ -559,11 +612,14 @@ def run_trials(
         return checks.report(banner="human simulate")
     scene_digest = _sha256(scene)
 
+    root_assist = RootAssistConfig.load(args.root_assist) if args.root_assist else None
     app = boot_isaac(args.headless)
     if app is None:
         checks.check("Isaac Sim started", False, "run through ~/isaacsim/python.sh")
         return checks.report(banner="human simulate")
     exit_code = 1
+    # The last trial that produced arrays; replayed to the viewport once physics stops.
+    playback: dict | None = None
     try:
         if plan.root_mode == "anchored":  # type: ignore[attr-defined]
             raise NotImplementedError(
@@ -595,7 +651,16 @@ def run_trials(
             f"requested {config.simulation.physics_dt_s} s, engine reports {measured_dt} s, "  # type: ignore[attr-defined]
             f"accepted={accepted}",
         )
-        runtime = HumanRuntime(stage, plan, enable_contact_views=True, app=app)  # type: ignore[arg-type]
+        # Contact views are NOT requested. This build cannot construct the tensors
+        # rigid-contact view for these patterns, and asking for it is not a quiet
+        # failure: omni.physics.tensors logs an error per filter path, and the same
+        # check re-raises from RigidPrim._on_physics_ready, which SimulationManager
+        # dispatches as an event callback -- so a screenful of plugin errors and a
+        # traceback land in stderr on every run, including at shutdown, where no
+        # try/except in this script can reach them. The contact history comes from
+        # the polled physx report, which needs no tensor view. See
+        # docs/physics-interaction-audit.md (RC-1).
+        runtime = HumanRuntime(stage, plan, enable_contact_views=False, app=app)  # type: ignore[arg-type]
         proxy_template = build_capsule_proxy_template(plan) if mesh is None else None
         # Tag the environment side of every reportable pair. PhysX needs the contact
         # report API on BOTH colliders, and the human side is tagged during authoring;
@@ -604,10 +669,23 @@ def run_trials(
         runtime.play()
         for _ in range(4):
             app.update()
+        if not args.headless:
+            # The apartment is authored closed, so without a de-roofed inspection camera
+            # the viewport shows a walled box with the body hidden inside it -- and the
+            # trial still reports success, which is the part that makes this easy to miss.
+            apply_inspection_view(
+                stage, mode=args.view, aspect_ratio=1600 / 900, require_viewport=True
+            )
+            checks.info(f"inspection view: {args.view} (temporary session layer)")
         checks.check(
             "runtime DOF set matches the plan",
-            runtime.capabilities["dof_order_matches_plan"],
-            ", ".join(runtime.capabilities["dof_order"]),
+            sorted(runtime.capabilities["dof_order"]) == sorted(plan.dof_names),
+            ", ".join(runtime.capabilities["dof_order"])
+            + (
+                " (PhysX traversal order; translated to plan order at the runtime boundary)"
+                if runtime.capabilities.get("dof_plan_permutation")
+                else ""
+            ),
         )
         try:
             probed = runtime.contact_samples()
@@ -653,10 +731,15 @@ def run_trials(
                 f"{len(runtime.capabilities['contact_filter_paths'])} filter paths",
             )
         else:
+            # Three distinct facts, three distinct readings: the caller declined the
+            # channel, the channel was asked for and failed, or there was nothing to
+            # ask against. Collapsing them into one message was how the dead channel
+            # stayed invisible.
             checks.skip(
                 "tensor contact force view",
                 str(
-                    runtime.capabilities.get("contact_tensor_view_error")
+                    runtime.capabilities.get("contact_tensor_view_reason")
+                    or runtime.capabilities.get("contact_tensor_view_error")
                     or runtime.capabilities.get("contact_error")
                 ),
             )
@@ -671,7 +754,9 @@ def run_trials(
         for clip_id, perturbation_id in selection(args, motions, config):
             clip = motions[clip_id]
             perturbation = config.perturbation(perturbation_id)  # type: ignore[attr-defined]
-            reference = build_reference(clip, physics_dt_s)
+            reference = build_reference(
+                clip, plan, physics_dt_s, config.visualization.pose_dict()  # type: ignore[attr-defined]
+            )
             record = execute_trial(
                 runtime,
                 app,
@@ -682,7 +767,9 @@ def run_trials(
                 pin_root=args.pin_root,
                 mesh=mesh,
                 proxy_template=proxy_template,
+                root_assist=root_assist,
             )
+            playback = record
             if record["pairs"] == 0:
                 checks.skip(f"{clip_id} x {perturbation_id}", "trial did not run")
                 continue
@@ -697,6 +784,24 @@ def run_trials(
                 scene_digest=scene_digest,
                 body=body,
             )
+            standing_applies = (
+                clip_id == "stand_neutral" and perturbation.kind == "none"
+                and plan.root_mode == "free" and not args.pin_root
+            )
+            standing = None
+            if standing_applies:
+                link_names = [link.name for link in plan.links]
+                standing = standing_metrics(
+                    record["root_position"],
+                    record["link_positions"][:, link_names.index("neck")]
+                    - record["link_positions"][:, link_names.index("pelvis")],
+                    reference_root_z=float(plan.spawn_root_position[2]),
+                    max_drop_m=config.control.standing_max_drop_m,
+                    max_tilt_deg=config.control.standing_max_tilt_deg,
+                    max_drift_m=config.control.standing_max_drift_m,
+                )
+                ground_truth.metadata["standing_acceptance"] = standing
+                checks.check("free stationary standing", bool(standing["passed"]), str(standing))
             written = ground_truth.write(args.out)
             # Contact points are variable-length per step, so they get their own file
             # rather than being squeezed into the fixed-shape raw dump: one row per
@@ -714,11 +819,11 @@ def run_trials(
                 contact_normal=contact_rows["normal"],
                 contact_impulse_ns=contact_rows["impulse"],
                 contact_separation_m=contact_rows["separation"],
-                # Opaque PhysX collider handles, kept only as a pair fingerprint: the
-                # report exposes no path lookup, so the side each handle belongs to is
-                # not recoverable. The two columns below carry what IS known.
+                # Both the encoded identifiers and the decoded collider paths are retained.
                 contact_handle0=contact_rows["handle0"],
                 contact_handle1=contact_rows["handle1"],
+                contact_collider0_path=contact_rows["path0"],
+                contact_collider1_path=contact_rows["path1"],
                 # The body segment whose capsule contained the contact point. This is
                 # the limb-level attribution a fall label can be argued from.
                 contact_segment=contact_rows["segment"],
@@ -743,16 +848,53 @@ def run_trials(
                     },
                     allow_pickle=False,
                 )
+            np.savez_compressed(
+                args.out / f"{written['npz'].stem}.control.npz",
+                time_s=record["time_s"],
+                reference_root_position=record["reference_root_position"],
+                reference_root_quaternion_wxyz=record["reference_root_quaternion"],
+                root_assist_force_n=record["root_assist_force_n"],
+                root_assist_torque_nm=record["root_assist_torque_nm"],
+                assisted=np.asarray(root_assist is not None),
+            )
             # A controlled daily action is only reproduced if the drives followed the
             # reference; a passive collapse or a deliberate control failure is NOT meant
             # to, so it is judged by a different protocol. Conflating the two let trials
             # with 71.9, 69.1 and 35.4 degree tracking errors count as usable.
             tracking_applies = (
                 perturbation.kind not in NON_TRACKING_PERTURBATIONS
-                and not set(clip.tags) & PASSIVE_MOTION_TAGS
+                and (clip.provenance.kind == "amass" or not set(clip.tags) & PASSIVE_MOTION_TAGS)
             )
             physically_valid = ground_truth.label.label != LABEL_INVALID
-            tracking_within_tolerance = float(record["tracking_error_deg"]) <= tracking_tolerance
+            tracking_gate_error = float(record["tracking_error_deg"])
+            tracking_window = "whole_trial"
+            if perturbation.kind == "force":
+                before_force = record["time_s"] < perturbation.start_s
+                if not before_force.any():
+                    raise ValueError("force trial requires an unperturbed initial tracking window")
+                tracking_gate_error = float(np.degrees(np.abs(
+                    record["joint_positions_rad"][before_force]
+                    - record["reference_joint_positions_rad"][before_force]
+                ).max()))
+                tracking_window = "before_external_force"
+            tracking_within_tolerance = tracking_gate_error <= tracking_tolerance
+            root_tracking = None
+            if clip.provenance.kind == "amass":
+                desired_roots = np.asarray(plan.spawn_root_position) + reference.root_translation
+                root_errors = np.linalg.norm(record["root_position"] - desired_roots, axis=1)
+                desired_quaternions = _quaternions(reference.root_rotation)
+                dots = np.abs(np.sum(record["root_quaternion"] * desired_quaternions, axis=1))
+                angles = np.degrees(2.0 * np.arccos(np.clip(dots, 0.0, 1.0)))
+                root_tracking = {
+                    "position_max_m": float(root_errors.max()),
+                    "position_rmse_m": float(np.sqrt(np.mean(root_errors ** 2))),
+                    "angle_max_deg": float(angles.max()),
+                    "position_tolerance_m": args.root_position_tolerance_m,
+                    "angle_tolerance_deg": args.root_angle_tolerance_deg,
+                    "passed": bool(root_errors.max() <= args.root_position_tolerance_m
+                                   and angles.max() <= args.root_angle_tolerance_deg),
+                    "root_teleported": bool(record["root_pinned_during_trial"]),
+                }
             entry = {
                 "motion_id": clip_id,
                 "perturbation_id": perturbation_id,
@@ -770,8 +912,18 @@ def run_trials(
                 "measured_step_s": round(float(record["measured_step_s"]), 12),
                 "gates": {
                     "physically_valid": physically_valid,
+                    "standing_acceptance": standing,
                     "tracking_gate_applies": tracking_applies,
+                    "tracking_window": tracking_window,
+                    "tracking_gate_error_deg": tracking_gate_error,
                     "tracking_within_tolerance": tracking_within_tolerance,
+                    "root_tracking": root_tracking,
+                    "unassisted_action_reproduced": bool(
+                        physically_valid and tracking_within_tolerance
+                        and root_tracking is not None and root_tracking["passed"]
+                        and not record["root_pinned_during_trial"]
+                        and record["root_assistance"] is None
+                    ),
                     "label_credible": bool(
                         physically_valid
                         and (
@@ -781,6 +933,8 @@ def run_trials(
                     ),
                     "usable": bool(
                         physically_valid and (not tracking_applies or tracking_within_tolerance)
+                        and (standing is None or standing["passed"])
+                        and (root_tracking is None or root_tracking["passed"])
                     ),
                 },
             }
@@ -799,7 +953,7 @@ def run_trials(
                 checks.check(
                     f"{clip_id} x {perturbation_id}: reference tracking within tolerance",
                     False,
-                    f"{record['tracking_error_deg']:.3f} deg exceeds the pre-registered "
+                    f"{tracking_gate_error:.3f} deg ({tracking_window}) exceeds the pre-registered "
                     f"{tracking_tolerance:.1f} deg, so the clip is not usable as that action",
                 )
             if ground_truth.label.label == LABEL_INVALID:
@@ -812,7 +966,7 @@ def run_trials(
             else:
                 checks.check(
                     f"{clip_id} x {perturbation_id}: usable",
-                    True,
+                    entry["gates"]["usable"],
                     ground_truth.label.reasons[0],
                 )
                 # Invariant: a fall label must carry a detected impact. If this ever
@@ -875,6 +1029,7 @@ def run_trials(
                     for key, value in runtime.capabilities.items()
                     if key != "contact_filter_paths"
                 },
+                "root_assistance": None if root_assist is None else asdict(root_assist),
                 "trials": index,
             },
         )
@@ -885,6 +1040,17 @@ def run_trials(
         checks.check("trials completed without error", False, f"{type(exc).__name__}: {exc}")
         exit_code = checks.report(banner="human simulate")
     finally:
+        if playback is not None:
+            # Rendering must not advance dynamics or invalidate live tensor views.
+            runtime.pause()
+        if not args.headless and playback is not None:
+            try:
+                played = play_back_trial(app, stage, playback, fps=PLAYBACK_FPS)
+                LOGGER.info("replayed %d recorded frames into the viewport", played)
+            except Exception as exc:  # noqa: BLE001 - the report is already decided
+                LOGGER.warning("viewport playback failed: %s: %s", type(exc).__name__, exc)
+        if not args.headless and args.hold_seconds:
+            hold_viewport(app, seconds=args.hold_seconds)
         app.close(exit_code=exit_code)
     return exit_code
 
@@ -900,6 +1066,7 @@ def execute_trial(
     pin_root: bool = False,
     mesh: object = None,
     proxy_template: object = None,
+    root_assist: RootAssistConfig | None = None,
 ) -> dict:
     """Drive one trial at the physics rate and record every step.
 
@@ -921,41 +1088,58 @@ def execute_trial(
     # floor. See the duration assertion below, which now catches this class of bug.
     step_s = float(config.simulation.physics_dt_s)  # type: ignore[attr-defined]
     frames = reference.frame_count  # type: ignore[attr-defined]
-    # Reset, then settle with the pelvis HELD at its standing pose.
-    #
-    # Without the hold the body simply collapses during the settle window and every
-    # recorded trial starts from a heap on the floor -- which is exactly what the
-    # first version of this did, and it made all six trials label identically with a
-    # peak descent of 0 m/s. The hold is a debug support, it is NOT present in the
-    # recorded window, and it is recorded in the trial provenance as
-    # ``settle_used_root_support`` so nobody mistakes a settled standing pose for a
-    # controller that can stand.
-    first_values, _ = joint_values_from_clip(reference, 0, plan)
+    # Reset once, then allow the solver to settle without free-root pose writes.
+    # Explicit --pin-root remains a labelled kinematic assistance for both windows.
+    target_joints = np.stack([
+        joint_values_from_clip(reference, frame, plan)[0] for frame in range(frames)
+    ])
+    target_velocities = np.gradient(target_joints, step_s, axis=0)
+    first_values = target_joints[0]
     pinned_root = np.asarray(plan.spawn_root_position) + reference.root_translation[0]  # type: ignore[attr-defined]
     pinned_quaternion = _quaternions(reference.root_rotation[:1])[0]
     runtime.set_root_pose(pinned_root, pinned_quaternion)  # type: ignore[attr-defined]
     runtime.set_joint_positions(first_values)  # type: ignore[attr-defined]
     runtime.set_joint_targets(first_values)  # type: ignore[attr-defined]
-    pinned = plan.root_mode == "free"  # type: ignore[attr-defined]
+    runtime.reset_velocities()  # clear momentum from the previous trial
+    if not runtime.set_control_scale(0.0 if config.control.mode == "torque_free" else 1.0):
+        raise RuntimeError("failed to restore configured drive scale before trial")
+    pinned = False
     pin_during_trial = bool(pin_root)
     settle_seconds = float(config.simulation.settle_seconds)  # type: ignore[attr-defined]
-    settle_steps = max(1, int(round(settle_seconds / step_s)))
+    settle_steps = int(round(settle_seconds / step_s))
     support_kind = "none"
     released_at_s = 0.0
-    if pinned:
-        support_kind, released_at_s = _settle_with_bounded_support(
-            runtime,
-            app,
-            target_position=pinned_root,
-            target_quaternion=pinned_quaternion,
-            steps=settle_steps,
-            step_s=step_s,
+
+    def assist(
+        target_position: np.ndarray, target_quaternion: np.ndarray,
+        target_linear: np.ndarray, target_angular: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if root_assist is None:
+            return np.zeros(3), np.zeros(3)
+        position, quaternion = runtime.root_pose()
+        linear, angular = runtime.root_velocities()
+        force, torque = root_wrench(
+            root_assist, position=position, quaternion=quaternion,
+            linear_velocity=linear, angular_velocity=angular,
+            target_position=target_position, target_quaternion=target_quaternion,
+            target_linear_velocity=target_linear, target_angular_velocity=target_angular,
+            mass_kg=plan.total_mass_kg, gravity_m_s2=config.simulation.gravity_m_s2,
         )
-    else:
-        # An anchored root already holds the pelvis, and writing its pose as well
-        # fights the world constraint (observed as a non-finite quaternion).
-        for _ in range(settle_steps):
-            app.update()  # type: ignore[attr-defined]
+        runtime.apply_root_wrench(force, torque)
+        return force, torque
+
+    for _ in range(settle_steps):
+        if pin_during_trial:
+            runtime.set_root_pose(pinned_root, pinned_quaternion)
+            pinned = True
+            support_kind = "kinematic_teleport"
+        if root_assist is not None:
+            assist(pinned_root, pinned_quaternion, np.zeros(3), np.zeros(3))
+            support_kind = "bounded_external_wrench"
+        # Deterministic stepper (see common.step_physics): one app.update()
+        # advances two physics steps on this build, which ran every
+        # seconds-derived window at twice the physics time it names.
+        step_physics(1)
 
     # The reference height a fall is measured against must be where the body actually
     # stands once the solver has settled, not the analytic spawn height. Contact
@@ -970,10 +1154,7 @@ def execute_trial(
             "window did not produce a standing body, so no fall threshold can be derived"
         )
 
-    # Confirm the contact channel can attribute a point to a limb before recording.
-    # Attribution is geometric (contact-point containment), so it needs the body to
-    # actually be touching something during settle -- a body hovering in mid-air
-    # produces no points to test and the channel is unproven, not proven empty.
+    # This standing-start protocol requires an actual contact after settling.
     support_height = runtime.support_surface_height_m()  # type: ignore[attr-defined]
     if support_height is None:
         raise RuntimeError(
@@ -985,11 +1166,7 @@ def execute_trial(
     try:
         settle_segments = runtime.contact_segment_names()  # type: ignore[attr-defined]
     except ContactSourceUnavailable as exc:
-        # A readable channel that cannot attribute a single point to a limb is a
-        # broken accessor, not an untouched body: attribution is pure containment
-        # arithmetic and cannot fail on a point the channel just reported. Folding
-        # this into "no contacts" is what let a crashing bbox helper record 121
-        # empty frames while reporting success, so it is raised instead.
+        # A decoding failure must never be recorded as an empty contact set.
         raise RuntimeError(
             "the contact channel is readable but no reported point could be matched "
             f"to a body capsule ({exc}); the contact history would be recorded empty "
@@ -1015,6 +1192,18 @@ def execute_trial(
     joint_velocities = np.zeros_like(joint_positions)
     link_positions = np.zeros((frames, len(plan.links), 3))  # type: ignore[attr-defined]
     reference_joints = np.zeros_like(joint_positions)
+    reference_roots = np.asarray(plan.spawn_root_position) + reference.root_translation
+    reference_quaternions = _quaternions(reference.root_rotation)
+    reference_linear = np.gradient(reference_roots, step_s, axis=0)
+    reference_angular = np.zeros((frames, 3))
+    for index in range(frames - 1):
+        reference_angular[index] = matrix_to_axis_angle(
+            quaternion_to_matrix(reference_quaternions[index + 1])
+            @ quaternion_to_matrix(reference_quaternions[index]).T
+        ) / step_s
+    reference_angular[-1] = reference_angular[-2]
+    assist_forces = np.zeros((frames, 3))
+    assist_torques = np.zeros((frames, 3))
     body_points: list[np.ndarray] = []
     mesh_vertices: list[np.ndarray] = []
     resolved_proxy_template = (
@@ -1035,7 +1224,12 @@ def execute_trial(
 
     for frame in range(frames):
         now = frame * step_s
-        values, _ = joint_values_from_clip(reference, frame, plan)
+        if root_assist is not None:
+            assist_forces[frame], assist_torques[frame] = assist(
+                reference_roots[frame], reference_quaternions[frame],
+                reference_linear[frame], reference_angular[frame],
+            )
+        values = target_joints[frame]
         using_perturbation = (
             perturbation.kind != "none"
             and perturbation.start_s <= now < perturbation.start_s + perturbation.duration_s
@@ -1064,8 +1258,12 @@ def execute_trial(
         if config.control.mode == "kinematic":  # type: ignore[attr-defined]
             runtime.set_joint_positions(values)  # type: ignore[attr-defined]
         else:
-            runtime.set_joint_targets(values)  # type: ignore[attr-defined]
-        app.update()  # type: ignore[attr-defined]
+            velocity_scale = 0.0 if config.control.mode == "torque_free" else control_scale
+            runtime.set_joint_targets(values, target_velocities[frame] * velocity_scale)
+        # One reference frame = one physics step (the reference was resampled to
+        # the physics rate), so the loop steps the clock by exactly one step;
+        # app.update() would advance two and play the reference at half rate.
+        step_physics(1)  # type: ignore[attr-defined]
 
         times[frame] = now
         positions, orientations = runtime.root_pose()  # type: ignore[attr-defined]
@@ -1169,6 +1367,12 @@ def execute_trial(
         "joint_positions_rad": joint_positions,
         "joint_velocities_rad_s": joint_velocities,
         "reference_joint_positions_rad": reference_joints,
+        "reference_joint_velocities_rad_s": target_velocities,
+        "reference_root_position": reference_roots,
+        "reference_root_quaternion": reference_quaternions,
+        "root_assist_force_n": assist_forces,
+        "root_assist_torque_nm": assist_torques,
+        "root_assistance": None if root_assist is None else asdict(root_assist),
         "link_positions": link_positions,
         "body_points": recorded_points,
         "body_point_owners": owners,
@@ -1180,15 +1384,7 @@ def execute_trial(
         "contact_force_n": contacts,
         "contact_samples": contact_samples,
         "contact_source": str(runtime.capabilities.get("contact_source", "unavailable")),  # type: ignore[attr-defined]
-        # How a contact point was attributed to a link. "geometry" is the only value
-        # that makes ``contact_samples`` attributable to the body; anything else means
-        # the export cannot name the limb a pair belongs to.
-        #
-        # ``omni.physx`` tags contact reporting per ACTOR, and its report exposes only
-        # opaque numeric collider handles (``proto_index*`` is the invalid sentinel and
-        # no handle->path API exists in this build), so a pair's two sides are NOT
-        # separable. Attribution is therefore done by testing the reported point
-        # against the live world-space capsule volumes instead.
+        # The decoded collider path identifies the limb, including pelvis and leaves.
         "contact_attribution": str(  # type: ignore[attr-defined]
             runtime.capabilities.get("contact_attribution", "unresolved")
         ),
@@ -1205,23 +1401,17 @@ def execute_trial(
         "force_failed_frames": force_failed_count,
         "control_scale": control_scale,
         "supports_removed": supports_removed,
-        "settle_used_root_support": pinned,
-        "settle_seconds": float(config.simulation.settle_seconds),  # type: ignore[attr-defined]
-        # What the settle support actually was, and when it stopped acting. A boolean
-        # "some support was used" cannot distinguish a bounded, released assist from a
-        # per-step teleport, and that distinction is what decides whether the body at
-        # the first recorded frame is anywhere near equilibrium.
+        "settle_used_root_support": pinned or root_assist is not None,
+        "settle_seconds": settle_steps * step_s,
+        # Pinning teleports the root; bounded assistance applies a recorded wrench.
         "settle_support_kind": support_kind,
         "settle_released_at_s": released_at_s,
-        "settle_max_correction_m": SETTLE_MAX_CORRECTION_M,
+        "settle_max_correction_m": 0.0,
         "step_s": step_s,
         "measured_step_s": float(np.median(np.diff(times))) if frames > 1 else step_s,
-        # In ``pd`` mode only the JOINT targets come from the reference; the pelvis is a
-        # free body and is never driven along the reference root trajectory. Falling
-        # therefore emerges from physics rather than being replayed, and a reference
-        # whose root path matters (the topple references) cannot be reproduced by
-        # tracking alone. Recorded so no reader assumes the root path was followed.
-        "root_reference_tracked": pin_during_trial,
+        # Joint PD alone does not track the root. Keep external assistance and
+        # teleport pinning explicit so downstream consumers can distinguish them.
+        "root_reference_tracked": pin_during_trial or root_assist is not None,
         "root_pinned_during_trial": pin_during_trial,
         "control_mode": str(config.control.mode),  # type: ignore[attr-defined]
         "body_geometry": REPRESENTATION_SKIN_MESH if mesh is not None else REPRESENTATION_PROXY,
@@ -1327,16 +1517,19 @@ def assemble_ground_truth(
             "supports_removed": record["supports_removed"],
             "settle_seconds": record["settle_seconds"],
             "settle_used_root_support": record["settle_used_root_support"],
-            # What the support was and when it let go. A boolean cannot distinguish a
-            # bounded, released assist from a per-step teleport, and that is exactly the
-            # distinction that decides whether the first recorded frame is near
-            # equilibrium -- so it has to reach the emitted provenance, not just the
-            # internal record.
+            # Persist assistance semantics, not only an internal implementation flag.
             "settle_support_kind": record["settle_support_kind"],
             "settle_released_at_s": record["settle_released_at_s"],
             "settle_max_correction_m": record["settle_max_correction_m"],
             "root_reference_tracked": record["root_reference_tracked"],
             "root_pinned_during_trial": record["root_pinned_during_trial"],
+            "root_assistance": record["root_assistance"],
+            "root_assist_force_peak_n": float(np.linalg.norm(
+                record["root_assist_force_n"], axis=1).max()),
+            "root_assist_torque_peak_nm": float(np.linalg.norm(
+                record["root_assist_torque_nm"], axis=1).max()),
+            "motion_metadata": dict(clip.metadata),
+            "motion_source": clip.provenance.as_dict(),
             "control_mode": record["control_mode"],
             # The fall threshold is a fraction of ``settled_pelvis_height_m``: the
             # height the solver actually rests at. Both numbers are kept so a trial
@@ -1484,13 +1677,30 @@ def main(argv: list[str] | None = None) -> int:
         plan = plan_human_rig(config, rest=rest, spawn_xy=spawn)
         if mesh is not None:
             mesh = fit_mesh_to_rest_joints(mesh, np.asarray(plan.rest_joint_positions))
-        if args.amass_root is not None:
+        if args.amass_file is not None:
+            imported = load_amass_clip(args.amass_file)
+            motions[imported.clip_id] = imported
+        if args.amass_root is not None or args.amass_file is not None:
             screened: dict[str, object] = {}
             for clip_id, clip in motions.items():
                 if clip.provenance.kind != "amass":
                     screened[clip_id] = clip
                     continue
+                # AMASS root poses are sequence-local: the raw capture-volume
+                # translation is not an apartment world pose (the first sample
+                # can sit outside every room, so a pinned body would fall
+                # forever).  Anchor to the first frame before screening so the
+                # candidate test and the physics trials share one coordinate
+                # frame, matching view_amass.py.
+                clip = normalize_root_motion(crop_amass_clip(
+                    clip, start_s=args.amass_start, duration_s=args.amass_duration
+                ))
+                clip = ground_amass_clip(
+                    clip, plan, support_z_m=plan.spawn_root_position[2] - plan.ground_offset_m
+                )
                 result = screen_amass_clip(clip, plan)
+                if args.amass_file is not None and not result.rig_expressible:
+                    raise ValueError(f"selected AMASS cannot be tracked: {result.reason}")
                 if not args.amass_fall_only or result.accepted:
                     screened[clip_id] = annotate_clip(clip, result)
             motions = screened

@@ -1,5 +1,9 @@
 # 室内场景：构建、导出与查看
 
+[文档索引](README.md) · [当前计划](../task_plan.md)。2026-09-24 整理：
+公寓已用于人体 GUI 与物理 CIR smoke，第 6/8 节为 09-21 历史证据，不再代表 GPU 被阻塞。
+键盘路线由用户控制；本轮不做主动避障，但保留人体对墙、家具和地板的接触验收。
+
 本文件说明阶段 5 的室内三维场景资产：它由哪个配置文件描述、如何导出为 USD、如何用
 Isaac Sim 查看 GUI 画面，以及实际跑通的验证结果。
 
@@ -240,9 +244,10 @@ CPU 侧：`python -m pytest -q` → 27 passed；`python -m compileall src tests 
    需与安装版本的 `itu_*` 材质数值对齐。
 2. **未做领域随机化**：当前是单一固定布局，配置里的 `seed` 已写入清单但还没有驱动任何
    随机化。DGSense 路线要求随机化房间布局、材质、人体参数与链路，属于后续工作。
-3. **人体验证缺失**：场景本身没有人体，跌倒轨迹与 CSI 生成属于阶段 6。
+3. **人体质量仍需整改**：基础公寓不内嵌人体，人体由独立入口加入；阶段 7 已有键盘/物理试验，
+   阶段 8 已有公寓 CIR smoke，滑步/皮肤穿透仍见 [键盘指南](keyboard-control.md)。
 4. **墙体归属是手工约定**：共享墙由哪一侧生成写在 YAML 注释里，尚无自动校验；
-   `tests/test_scenes.py::test_shared_walls_are_not_built_twice` 只保证跨房间不重叠。
+   `tests/scenes/test_scenes.py::test_shared_walls_are_not_built_twice` 只保证跨房间不重叠。
 5. **动态物体只有一把椅子**：足以验证复合刚体路径，但不足以支撑拖拽、碰撞链等更复杂
    的接触场景。
 6. **玻璃与渲染外观**：玻璃用了 `opacity = 0.35`，实际透明度取决于渲染器设置；材质
@@ -251,7 +256,8 @@ CPU 侧：`python -m pytest -q` → 27 passed；`python -m compileall src tests 
 ## 8. 本轮验收与内部查看（2026-09-21）
 
 **当前状态：验收发现的 R1–R6 已修复并通过 CPU/实际 USD/物理复验。**
-详见 [`indoor-scene-remediation.md`](indoor-scene-remediation.md)；GPU 视觉和完整研究链路仍待验证。
+详见 [`indoor-scene-remediation.md`](indoor-scene-remediation.md)；当时 GPU 视觉尚未验证，
+后续人体实时截图与 CIR smoke 分别见 [键盘指南](keyboard-control.md) 和 [独立复核](verification-2026-09-23.md)。
 以上第 6 节保留首次构建的历史验证记录。
 
 `scripts/scenes/view.py` 现在默认使用去顶正交俯视相机，打开后可以检查六个房间内部：

@@ -61,6 +61,7 @@ from common import (  # noqa: E402
 
 from sim2sense_fall.humans.amass import (  # noqa: E402
     annotate_clip,
+    ground_amass_clip,
     load_amass_clip_by_id,
     load_amass_library,
     normalize_root_motion,
@@ -75,6 +76,9 @@ from sim2sense_fall.humans.mesh_sequence import (  # noqa: E402
 from sim2sense_fall.humans.motion import MotionClip, load_motion_library  # noqa: E402
 from sim2sense_fall.humans.rig import (  # noqa: E402
     HumanRigPlan,
+    apply_neutral_pose,
+    authors_deviations,
+    axis_residuals,
     fit_rest_skeleton,
     forward_kinematics,
     plan_human_rig,
@@ -85,6 +89,7 @@ from sim2sense_fall.humans.usd_human import (  # noqa: E402
     build_human_stage,
     pxr_modules,
 )
+from sim2sense_fall.scenes.view import apply_inspection_view  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -167,16 +172,17 @@ def _amass_library(args: argparse.Namespace, plan: HumanRigPlan) -> dict[str, Mo
     if args.motion and args.motion.startswith("amass__") and args.limit is None:
         # An explicit motion id is resolved directly.  This avoids parsing all
         # 110 Transitions files before Isaac Sim can even start.
-        clips = {
-            args.motion: load_amass_clip_by_id(args.amass_root, args.motion, target_up_axis="z")
-        }
+        clips = {args.motion: load_amass_clip_by_id(args.amass_root, args.motion)}
     else:
-        clips = load_amass_library(args.amass_root, limit=args.limit, target_up_axis="z")
+        clips = load_amass_library(args.amass_root, limit=args.limit).clips
     screened: dict[str, MotionClip] = {}
     for clip_id, source_clip in clips.items():
         # AMASS root poses are sequence-local.  Anchor them before screening so
         # the candidate test and the GUI playback use the same coordinate frame.
-        clip = normalize_root_motion(source_clip)
+        clip = ground_amass_clip(
+            normalize_root_motion(source_clip), plan,
+            support_z_m=plan.spawn_root_position[2] - plan.ground_offset_m,
+        )
         result = screen_amass_clip(clip, plan)
         if args.fall_only and not result.accepted:
             continue
@@ -209,7 +215,8 @@ def _apply_frame(
         plan,
         values,
         root_position=(0.0, 0.0, 0.0),
-        root_rotation=reference.root_rotation[frame],
+        # Skin is a child of the root prim; its world rotation is applied below.
+        root_rotation=np.zeros(3),
     )
     points = skin_mesh_sequence_frame(mesh, poses)
     skin_mesh.GetPointsAttr().Set(  # type: ignore[attr-defined]
@@ -234,6 +241,7 @@ def _capture_frames(
     plan: HumanRigPlan,
     reference: MotionClip,
     usd: object,
+    stage: object,
     count: int,
     out_dir: Path,
     clip_id: str,
@@ -264,6 +272,13 @@ def _capture_frames(
         written: list[Path] = []
         for frame in frames:
             _apply_frame(runtime, skin_mesh, mesh, plan, reference, usd, frame)
+            # Keep the camera on the body. A camera authored once at frame 0 loses any
+            # clip that travels, and the capture then reports "N of N written" over
+            # pictures of an empty room. This does not fix the harder one: the root
+            # *height* is taken from the sequence as authored, so a clip whose AMASS
+            # ``trans`` wanders plays with the body metres above the slab or below it,
+            # and the frame then shows ceiling or floor from inside.
+            apply_inspection_view(stage, mode="human", aspect_ratio=1600 / 900)
             # The replay writes USD and PhysX state; the viewport needs a rendered frame
             # after that write, or the capture shows the previous pose.
             await next_viewport_frame_async(viewport, 2)
@@ -291,8 +306,7 @@ def _capture_frames(
 def _evenly_spaced(total: int, count: int) -> list[int]:
     if total <= count:
         return list(range(total))
-    step = total / count
-    return [min(int(round(index * step)), total - 1) for index in range(count)]
+    return np.linspace(0, total - 1, count, dtype=int).tolist()
 
 
 def _banner(args: argparse.Namespace) -> str:
@@ -337,10 +351,7 @@ def _scripted_library(args: argparse.Namespace) -> dict[str, MotionClip]:
 
 
 def _joint_values(clip: MotionClip, frame: int, plan: HumanRigPlan) -> dict[str, float]:
-    return {
-        joint.name: float(clip.rotation_of(frame, joint.chain_joint)["xyz".index(joint.axis)])
-        for joint in plan.joints
-    }
+    return {name: value[0] for name, value in axis_residuals(clip, frame, plan).items()}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -367,6 +378,11 @@ def main(argv: list[str] | None = None) -> int:
     if motion_id not in clips:
         raise ValueError(f"unknown AMASS motion {motion_id!r}; known: {sorted(clips)}")
     clip = clips[motion_id]
+    if authors_deviations(clip):
+        # Same rule the trial runner uses: a scripted clip is authored as a deviation
+        # from the body's neutral pose, so the arms-at-the-sides angle has to be added
+        # back here or the viewer shows a different body from the one being simulated.
+        clip = apply_neutral_pose(clip, plan, config.visualization.pose_dict())
     reference = clip.resample(1.0 / config.simulation.physics_dt_s, method="slerp")
     display_values = _joint_values(clip, 0, plan)
     initial_poses = forward_kinematics(
@@ -417,20 +433,13 @@ def main(argv: list[str] | None = None) -> int:
             "first frame is the local apartment anchor",
         )
         checks.check("physics activated", activation["active_engine"] == "physx", str(activation))
-        from sim2sense_fall.scenes.view import configure_inspection_view
-
-        # ``configure_inspection_view`` authors a camera and *returns its path*; the
-        # caller has to point the viewport at it. This call used to discard the return
-        # value, so the viewport kept whatever camera it had and every screenshot showed
-        # a corner of the room with no body in it -- a capture that "succeeded" while
-        # proving nothing about what was on screen.
-        camera_path = configure_inspection_view(stage, mode="human", aspect_ratio=1600 / 900)
-        from omni.kit.viewport.utility import get_active_viewport
-
-        active_viewport = get_active_viewport()
-        if active_viewport is not None:
-            active_viewport.camera_path = camera_path
-            checks.info(f"viewport camera set to {camera_path}")
+        # Authoring a camera is not enough -- the viewport has to be pointed at it. This
+        # call used to discard the returned path, so the viewport kept whatever camera it
+        # had and every screenshot showed a corner of the room with no body in it: a
+        # capture that "succeeded" while proving nothing about what was on screen.
+        _apply_frame(runtime, usd.UsdGeom.Mesh(skin_prim), mesh, plan, reference, usd, 0)
+        camera_path = apply_inspection_view(stage, mode="human", aspect_ratio=1600 / 900)
+        checks.info(f"inspection camera: {camera_path}")
         skin_mesh = usd.UsdGeom.Mesh(skin_prim)
         if args.capture_dir is not None:
             captured = _capture_frames(
@@ -441,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
                 plan=plan,
                 reference=reference,
                 usd=usd,
+                stage=stage,
                 count=args.capture_frames,
                 out_dir=args.capture_dir,
                 clip_id=motion_id,

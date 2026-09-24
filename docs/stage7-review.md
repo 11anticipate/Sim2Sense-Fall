@@ -1,5 +1,9 @@
 # 阶段 7 批判性验收（2026-09-22）
 
+> 历史快照：下文旧资产扫描、单轴 rig、GPU 和未完成项不能作为当前状态。
+> 后续真实 AMASS 已导入，多轴 PhysX 与键盘 GUI 已运行；当前边界见 [人体指南](human-simulation.md)，
+> 证据见 [文档索引](README.md)。保留本页的失败样例和数据划分风险供回归。
+
 > 本文保留第一次复审的缺陷证据。二次验收发现当时资产扫描处于旧状态：当前 `data/humans/smpl/` 已有并实际加载 SMPL v1.1.0 neutral/male/female（3/5 模型可用），neutral CPU 静止蒙皮已通过；AMASS 原始序列仍未发现。逐帧网格整改与最新边界见 [`docs/mesh-export.md`](mesh-export.md) 和 [`docs/progress.md`](progress.md)。因此下文“SMPL 0/5、所有产物均为代理”的句子只代表第一次复审快照，不代表当前资产状态。
 
 ## 结论与资产（第一次复审快照）

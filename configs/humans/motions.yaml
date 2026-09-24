@@ -7,9 +7,14 @@
 # be reported as motion-capture data.
 #
 # Body-local frame: +X forward, +Y left, +Z up.
-# Rotations about +Y are pitch: a downward-pointing segment moves its tip backward
-# for positive values, so hip and shoulder flexion are negative while knee, elbow
-# and spine flexion are positive.
+# Rotations about +Y are pitch for a segment that already points down: its tip moves
+# backward for positive values, so hip and spine flexion are negative while knee,
+# ankle and trunk flexion are positive.
+# The arm is the exception. At the SMPL rest it points sideways along +Y, so +Y is the
+# arm's own twist axis and cannot lower it; the shoulder's one DOF is therefore
+# adduction about +X (-105 deg left / +105 deg right puts the wrist beside the hip)
+# and the elbow flexes about +Z. A fore-and-aft arm swing needs a second shoulder DOF
+# the rig does not have, so no clip here authors one.
 #
 # `phase` is the single phase label for a scripted clip. Fall trials get their
 # labels from the trajectory instead, in sim2sense_fall.humans.events.
@@ -44,7 +49,11 @@ motions:
     phase: standing
     duration_s: 1.0
     tags: [reference, controlled]
-    notes: Zero pose. The identity reference for every joint.
+    notes: >-
+      Zero pose: the identity reference for every joint, which the trial runner offsets
+      by the rig's declared neutral pose. Arms at the sides therefore comes from
+      visualization.default_pose_rad in the human config, not from here, so the same
+      clip means the same thing on a skeleton whose rest already hangs the arms.
 
   - id: bend_forward
     phase: bending
@@ -61,8 +70,6 @@ motions:
       spine3: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, 0.40, 0], [0, 0.40, 0]]}
       left_hip: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, -0.30, 0], [0, -0.30, 0]]}
       right_hip: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, -0.30, 0], [0, -0.30, 0]]}
-      left_shoulder: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, -0.25, 0], [0, -0.25, 0]]}
-      right_shoulder: {times_s: [0.0, 1.0, 2.0], values: [[0, 0, 0], [0, -0.25, 0], [0, -0.25, 0]]}
 
   - id: squat
     phase: squatting
@@ -109,17 +116,18 @@ motions:
     generator: sine
     tags: [reference, controlled]
     notes: >-
-      One cycle per 1.11 s. Alternating hip and knee flexion with counter-phased
-      arm swing; the body does not translate, so it isolates joint tracking from
-      root locomotion.
+      One cycle per 1.11 s. Alternating hip and knee flexion; the body does not
+      translate, so it isolates joint tracking from root locomotion. No arm channel:
+      swinging the arms fore-and-aft needs shoulder flexion, and this rig gives the
+      shoulder one DOF, which is adduction. The counter-phased shoulder channels that
+      used to sit here rotated about the arm's own axis and moved the wrist 3 cm --
+      motion that looked authored and was physically nothing.
     sine:
       channels:
         - {joint: left_hip, axis: y, amplitude_deg: 28.0, frequency_hz: 0.9, phase_deg: 0.0}
         - {joint: right_hip, axis: y, amplitude_deg: 28.0, frequency_hz: 0.9, phase_deg: 180.0}
         - {joint: left_knee, axis: y, amplitude_deg: 25.0, frequency_hz: 0.9, phase_deg: 90.0, offset_deg: 25.0}
         - {joint: right_knee, axis: y, amplitude_deg: 25.0, frequency_hz: 0.9, phase_deg: 270.0, offset_deg: 25.0}
-        - {joint: left_shoulder, axis: y, amplitude_deg: 18.0, frequency_hz: 0.9, phase_deg: 180.0}
-        - {joint: right_shoulder, axis: y, amplitude_deg: 18.0, frequency_hz: 0.9, phase_deg: 0.0}
         - {joint: left_ankle, axis: y, amplitude_deg: 12.0, frequency_hz: 0.9, phase_deg: 90.0}
         - {joint: right_ankle, axis: y, amplitude_deg: 12.0, frequency_hz: 0.9, phase_deg: 270.0}
 
@@ -229,15 +237,18 @@ motions:
     duration_s: 1.0
     tags: [reference, fall_reference]
     notes: >-
-      Arms reach forward while the trunk pitches over, the shape a protective
-      response takes. Kept separate from the topple so a protective-reaction label
-      can be argued from the joint trace rather than from the perturbation id.
+      Arms lift away from the torso while the trunk pitches over, the shape a
+      protective response takes. It is not a forward reach: reaching needs shoulder
+      flexion and this rig gives the shoulder adduction only, so what is authored here
+      is abduction plus elbow flexion, as deviations from the neutral pose the human
+      config declares. Kept separate from the topple so a protective-reaction label can
+      be argued from the joint trace rather than from the perturbation id.
     root:
       rotation_keyframes:
         times_s: [0.0, 0.5, 1.0]
         values: [[0, 0, 0], [0, 0.35, 0], [0, 0.90, 0]]
     joint_keyframes:
-      left_shoulder: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, -1.40, 0], [0, -1.55, 0]]}
-      right_shoulder: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, -1.40, 0], [0, -1.55, 0]]}
-      left_elbow: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, -0.40, 0], [0, -0.30, 0]]}
-      right_elbow: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, -0.40, 0], [0, -0.30, 0]]}
+      left_shoulder: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0.43, 0, 0], [0.58, 0, 0]]}
+      right_shoulder: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [-0.43, 0, 0], [-0.58, 0, 0]]}
+      left_elbow: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, 0, -0.2], [0, 0, -0.1]]}
+      right_elbow: {times_s: [0.0, 0.5, 1.0], values: [[0, 0, 0], [0, 0, 0.2], [0, 0, 0.1]]}

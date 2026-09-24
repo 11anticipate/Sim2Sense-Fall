@@ -1,0 +1,8 @@
+# Explicit external pelvis actuator. Never label trials using this as unassisted.
+position_stiffness_n_m: 12000.0
+position_damping_ns_m: 900.0
+rotation_stiffness_nm_rad: 3000.0
+rotation_damping_nms_rad: 180.0
+max_force_n: 1500.0
+max_torque_nm: 400.0
+gravity_compensation_fraction: 0.7

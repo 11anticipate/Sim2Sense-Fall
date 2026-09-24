@@ -1,5 +1,31 @@
 # 把人体 Mesh 导入 Sionna RT
 
+[文档索引](README.md) · [数据契约](data-contract.md) · [当前计划](../task_plan.md)。
+
+## 当前公寓入口（2026-09-24 整理）
+
+固定公寓 + 实际后推跌倒 → 复数 CIR 已实跑，证据是 [2026-09-23 独立复核](verification-2026-09-23.md)。
+这是单场景、单类物理跌倒 smoke，不是 50 Hz 训练数据集，也未同步受人体撞动后的家具。
+人体材料使用 [来源记录](human-em-material.md) 的 3.5 GHz 参数；参数模型不等于真人测量。
+
+已有该物理试验产物时，从仓库根目录执行：
+
+```bash
+python3 scripts/sionna/import_fall_mesh.py --dry-run \
+  --trial-json artifacts/review_20260923/final_physics/smpl_neutral_standing__stand_neutral__push_backward.trial.json
+/home/gsh/.local/opt/sionna/bin/python scripts/sionna/import_fall_mesh.py --frames 12 \
+  --trial-json artifacts/review_20260923/final_physics/smpl_neutral_standing__stand_neutral__push_backward.trial.json \
+  --out artifacts/sionna/apartment_physics_review
+```
+
+输入不存在时，先按独立复核报告生成试验；`keyboard.py` 的 `recording.npz` 不是此入口要求的 trial 格式。
+
+## 历史导入记录说明
+
+以下环境/API 和首次 `floor_wall` 试验保留历史语境。旧功率 dB 值因丢弃虚部已撤回，
+旧材料 εr=51、σ=2.16 S/m 已替换，不能引用下文旧输出为当前研究结果。
+
+
 本轮（2026-09-23）把阶段 7 导出的逐帧人体网格真正接进 Sionna RT，并验证导入成功。
 本文记录**本机环境**、**API 事实**（Sionna RT 2.1 的几何导入入口与直觉不符，写错会静默失败）
 和**实测结果**。
@@ -70,15 +96,16 @@ Sionna 的 ITU-R P.2040 表里只有 19 种**建筑材料**（concrete / brick /
 glass / wood / 各种 ground / `vacuum` …），**没有人体组织**。所以人体必须显式给一个
 `RadioMaterial`，并且必须把假设写进产物。
 
-默认取高含水率软组织在 ~3.5 GHz 的常数：`ε_r = 51.0`、`σ = 2.16 S/m`、厚度 `0.02 m`。
+首次试验曾取 `ε_r = 51.0`、`σ = 2.16 S/m`、厚度 `0.02 m`（旧参数，已替换）。
 `HumanMaterial.as_dict()` 会带上
 `provenance: "modelling assumption, not measured"` 与 `source` 字符串，
-**用于正式结果前需要补文献引用**。
+现已补来源并将 3.5 GHz 参数改为 εr=51.4442299518、σ=2.5575182495 S/m，
+详见 [人体电磁材料](human-em-material.md)；均匀材料与 0.02 m 厚度仍是代理假设。
 
 另一个"不需要新假设"的选择是 `vacuum`（ε_r=1、σ=0），但那是错的：它让电磁意义上
 **不存在人体**，会悄悄删掉这一阶段要测的交互本身。
 
-## 实测：导入成功且真的改变了信道
+## 历史首次导入输出（旧 dB 数值已撤回）
 
 ```bash
 DISPLAY=:0 /home/gsh/.local/opt/sionna/bin/python scripts/sionna/import_fall_mesh.py \
@@ -99,15 +126,15 @@ DISPLAY=:0 /home/gsh/.local/opt/sionna/bin/python scripts/sionna/import_fall_mes
 
 **正向对照是关键**：同一场景、同一收发，分别求「有人体」与「无人体」。
 导入若静默失败，信道不会有任何变化；只报告「解出 N 条路径」是发现不了的。
-实测人体让信道变化最多 **+6.03 dB**，且**随人体倒下变化 10.15 dB** ——
-后者正是跌倒检测所依赖的量（静止人体会给 0）。
+上方 **+6.03 dB / 10.15 dB 为已撤回的旧计算输出**，仅保留排错记录。
+正确复数计算及新公寓对照见独立复核报告，不混合场景、材料或计算版本比较。
 
 产物：`artifacts/sionna/fall_import/`
 
 - `<sample>.cir.npz`：`timestamp_s` / `cir` / `frame_index`
 - `<sample>.import.json`：环境、几何、材质、逐帧路径数与功率、基线、失败清单
 
-## 明确边界（不要误读）
+## 首次 floor_wall 试验边界（历史）
 
 - 场景是 Sionna **内置的 `floor_wall`**（地面 + 一面墙），**不是本项目的公寓**。
   把公寓转成 Sionna 场景是另一件事；混在一起会让失败无法区分是"人体导入不了"

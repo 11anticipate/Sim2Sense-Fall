@@ -1,0 +1,21 @@
+version: 1
+notes: Analytic reference motions only. No AMASS or other captured sequence is included
+  or referred to here.
+defaults:
+  fps: 60.0
+  generator: keyframes
+  tags:
+  - reference
+motions:
+- id: stand_neutral
+  phase: standing
+  duration_s: 5.0
+  tags:
+  - reference
+  - controlled
+  notes: >-
+    Zero pose: the identity reference for every joint. The arms-at-the-sides carry
+    angle is not authored here -- it is the rig's neutral pose, declared once in
+    configs/humans/human_smpl_*.yaml under visualization.default_pose_rad and applied
+    to the reference by the trial runner, because "arms at the sides" is a property of
+    the skeleton's rest pose rather than of this motion.

@@ -53,12 +53,12 @@ from sim2sense_fall.humans.assets import (  # noqa: E402
 from sim2sense_fall.humans.rig import (  # noqa: E402
     fit_rest_skeleton,
     forward_kinematics,
+    joint_values_from_clip,
     plan_human_rig,
     standing_height_for,
 )
 from sim2sense_fall.humans.skeleton import default_rest_skeleton, smpl_skeleton  # noqa: E402
 from sim2sense_fall.humans.skinning import skin_with_link_poses  # noqa: E402
-from sim2sense_fall.humans.usd_human import joint_values_from_clip  # noqa: E402
 
 #: At least one reference motion must involve the root, or the fall labels would be
 #: derived from a body that never tips.

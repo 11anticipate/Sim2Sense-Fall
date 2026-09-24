@@ -1,5 +1,7 @@
 # 系统架构
 
+[文档索引](README.md) · [当前计划](../task_plan.md)。下图描述目标链路，实际完成状态以计划及试验报告为准。
+
 ```text
 场景资产（CPU 可复现）
   ├─ configs/scenes/*.yaml       房间尺寸、墙体归属、门窗开口、家具、材质覆盖
@@ -59,6 +61,18 @@ Sionna RT
   `tests/scenes/` 对应场景回归。配置仍在 `configs/scenes/`，产物仍在 `artifacts/scenes/`。
 - 场景的消费边界是 `ScenePlan`（不可变数据）和导出的 USD；下游不应该反过来依赖
   `scenes.planner` 的内部函数。
+
+## 人体控制与真实运行时
+
+- `humans/amass.py` 负责动作读取和坐标适配，`humans/rig.py` 将参考旋转分解为配置关节目标。
+- `humans/teleop.py` 处理键盘意图、周期步态、限速和平滑；`humans/root_control.py` 生成有界根辅助力/力矩。
+- `humans/usd_human.py` 连接 PhysX 驱动与接触报告，读取实际姿态；SMPL 显示消费实际姿态。
+- `scripts/humans/keyboard.py` 管理窗口、物理回调、实时蒙皮和记录。现有键盘模式为辅助物理控制。
+  新增蹲下/起立/摔倒状态机尚待实现；行走路线由用户选择，不包含主动避障或导航模块。
+- `sionna/apartment.py` 转换固定公寓几何，`sionna/mesh_import.py` 导入人体，`sionna/channel.py` 处理复数信道。
+  公寓 + 物理后推跌倒的 CIR smoke 已完成；动态家具同步、数据集和训练仍待完成。
+
+运动学参考预览、物理仿真和记录后渲染是三条不同路径。完整边界见 [人体指南](human-simulation.md)。
 
 ## 关键风险
 

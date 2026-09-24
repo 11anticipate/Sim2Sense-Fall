@@ -44,9 +44,18 @@ Runtime behaviour that was probed, not assumed
   ``get_net_contact_forces`` raises. Contact reporting is therefore best-effort and
   its absence is recorded rather than faked.
 * On Isaac Sim 6.0.1 that view does not actually work here: constructing it with any
-  filter set raises ``Pattern '/World/Human' did not match any rigid contact for
-  filters`` and the prim's ``_on_physics_ready`` then dereferences a null, so
-  ``contact_forces`` stays false however it is constructed. The working channel is
+  filter set makes ``omni.physics.tensors`` log ``Pattern '/World/Human' did not match
+  any rigid contact for filters`` for every filter path, and the wrapper it hands back
+  has no backend, so ``contact_forces`` stays false however it is constructed.
+  Requesting it is not merely useless, it is not a quiet failure: the same ``check()``
+  runs again from ``RigidPrim._on_physics_ready``, which ``SimulationManager``
+  dispatches as an event callback over a weakref proxy, so the ``AttributeError`` it
+  raises there (``'NoneType' object has no attribute 'check'``) lands in the app's
+  stderr instead of in any ``try`` of ours -- every run that asks for the view paints a
+  screenful of plugin errors and a traceback, including at shutdown when the timeline
+  stops and the event fires again. The entry points therefore pass
+  ``enable_contact_views=False``; the parameter remains as an opt-in for a build where
+  the view does work. The working channel is
   PhysX's own polled report --
   ``omni.physx.get_physx_simulation_interface().get_contact_report()`` -- which does
   return per-contact position, normal, impulse and separation. It requires
@@ -66,7 +75,7 @@ import math
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -74,12 +83,12 @@ from typing import Any
 import numpy as np
 
 from .config import PerturbationConfig
-from .motion import MotionClip
 from .rig import HumanRigPlan, LinkTransform, pose_surface_points
 from .rotations import quaternion_to_matrix
 
 __all__ = [
     "HUMAN_ROOT_PATH",
+    "DISPLAY_SKIN_PATH",
     "ContactSourceUnavailable",
     "ContactSample",
     "HumanRuntime",
@@ -96,6 +105,9 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 HUMAN_ROOT_PATH = "/World/Human"
+#: World-space playback mesh; see :func:`write_display_skin`. It is deliberately not a
+#: child of the articulation, so updating it cannot be mistaken for changing the body.
+DISPLAY_SKIN_PATH = "/World/DisplaySkin"
 JOINTS_SUFFIX = "Joints"
 
 #: Contact reporting is filtered to these environment categories. A fall impact is
@@ -145,22 +157,8 @@ class ContactSourceUnavailable(RuntimeError):
 class ContactSample:
     """One contact point, as reported by PhysX's polled contact report.
 
-    ``collider0``/``collider1`` are **numeric PhysX collider handles**, not USD prim
-    paths. This was measured, not assumed: on Isaac Sim 6.0.1 ``get_contact_report()``
-    yields ``header.collider0`` as a plain ``int`` (e.g. ``265729``), and the header
-    carries no path attribute at all -- only ``actor0``/``actor1`` (also handles),
-    ``proto_index0``/``proto_index1`` and ``stage_id``. There is no public
-    handle-to-path mapping in ``omni.physx``.
-
-    An earlier version of this dataclass typed the handles as ``str`` and documented
-    them as paths, then filtered them against ``/World/Human``. That filter could
-    never match, so every in-trial contact was silently dropped and the exported
-    contact history was empty while the report itself was healthy. The handles are
-    kept typed as ``int`` now so the same mistake cannot be made silently.
-
-    Use :meth:`HumanRuntime.human_contact_samples` to get pairs attributable to a
-    known side; it resolves each handle against the collider paths this runtime
-    authored rather than guessing from the pair order.
+    Numeric collider identifiers are decoded with PhysicsSchemaTools.intToSdfPath.
+    Both encoded identifiers and decoded paths are retained for traceability.
     """
 
     collider0: int
@@ -169,6 +167,8 @@ class ContactSample:
     normal: tuple[float, float, float]
     impulse_ns: tuple[float, float, float]
     separation_m: float
+    collider0_path: str = ""
+    collider1_path: str = ""
 
     @property
     def impulse_magnitude_ns(self) -> float:
@@ -187,6 +187,8 @@ class ContactSample:
             "collider1": self.collider1,
             "collider0_handle": self.collider0,
             "collider1_handle": self.collider1,
+            "collider0_path": self.collider0_path,
+            "collider1_path": self.collider1_path,
             "position_m": list(self.position_m),
             "normal": list(self.normal),
             "impulse_ns": list(self.impulse_ns),
@@ -229,19 +231,20 @@ def _ensure_xform(runtime: SimpleNamespace, stage: Any, path: str) -> Any:
     return stage.GetPrimAtPath(path)
 
 
-def _point_in_capsule(
+def _capsule_surface_distance(
     point: tuple[float, float, float],
     centre: tuple[float, float, float],
     radius: float,
     axis_half: tuple[float, float, float],
-) -> bool:
-    """True when ``point`` lies inside the capsule described by the other arguments.
+) -> float:
+    """Signed distance from ``point`` to the capsule surface (negative = inside).
 
     ``axis_half`` is the half-height vector along the capsule's own Z axis, so it
-    carries both the length and the orientation. A small tolerance is added because
-    PhysX reports the contact point on the *contact offset* shell, which sits a few
-    millimetres outside the collision surface; without it, resting contacts would fall
-    just outside their own capsule.
+    carries both the length and the orientation. The diagnostic half of
+    :func:`_point_in_capsule`: when attribution fails, the raise must say how far
+    outside every capsule the point was and for which limb, because "3 mm outside
+    the contact shell" and "a metre away in another room" are different defects
+    with different fixes.
     """
 
     ax, ay, az = axis_half
@@ -256,7 +259,27 @@ def _point_in_capsule(
         along = min(1.0, max(-1.0, along))
         offset = (px - along * ax, py - along * ay, pz - along * az)
     distance = math.sqrt(offset[0] ** 2 + offset[1] ** 2 + offset[2] ** 2)
-    return distance <= radius + CAPSULE_CONTAINMENT_TOLERANCE_M
+    return distance - radius
+
+
+def _point_in_capsule(
+    point: tuple[float, float, float],
+    centre: tuple[float, float, float],
+    radius: float,
+    axis_half: tuple[float, float, float],
+) -> bool:
+    """True when ``point`` lies inside the capsule described by the other arguments.
+
+    A small tolerance is added because PhysX reports the contact point on the
+    *contact offset* shell, which sits a few millimetres outside the collision
+    surface; without it, resting contacts would fall just outside their own
+    capsule.
+    """
+
+    return (
+        _capsule_surface_distance(point, centre, radius, axis_half)
+        <= CAPSULE_CONTAINMENT_TOLERANCE_M
+    )
 
 
 def _prim_local_box(prim: Any, runtime: Any) -> Any:
@@ -348,6 +371,92 @@ def _segment_in_volumes(
         if _point_in_capsule(point, centre, radius, axis_half):
             return name
     return None
+
+
+def _capsule_geometry_in_link_frame(
+    runtime: SimpleNamespace,
+    capsule_prim: Any,
+    link_prim: Any,
+) -> tuple[tuple[float, float, float], float, tuple[float, float, float]]:
+    """Capsule ``(centre, radius, half-axis)`` expressed in its LINK's frame.
+
+    The capsule prim is authored once as a child of its link with translate and
+    orient ops only, so its offset from the link origin is a constant of the rig.
+    Reading it as the *relative* transform between the two prims (both sampled
+    from the stage at the same instant) keeps it valid no matter when it is
+    sampled: the ratio of two equally stale poses is still the authored offset.
+    Composing this constant with the link's live physics pose at attribution
+    time is what keeps contact volumes on the body -- a USD-stage world read
+    freezes the moment stepping bypasses the fabric/USD sync, which is the
+    measured cause of the frame-2298 attribution escape in the AMASS trial
+    (``scripts/humans/probe_stage_staleness.py``).
+
+    Raises ``ValueError`` when the relative transform is not rigid: a scaled or
+    sheared offset would silently deform the capsule and misplace every contact.
+    """
+
+    if not capsule_prim or not capsule_prim.IsValid():
+        raise ValueError("capsule prim is invalid")
+    if not link_prim or not link_prim.IsValid():
+        raise ValueError("link prim is invalid")
+    capsule = runtime.UsdGeom.Capsule(capsule_prim)
+    if not capsule:
+        raise ValueError(f"prim {capsule_prim.GetPath()} is not a UsdGeom.Capsule")
+    radius = float(capsule.GetRadiusAttr().Get() or 0.0)
+    height = float(capsule.GetHeightAttr().Get() or 0.0)
+    if radius <= 0.0:
+        raise ValueError(f"capsule {capsule_prim.GetPath()} has non-positive radius {radius}")
+    time = runtime.Usd.TimeCode.Default()
+    link_matrix = runtime.UsdGeom.Xformable(link_prim).ComputeLocalToWorldTransform(time)
+    cap_matrix = runtime.UsdGeom.Xformable(capsule_prim).ComputeLocalToWorldTransform(time)
+    to_link = link_matrix.GetInverse()
+    world_centre = cap_matrix.Transform(runtime.Gf.Vec3d(0.0, 0.0, 0.0))
+    world_axis = cap_matrix.TransformDir(runtime.Gf.Vec3d(0.0, 0.0, 1.0))
+    local_centre = to_link.Transform(world_centre)
+    local_axis = to_link.TransformDir(world_axis)
+    axis_norm = local_axis.GetLength()
+    if abs(axis_norm - 1.0) > 1e-6:
+        raise ValueError(
+            f"capsule-to-link transform for {capsule_prim.GetPath()} is not rigid "
+            f"(axis scale {axis_norm:.9f}); a deformed offset would misplace every "
+            "attributed contact"
+        )
+    half = max(0.0, height * 0.5)
+    return (
+        (float(local_centre[0]), float(local_centre[1]), float(local_centre[2])),
+        radius,
+        (
+            float(local_axis[0]) * half,
+            float(local_axis[1]) * half,
+            float(local_axis[2]) * half,
+        ),
+    )
+
+
+def _capsule_world_volume(
+    link_rotation: np.ndarray,
+    link_translation: np.ndarray,
+    geometry: tuple[tuple[float, float, float], float, tuple[float, float, float]],
+) -> tuple[tuple[float, float, float], float, tuple[float, float, float]]:
+    """Map an authored link-frame capsule into world space through the link pose.
+
+    ``link_rotation`` (3x3, world-from-link) and ``link_translation`` come from
+    the physics read channel, which stays current even when stepping bypasses the
+    fabric/USD sync; ``geometry`` is the constant authored offset from
+    :func:`_capsule_geometry_in_link_frame`. The radius passes through unchanged:
+    rigid composition cannot scale it. Split out from the runtime so the
+    composition can be exercised on plain numbers without a stage.
+    """
+
+    centre = link_rotation @ np.asarray(geometry[0], dtype=np.float64) + np.asarray(
+        link_translation, dtype=np.float64
+    )
+    axis_half = link_rotation @ np.asarray(geometry[2], dtype=np.float64)
+    return (
+        (float(centre[0]), float(centre[1]), float(centre[2])),
+        float(geometry[1]),
+        (float(axis_half[0]), float(axis_half[1]), float(axis_half[2])),
+    )
 
 
 def _author_metadata(runtime: SimpleNamespace, prim: Any, entries: Mapping[str, Any]) -> None:
@@ -912,8 +1021,8 @@ class TrialRecording:
         return float(min(0.0, self.body_points[:, :, 2].min()))
 
 
-def tracking_target_rad(low: float, high: float) -> float:
-    """Half of whichever limit excursion is wider, in radians.
+def tracking_target_rad(low: float, high: float, min_amplitude: float = 0.0) -> float:
+    """A probe target far enough from rest to falsify a tracking claim.
 
     ``low`` and ``high`` must already be radians, as :meth:`HumanRuntime.dof_limits_rad`
     reports them. The stage-7 review found a caller converting them a second time, which
@@ -923,11 +1032,64 @@ def tracking_target_rad(low: float, high: float) -> float:
     Half of the wider side is used rather than the midpoint of the pair, because
     asymmetric limits can put the midpoint almost on zero: the ankle's ``[-35, 45]``
     midpoints to 5 degrees, which no tolerance can meaningfully discriminate against.
+    When that is still inside ``min_amplitude`` -- a three-axis chain has small
+    secondary-axis spans a single-axis rig never had -- the target is pushed toward
+    the same limit until the amplitude clears the bar, clamped to stay off the bound
+    so the drive has room to settle.
     """
 
     if not np.isfinite([low, high]).all() or low > high:
         raise ValueError(f"limits must be finite and ordered, got [{low!r}, {high!r}]")
-    return float(0.5 * (high if abs(high) >= abs(low) else low))
+    target = 0.5 * (high if abs(high) >= abs(low) else low)
+    if abs(target) < min_amplitude:
+        sign = 1.0 if target >= 0.0 else -1.0
+        target = sign * float(min_amplitude)
+    margin = 0.05 * (high - low) + 1e-9
+    return float(min(max(target, low + margin), high - margin))
+
+
+def dof_permutation(plan_names: Sequence[str], runtime_names: Sequence[str]) -> np.ndarray:
+    """Index map translating plan-ordered DOF arrays into articulation order.
+
+    ``result[k]`` is the plan index of the DOF that PhysX keeps in slot ``k``, so
+    ``plan_values[result]`` is the array to hand to the articulation and
+    ``out[result] = runtime_values`` translates a reading back. The two orders
+    coincide for a single-axis rig and diverge as soon as a joint carries a proxy
+    chain, which is why every crossing of that boundary goes through this map.
+    """
+
+    plan_index = {name: index for index, name in enumerate(plan_names)}
+    try:
+        return np.array([plan_index[name] for name in runtime_names], dtype=np.int64)
+    except KeyError as exc:
+        raise HumanRuntimeUnavailable(
+            f"the articulation exposes DOF {exc.args[0]!r} that the plan does not declare"
+        ) from exc
+
+
+def _gather_runtime_order(values: np.ndarray, permutation: np.ndarray | None) -> np.ndarray:
+    """Reorder plan-ordered values into articulation order; no map means pass-through.
+
+    The permutation is optional state rather than a required argument because
+    ``set_control_scale`` is also exercised duck-typed against a bare namespace by
+    the CPU tests: callers that carry a map get the translation, callers that do
+    not get their arrays back untouched, which matches a single-axis rig where the
+    two orders coincide anyway.
+    """
+
+    if permutation is None:
+        return values
+    return values[..., permutation]
+
+
+def _scatter_plan_order(values: np.ndarray, permutation: np.ndarray | None) -> np.ndarray:
+    """Reorder articulation-ordered values into plan order; no map means pass-through."""
+
+    if permutation is None:
+        return values
+    out = np.empty_like(values)
+    out[..., permutation] = values
+    return out
 
 
 class HumanRuntime:
@@ -973,9 +1135,7 @@ class HumanRuntime:
             # Which channel contact samples come from, or "unavailable". Recorded so a
             # consumer can tell a measured contact from a missing channel.
             "contact_source": "unavailable",
-            # How a contact point is attributed to a limb. "geometry" means the
-            # point was matched to a live capsule volume; anything else means the
-            # export cannot name the limb that touched.
+            # Set to usd_collider_path after decoding a contact report.
             "contact_attribution": "unresolved",
             "dof_order_matches_plan": False,
         }
@@ -990,6 +1150,16 @@ class HumanRuntime:
             )
         self.capabilities["dof_order_matches_plan"] = runtime_names == plan.dof_names
         self.capabilities["dof_order"] = list(runtime_names)
+        # PhysX orders an articulation's DOFs by link traversal, not by the plan's
+        # joint order. On a single-axis rig the two orders happen to coincide; a
+        # proxy chain (a multi-axis joint) does not, and every positional write
+        # then lands on the wrong joint -- the verify probes that bent spine2 when
+        # asked for left_knee are that failure, measured. Every array crossing
+        # this boundary is therefore translated explicitly, in both directions.
+        self._plan_to_runtime = dof_permutation(plan.dof_names, runtime_names)
+        self.capabilities["dof_plan_permutation"] = bool(
+            np.any(self._plan_to_runtime != np.arange(len(self._plan_to_runtime)))
+        )
         self._base_gains: tuple[np.ndarray, np.ndarray] | None = None
         self.control_scale = 1.0
 
@@ -1010,6 +1180,23 @@ class HumanRuntime:
         # assumed from the plan -- the plan's capsule set and the authored set can
         # diverge, and containment must use what physics actually has.
         self._link_collider_paths = self._discover_collider_paths()
+        # Contact volumes are composed at attribution time from the link's LIVE
+        # physics pose plus this constant authored offset. USD-stage world
+        # transforms freeze the moment stepping bypasses the fabric/USD sync
+        # (``SimulationManager.step(update_fabric=False)`` -- measured in
+        # ``scripts/humans/probe_stage_staleness.py``), so a stage-read volume
+        # would hold the spawn pose forever and the first contact away from it
+        # -- the first floor touch of a fall -- would be unattributable. That
+        # was the frame-2298 escape of the AMASS trial, measured 2026-09-24.
+        self._capsule_local_geometry = {
+            name: _capsule_geometry_in_link_frame(
+                pxr_modules(),
+                stage.GetPrimAtPath(collider_path),
+                stage.GetPrimAtPath(self._link_paths[name]),
+            )
+            for name, collider_path in self._link_collider_paths.items()
+        }
+        self.capabilities["contact_volume_poses"] = "live_link_poses"
         self._rigids: dict[str, Any] = {}
         self.capabilities["contact_filter_paths"] = []
         self._build_link_views(
@@ -1033,6 +1220,12 @@ class HumanRuntime:
         runtime = pxr_modules()
         found: dict[str, str] = {}
         for name, link_path in self._link_paths.items():
+            # The root body's capsule is under the non-rigid pelvis Xform, while
+            # its RigidPrim is the articulation root itself.
+            declared = self._stage.GetPrimAtPath(f"{self.root_path}/{name}/collider")
+            if declared and declared.IsValid() and runtime.UsdGeom.Capsule(declared):
+                found[name] = str(declared.GetPath())
+                continue
             prim = self._stage.GetPrimAtPath(link_path)
             if not prim or not prim.IsValid():
                 continue
@@ -1097,6 +1290,17 @@ class HumanRuntime:
                 f"{list(categories)}, so there is nothing to report contacts against"
             )
         elif not self.capabilities.get("contact_tensor_view"):
+            if not enable_contact_views:
+                # Recorded as a reason rather than an error: nothing failed in this
+                # process, the caller declined a channel this build cannot deliver.
+                # Keeping it distinct from ``contact_error`` is what lets a reader
+                # tell "we did not ask" from "we asked and it broke".
+                self.capabilities["contact_tensor_view_reason"] = (
+                    "not requested: the tensors rigid-contact view cannot be built for "
+                    "these patterns on this Isaac build, and asking for it raises from "
+                    "an async physics-ready callback that cannot be caught; contacts "
+                    "come from the polled physx report"
+                )
             # The polled report does not need a tensor view, so the channel may still
             # be available. It is probed on first read.
             self.capabilities["contact_source"] = "physx_contact_report"
@@ -1154,11 +1358,17 @@ class HumanRuntime:
             raise ContactSourceUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
         rows = list(data)
+        from pxr import PhysicsSchemaTools
+
         samples: list[ContactSample] = []
         for header in headers:
             offset = int(header.contact_data_offset)
             collider0 = int(header.collider0)
             collider1 = int(header.collider1)
+            paths = tuple(str(PhysicsSchemaTools.intToSdfPath(value))
+                          for value in (collider0, collider1))
+            if not all(path.startswith("/") for path in paths):
+                raise ContactSourceUnavailable(f"contact collider path decoding failed: {paths}")
             for record in rows[offset : offset + int(header.num_contact_data)]:
                 samples.append(
                     ContactSample(
@@ -1168,27 +1378,14 @@ class HumanRuntime:
                         normal=tuple(float(v) for v in record.normal),
                         impulse_ns=tuple(float(v) for v in record.impulse),
                         separation_m=float(record.separation),
+                        collider0_path=paths[0],
+                        collider1_path=paths[1],
                     )
                 )
         return tuple(samples)
 
     def human_contact_samples(self) -> tuple[ContactSample, ...]:
-        """Contact samples involving the human, with sides canonicalised.
-
-        PhysX reports an unordered pair of opaque numeric handles (see
-        :class:`ContactSample`) and, in this build, tags contact reporting per
-        **actor** rather than per collider. Untagging all 19 human capsules leaves
-        the report unchanged and tagging any single capsule does not narrow it, so
-        the pair cannot be split by handle and "which side is the body" is answered
-        geometrically instead: the body is the only thing at these coordinates, and
-        its capsule volumes are known exactly from the stage. See
-        :meth:`attributed_contact_samples`.
-
-        When no handle could be resolved this *raises* rather than returning an empty
-        tuple: an unresolvable filter and a genuinely contact-free step are different
-        facts, and conflating them is what produced an empty contact history while the
-        underlying report was healthy.
-        """
+        """Human contacts with the body's collider first and normals pointing toward it."""
 
         return tuple(sample for sample, _ in self.attributed_contact_samples())
 
@@ -1202,40 +1399,30 @@ class HumanRuntime:
         """
 
         samples = self.contact_samples()
-        if not samples:
-            return ()
-        # The report carries no paths, so "is this pair the body's?" is answered
-        # geometrically: the body is the only thing at these coordinates, and the
-        # capsule volumes are known exactly from the stage.
-        volumes = self._capsule_volumes()
+        collider_segments = {path: name for name, path in self._link_collider_paths.items()}
         resolved: list[tuple[ContactSample, str]] = []
         for sample in samples:
-            segment = _segment_in_volumes(sample.position_m, volumes)
-            if segment is not None:
-                resolved.append((sample, segment))
-        if not resolved:
-            # Not one contact point landed inside a body capsule. That is either a
-            # body far from everything, or a broken geometric frame -- and the two are
-            # indistinguishable here, so the caller is told rather than handed a
-            # silently empty body history.
-            raise ContactSourceUnavailable(
-                f"none of the {len(samples)} reported contact points fell inside a body "
-                "capsule, so the body's own contacts cannot be separated from the "
-                "environment's; check that the stage's link poses match the report"
-            )
-        self.capabilities["contact_attribution"] = "geometry"
+            for path in (sample.collider0_path, sample.collider1_path):
+                if path in collider_segments:
+                    if path == sample.collider1_path:
+                        sample = replace(
+                            sample, collider0=sample.collider1, collider1=sample.collider0,
+                            collider0_path=sample.collider1_path,
+                            collider1_path=sample.collider0_path,
+                            normal=tuple(-v for v in sample.normal),
+                            impulse_ns=tuple(-v for v in sample.impulse_ns),
+                        )
+                    resolved.append((sample, collider_segments[path]))
+                    break
+                if path == self.root_path or path.startswith(self.root_path + "/"):
+                    raise ContactSourceUnavailable(
+                        f"unregistered human collider in contact: {path}"
+                    )
+        self.capabilities["contact_attribution"] = "usd_collider_path"
         return tuple(resolved)
 
     def contact_segments(self) -> tuple[tuple[ContactSample, str], ...]:
-        """Human contact samples paired with the limb each one landed on.
-
-        The limb is resolved by contact-point containment, which is the only
-        attribution available: this build's report returns opaque numeric handles
-        with no handle-to-path lookup, and measurements show the API is applied per
-        **actor** rather than per collider (untagging every human capsule does not
-        remove the body's pairs, and tagging a single capsule does not narrow them).
-        Containment needs no such cooperation -- it uses the link poses the physics
-        already publishes.
+        """Human contacts paired with the limb identified by the decoded collider path.
 
         Thin alias for :meth:`attributed_contact_samples`; both read the report once
         so the positions and the limb names can never describe different steps.
@@ -1247,9 +1434,7 @@ class HumanRuntime:
         """Body segments that reported a contact on the last step, one per sample.
 
         This is the limb-level attribution the export records, in the same order as
-        :meth:`human_contact_samples`. Derived by containment rather than by handle
-        lookup, which is the only route available: see
-        :meth:`attributed_contact_samples`.
+        :meth:`human_contact_samples`.
         """
 
         return tuple(segment for _, segment in self.attributed_contact_samples())
@@ -1259,42 +1444,27 @@ class HumanRuntime:
     ) -> dict[str, tuple[tuple[float, float, float], float, tuple[float, float, float]]]:
         """World-space capsule volumes for every collidable link, computed fresh.
 
-        Recomputed on each call rather than cached: the body moves every step, and a
-        stale volume would attribute a contact to wherever the limb used to be.
+        Composed from each link's LIVE physics pose (the ``RigidPrim`` read that
+        ``probe_loop_timing`` proved current under
+        ``SimulationManager.step(update_fabric=False)``) and the constant authored
+        capsule-to-link offset captured once at construction. Recomputed on each
+        call rather than cached: the body moves every step, and a stale volume
+        would attribute a contact to wherever the limb used to be. USD-stage world
+        transforms are deliberately NOT used here: they freeze when stepping
+        bypasses the fabric/USD sync, which is the measured cause of the AMASS
+        trial's frame-2298 attribution escape (see
+        ``scripts/humans/probe_stage_staleness.py``).
         """
 
-        runtime = pxr_modules()
         volumes: dict[
             str, tuple[tuple[float, float, float], float, tuple[float, float, float]]
         ] = {}
-        for name, path in self._collider_paths().items():
-            prim = self._stage.GetPrimAtPath(path)
-            if not prim or not prim.IsValid():
-                continue
-            capsule = runtime.UsdGeom.Capsule(prim)
-            if not capsule:
-                continue
-            radius = float(capsule.GetRadiusAttr().Get() or 0.0)
-            height = float(capsule.GetHeightAttr().Get() or 0.0)
-            if radius <= 0.0:
-                continue
-            matrix = runtime.UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
-                runtime.Usd.TimeCode.Default()
-            )
-            centre = matrix.Transform(runtime.Gf.Vec3d(0.0, 0.0, 0.0))
-            axis = matrix.TransformDir(runtime.Gf.Vec3d(0.0, 0.0, 1.0)).GetNormalized()
-            half = max(0.0, height * 0.5)
-            volumes[name] = (
-                (float(centre[0]), float(centre[1]), float(centre[2])),
-                radius,
-                (float(axis[0]) * half, float(axis[1]) * half, float(axis[2]) * half),
+        for name, geometry in self._capsule_local_geometry.items():
+            position, quaternion = self._world_pose_of(name)
+            volumes[name] = _capsule_world_volume(
+                quaternion_to_matrix(quaternion), position, geometry
             )
         return volumes
-
-    def _collider_paths(self) -> dict[str, str]:
-        """Segment name -> collider prim path, for every collidable link."""
-
-        return dict(self._link_collider_paths)
 
     def contact_support_summary(self) -> dict[str, Any]:
         """Contacts on the last step, split by whether they carry the body weight.
@@ -1303,11 +1473,8 @@ class HumanRuntime:
         somewhere. Separating resting contacts from glancing ones gives the labelling
         stage something to threshold on without re-parsing the raw report.
 
-        "Support" is decided from **contact geometry**, not from a handle comparison:
-        the report carries opaque numeric handles with no path lookup, so a
-        handle-to-surface test is impossible. A contact whose normal points upward and
-        whose point sits at the resting surface is a support contact, which is the same
-        fact the handle test was trying to recover.
+        A contact whose body-directed normal points upward and whose point sits at
+        the resting surface is marked as support. Both collider paths remain available.
 
         The report is read exactly once here, so the counts, the impulses and the
         segment names all describe the same physics step.
@@ -1427,24 +1594,57 @@ class HumanRuntime:
     def dof_names(self) -> tuple[str, ...]:
         return tuple(str(name) for name in self.articulation.dof_names)
 
+    def _to_runtime(self, values: np.ndarray) -> np.ndarray:
+        """Reorder a plan-ordered vector into the articulation's DOF order."""
+
+        return _gather_runtime_order(values, self._plan_to_runtime)
+
+    def _to_plan(self, values: np.ndarray) -> np.ndarray:
+        """Reorder an articulation-ordered vector into the plan's DOF order."""
+
+        return _scatter_plan_order(values, self._plan_to_runtime)
+
     def dof_limits_rad(self) -> tuple[np.ndarray, np.ndarray]:
         low, high = self.articulation.get_dof_limits()
-        return low.numpy()[0].astype(np.float64), high.numpy()[0].astype(np.float64)
+        return (
+            self._to_plan(low.numpy()[0].astype(np.float64)),
+            self._to_plan(high.numpy()[0].astype(np.float64)),
+        )
 
     def set_joint_positions(self, values_rad: Sequence[float]) -> None:
-        """Write joint angles directly (kinematic replay)."""
+        """Write joint angles directly (kinematic replay).
+
+        ``values_rad`` is in plan DOF order; the translation to the articulation's
+        own order happens here, so callers never see the PhysX permutation.
+        """
 
         self._check_length(values_rad)
-        self.articulation.set_dof_positions(self._row(values_rad))
+        self.articulation.set_dof_positions(self._to_runtime(self._row(values_rad)))
 
-    def set_joint_targets(self, values_rad: Sequence[float]) -> None:
-        """Set PD drive targets (the controlled-tracking path)."""
+    def set_joint_targets(
+        self, values_rad: Sequence[float], velocities_rad_s: Sequence[float] | None = None
+    ) -> None:
+        """Set PD position and velocity targets in plan order; a hold has zero velocity."""
 
         self._check_length(values_rad)
-        self.articulation.set_dof_position_targets(self._row(values_rad))
+        self.articulation.set_dof_position_targets(self._to_runtime(self._row(values_rad)))
+        velocities = np.zeros(len(values_rad)) if velocities_rad_s is None else velocities_rad_s
+        self._check_length(velocities)
+        self.articulation.set_dof_velocity_targets(self._to_runtime(self._row(velocities)))
 
     def set_control_scale(self, scale: float) -> bool:
-        """Scale every joint drive relative to the gains the articulation was built with.
+        """Scale the active control authority relative to the authored gains.
+
+        The scale multiplies the drive **stiffness** (position feedback) only. The
+        authored **damping is always kept**: passive joint damping is a property of
+        the joint, not of the controller, and a body that lost active control is a
+        damped ragdoll, not a frictionless one. The measured reason this matters: a
+        zero-damped 57-DOF multi-axis ragdoll folds ballistically -- 975 deg/s of
+        joint speed within the 0.2 s verification hold, 2864 deg/s mid-fall -- and
+        the floor impact of that state NaNs the PhysX solver
+        (``non-finite world position for link 'pelvis'``). Damping alone cannot
+        track a position target, so the drives-off negative control stays valid,
+        and it cannot hold a pose, so the gravity-drop positive control stays real.
 
         Used by the ``control_failure`` perturbation and by the verification negative
         control. Returning ``False`` lets the caller mark the trial as not carrying the
@@ -1460,12 +1660,22 @@ class HumanRuntime:
         if not 0.0 <= scale <= 1.0:
             raise ValueError(f"control scale must be within [0, 1], got {scale!r}")
         try:
+            # This method is also exercised duck-typed against a bare namespace by
+            # the CPU tests, so besides the articulation it may only rely on the
+            # two attributes below plus an optional DOF permutation.
+            permutation = getattr(self, "_plan_to_runtime", None)
             if self._base_gains is None:
                 try:
                     stiffness, damping = self.articulation.get_dof_gains()
+                    # Stored in plan order, like every other array this class
+                    # exchanges with callers; the write below translates back.
                     self._base_gains = (
-                        np.asarray(stiffness.numpy(), dtype=np.float64),
-                        np.asarray(damping.numpy(), dtype=np.float64),
+                        _scatter_plan_order(
+                            np.asarray(stiffness.numpy(), dtype=np.float64), permutation
+                        ),
+                        _scatter_plan_order(
+                            np.asarray(damping.numpy(), dtype=np.float64), permutation
+                        ),
                     )
                 except Exception:
                     # Isaac's experimental articulation view can expose the setter
@@ -1483,7 +1693,11 @@ class HumanRuntime:
                     )
             base_stiffness, base_damping = self._base_gains
             self.articulation.set_dof_gains(
-                base_stiffness * float(scale), base_damping * float(scale)
+                _gather_runtime_order(base_stiffness * float(scale), permutation),
+                # Passive damping is not scaled: see the docstring. It is rewritten
+                # unchanged so a partially-scaled state cannot linger after the
+                # reference gains were re-captured.
+                _gather_runtime_order(base_damping, permutation),
             )
             self.control_scale = float(scale)
             return True
@@ -1492,16 +1706,18 @@ class HumanRuntime:
             return False
 
     def joint_positions_rad(self) -> np.ndarray:
-        return self.articulation.get_dof_positions().numpy()[0].astype(np.float64)
+        return self._to_plan(
+            self.articulation.get_dof_positions().numpy()[0].astype(np.float64)
+        )
 
     def control_gains(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return the current stiffness and damping in runtime DOF order."""
+        """Return the current stiffness and damping, in plan DOF order."""
 
         try:
             stiffness, damping = self.articulation.get_dof_gains()
             return (
-                np.asarray(stiffness.numpy(), dtype=np.float64).reshape(-1),
-                np.asarray(damping.numpy(), dtype=np.float64).reshape(-1),
+                self._to_plan(np.asarray(stiffness.numpy(), dtype=np.float64).reshape(-1)),
+                self._to_plan(np.asarray(damping.numpy(), dtype=np.float64).reshape(-1)),
             )
         except Exception:
             if self._base_gains is None:
@@ -1509,13 +1725,16 @@ class HumanRuntime:
                     "control gains are not available before set_control_scale()"
                 ) from None
             base_stiffness, base_damping = self._base_gains
+            # What is actually commanded: scaled stiffness, unscaled passive damping.
             return (
                 base_stiffness * self.control_scale,
-                base_damping * self.control_scale,
+                base_damping,
             )
 
     def joint_velocities_rad_s(self) -> np.ndarray:
-        return self.articulation.get_dof_velocities().numpy()[0].astype(np.float64)
+        return self._to_plan(
+            self.articulation.get_dof_velocities().numpy()[0].astype(np.float64)
+        )
 
     def _world_pose_of(self, link_name: str) -> tuple[np.ndarray, np.ndarray]:
         positions, orientations = self._rigids[link_name].get_world_poses()
@@ -1629,6 +1848,35 @@ class HumanRuntime:
             LOGGER.warning("could not apply force to link %r: %s", body, exc)
             return False
 
+    def root_velocities(self) -> tuple[np.ndarray, np.ndarray]:
+        linear, angular = self._rigids[self.plan.root_link].get_velocities()
+        return linear.numpy()[0].astype(np.float64), angular.numpy()[0].astype(np.float64)
+
+    def link_point_velocity(self, body: str, point_world: np.ndarray) -> np.ndarray:
+        """World velocity at a point, including rotation about the link's COM.
+
+        PhysX reports COM pose in the actor frame and linear velocity at the COM.
+        This is body-side velocity; moving contact partners must be subtracted
+        separately before treating it as relative slip.
+        """
+        if body not in self._rigids:
+            raise ValueError(f"unknown body: {body}")
+        if np.shape(point_world) != (3,) or not np.isfinite(point_world).all():
+            raise ValueError("contact point must be a finite world-space vector")
+        rigid = self._rigids[body]
+        local_com, _ = rigid.get_coms()
+        position, quaternion = self._world_pose_of(body)
+        com = position + quaternion_to_matrix(quaternion) @ local_com.numpy()[0]
+        linear, angular = rigid.get_velocities()
+        return linear.numpy()[0] + np.cross(angular.numpy()[0], point_world - com)
+
+    def apply_root_wrench(self, force_n: np.ndarray, torque_nm: np.ndarray) -> None:
+        if any(np.shape(v) != (3,) or not np.isfinite(v).all() for v in (force_n, torque_nm)):
+            raise ValueError("root wrench requires finite three-component force and torque")
+        self._rigids[self.plan.root_link].apply_forces_and_torques_at_pos(
+            forces=force_n.reshape(1, 3), torques=torque_nm.reshape(1, 3), local_frame=False
+        )
+
     def _check_length(self, values: Sequence[float]) -> None:
         if len(values) != len(self.dof_names):
             raise ValueError(f"expected {len(self.dof_names)} joint values, got {len(values)}")
@@ -1640,44 +1888,45 @@ class HumanRuntime:
         return array.reshape(1, -1)
 
 
-def joint_values_from_clip(
-    clip: MotionClip, frame: int, plan: HumanRigPlan, *, axis_tolerance_rad: float = 1e-6
-) -> tuple[np.ndarray, float]:
-    """Map one clip frame onto the rig's scalar DOFs.
+def write_display_skin(stage: Any, points: Any, faces: Any) -> int:
+    """Create or update a world-space display mesh, outside the articulation subtree.
 
-    A single-axis revolute joint can only express rotation about its own axis, so a
-    joint rotation whose axis-angle vector is not parallel to that axis cannot be
-    replayed exactly. Instead of silently projecting and pretending the motion was
-    reproduced, this returns the residual magnitude and the caller decides: the
-    shipped configuration is single-axis, and the reference motions are authored
-    axis-aligned, so a non-zero residual means a motion and a rig have drifted apart.
+    The authored ``/World/Human/Skin`` is written once from the rest template and is a
+    rigid child of the pelvis, so during a trial it rides the root while the limbs stay
+    where the rest pose put them: the viewport shows a T-pose body whose feet pop out of
+    the floor as the body tips, and none of that is what physics did. This prim is the
+    picture the recording actually supports -- same vertex order, world coordinates,
+    sibling of the human rather than a child, and the authored skin is hidden in the
+    transient session layer so only one body draws.
 
-    Returns ``(values_rad, residual_rad)`` in plan DOF order.
+    Returns the number of vertices written.
     """
 
-    if not 0 <= frame < clip.frame_count:
-        raise ValueError(f"frame {frame} is outside the clip's {clip.frame_count} frames")
-    values = np.zeros(len(plan.dof_names), dtype=np.float64)
-    worst = 0.0
-    for index, joint in enumerate(plan.joints):
-        if joint.chain_joint not in clip.joint_names:
-            raise ValueError(
-                f"{joint.chain_joint}: the clip does not drive this joint; every plan DOF "
-                "must be present in the reference motion"
-            )
-        vector = np.asarray(clip.rotation_of(frame, joint.chain_joint), dtype=np.float64)
-        axis_index = "xyz".index(joint.axis)
-        component = float(vector[axis_index])
-        values[index] = component
-        residual = np.linalg.norm(np.delete(vector, axis_index))
-        worst = max(worst, float(residual))
-    if worst > axis_tolerance_rad:
+    runtime = pxr_modules()
+    rows = np.asarray(points, dtype=np.float64)
+    triangles = np.asarray(faces, dtype=np.int64)
+    if rows.ndim != 2 or rows.shape[1] != 3:
+        raise ValueError(f"display skin points must be (V, 3), got {rows.shape}")
+    if triangles.ndim != 2 or triangles.shape[1] != 3:
+        raise ValueError(f"display skin faces must be (F, 3), got {triangles.shape}")
+    if triangles.size and int(triangles.max()) >= rows.shape[0]:
         raise ValueError(
-            f"the reference motion rotates a joint about an axis the rig cannot express "
-            f"(residual {math.degrees(worst):.3f} degrees at frame {frame}); projecting it "
-            "would reproduce a different motion than the reference"
+            f"display skin face index runs to {int(triangles.max())} with only "
+            f"{rows.shape[0]} vertices"
         )
-    return values, worst
+    mesh = runtime.UsdGeom.Mesh.Get(stage, DISPLAY_SKIN_PATH)
+    if mesh is None or not mesh.GetPrim().IsValid():
+        mesh = runtime.UsdGeom.Mesh.Define(stage, DISPLAY_SKIN_PATH)
+        mesh.GetSubdivisionSchemeAttr().Set("none")
+        authored = runtime.UsdGeom.Mesh.Get(stage, f"{HUMAN_ROOT_PATH}/Skin")
+        if authored is not None and authored.GetPrim().IsValid():
+            runtime.UsdGeom.Imageable(authored.GetPrim()).CreateVisibilityAttr().Set(
+                runtime.UsdGeom.Tokens.invisible
+            )
+    mesh.GetPointsAttr().Set([runtime.Gf.Vec3f(*row) for row in rows])
+    mesh.GetFaceVertexIndicesAttr().Set([int(value) for row in triangles for value in row])
+    mesh.GetFaceVertexCountsAttr().Set([3] * int(triangles.shape[0]))
+    return int(rows.shape[0])
 
 
 def sample_body_points(

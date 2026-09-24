@@ -1,0 +1,362 @@
+# Validated stationary baseline; original finite torque limits retained.
+human_id: smpl_neutral_standing
+description: 'Static standing baseline: explicit flat sole capsules and finite high-stiffness
+  PD. No root assistance; not a walking controller.'
+skeleton:
+  topology: smpl
+  model_asset: smpl_neutral_v1_1_0
+  allow_procedural_skeleton: true
+  height_m: 1.7
+  mass_kg: 72.0
+  note: height_m and mass_kg are the nominal adult values used for the procedural
+    skeleton. They are replaced by shape coefficients (betas) and the fitted segment
+    masses when the model file is present.
+rig:
+  root_joint: pelvis
+  root_mode: free
+  collider: capsule
+  self_collisions: false
+  contact_offset_m: 0.01
+  rest_offset_m: 0.0
+  linear_damping: 0.02
+  angular_damping: 0.02
+  segments:
+    pelvis:
+      radius_m: 0.135
+      mass_weight: 1.4
+      aim: spine1
+    spine1:
+      radius_m: 0.115
+      mass_weight: 0.9
+    spine2:
+      radius_m: 0.115
+      mass_weight: 0.9
+    spine3:
+      radius_m: 0.11
+      mass_weight: 0.9
+    neck:
+      radius_m: 0.085
+      mass_weight: 0.2
+    head:
+      radius_m: 0.1
+      mass_weight: 0.75
+    left_hip:
+      radius_m: 0.09
+      mass_weight: 0.9
+    right_hip:
+      radius_m: 0.09
+      mass_weight: 0.9
+    left_knee:
+      radius_m: 0.072
+      mass_weight: 0.43
+    right_knee:
+      radius_m: 0.072
+      mass_weight: 0.43
+    left_ankle:
+      radius_m: 0.05
+      mass_weight: 0.13
+    right_ankle:
+      radius_m: 0.05
+      mass_weight: 0.13
+    left_foot:
+      radius_m: 0.045
+      mass_weight: 0.115
+    right_foot:
+      radius_m: 0.045
+      mass_weight: 0.115
+    left_collar:
+      radius_m: 0.058
+      mass_weight: 0.15
+    right_collar:
+      radius_m: 0.058
+      mass_weight: 0.15
+    left_shoulder:
+      radius_m: 0.055
+      mass_weight: 0.24
+    right_shoulder:
+      radius_m: 0.055
+      mass_weight: 0.24
+    left_elbow:
+      radius_m: 0.045
+      mass_weight: 0.17
+    right_elbow:
+      radius_m: 0.045
+      mass_weight: 0.17
+    left_wrist:
+      radius_m: 0.036
+      mass_weight: 0.075
+    right_wrist:
+      radius_m: 0.036
+      mass_weight: 0.075
+    left_hand:
+      radius_m: 0.04
+      mass_weight: 0.055
+    right_hand:
+      radius_m: 0.04
+      mass_weight: 0.055
+  joints:
+    left_hip:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - -120
+        - 30
+      drive:
+        stiffness: 8000
+        damping: 200
+        max_force: 400
+    right_hip:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - -120
+        - 30
+      drive:
+        stiffness: 8000
+        damping: 200
+        max_force: 400
+    left_knee:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - 0
+        - 150
+      drive:
+        stiffness: 6000
+        damping: 150
+        max_force: 300
+    right_knee:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - 0
+        - 150
+      drive:
+        stiffness: 6000
+        damping: 150
+        max_force: 300
+    left_ankle:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - -35
+        - 45
+      drive:
+        stiffness: 3000
+        damping: 75
+        max_force: 150
+    right_ankle:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - -35
+        - 45
+      drive:
+        stiffness: 3000
+        damping: 75
+        max_force: 150
+    spine1:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - -25
+        - 60
+      drive:
+        stiffness: 10000
+        damping: 250
+        max_force: 500
+    spine2:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - -25
+        - 60
+      drive:
+        stiffness: 10000
+        damping: 250
+        max_force: 500
+    spine3:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - -25
+        - 60
+      drive:
+        stiffness: 10000
+        damping: 250
+        max_force: 500
+    neck:
+      dof: revolute
+      rotations:
+      - y
+      limits_deg:
+      - - -40
+        - 50
+      drive:
+        stiffness: 120
+        damping: 12
+        max_force: 120
+    left_shoulder:
+      dof: revolute
+      # Adduction/abduction about the body's forward axis; see the note in
+      # human_smpl_neutral.yaml. The arm only hangs along -Z once adducted, so pitch
+      # about +Y would be a twist about the arm's own axis.
+      rotations:
+      - x
+      limits_deg:
+      - - -120
+        - 75
+      drive:
+        stiffness: 200
+        damping: 20
+        max_force: 200
+    right_shoulder:
+      dof: revolute
+      rotations:
+      - x
+      limits_deg:
+      - - -75
+        - 120
+      drive:
+        stiffness: 200
+        damping: 20
+        max_force: 200
+    left_elbow:
+      dof: revolute
+      rotations:
+      - z
+      limits_deg:
+      - - -145
+        - 10
+      drive:
+        stiffness: 150
+        damping: 15
+        max_force: 150
+    right_elbow:
+      dof: revolute
+      rotations:
+      - z
+      limits_deg:
+      - - -10
+        - 145
+      drive:
+        stiffness: 150
+        damping: 15
+        max_force: 150
+  horizontal_foot_capsules: true
+visualization:
+  default_pose_rad:
+    left_shoulder: -1.8325957145940459
+    right_shoulder: 1.8325957145940459
+    left_elbow: -0.2
+    right_elbow: 0.2
+control:
+  mode: pd
+  warmup_seconds: 0.3
+  tracking_tolerance_deg: 15.0
+  pose_hold_seconds: 0.2
+  max_root_linear_velocity_m_s: 3.0
+  standing_max_drop_m: 0.05
+  standing_max_tilt_deg: 15.0
+  standing_max_drift_m: 0.05
+simulation:
+  physics_dt_s: 0.008333333333333333
+  solver_position_iterations: 16
+  solver_velocity_iterations: 4
+  settle_seconds: 0.6
+  gravity_m_s2: 9.81
+  stabilization_threshold_s: 0.001
+perturbations:
+- id: push_forward
+  kind: force
+  body: pelvis
+  direction:
+  - 1.0
+  - 0.0
+  - 0.0
+  magnitude_n: 220.0
+  start_s: 0.4
+  duration_s: 0.25
+  notes: Push from behind, tipping the figure toward +X (forward).
+- id: push_backward
+  kind: force
+  body: pelvis
+  direction:
+  - -1.0
+  - 0.0
+  - 0.0
+  magnitude_n: 200.0
+  start_s: 0.4
+  duration_s: 0.25
+  notes: Push from the front, tipping the figure toward -X (backward).
+- id: push_right
+  kind: force
+  body: pelvis
+  direction:
+  - 0.0
+  - -1.0
+  - 0.0
+  magnitude_n: 180.0
+  start_s: 0.4
+  duration_s: 0.25
+  notes: Lateral push toward -Y (the figure's right).
+- id: push_left
+  kind: force
+  body: pelvis
+  direction:
+  - 0.0
+  - 1.0
+  - 0.0
+  magnitude_n: 180.0
+  start_s: 0.4
+  duration_s: 0.25
+  notes: Lateral push toward +Y (the figure's left).
+- id: control_loss
+  kind: control_failure
+  body: pelvis
+  start_s: 0.4
+  duration_s: 1.5
+  control_scale: 0.0
+  notes: Joint drives are scaled to zero from start_s, so the body collapses under
+    gravity with no external load. This is the passive-ragdoll baseline.
+- id: none
+  kind: none
+  body: pelvis
+  start_s: 0.0
+  duration_s: 1.0
+  notes: 'Unperturbed control trial: nothing is applied. Included so every trial id
+    resolves to a config entry rather than needing a special case.'
+export:
+  channel_sample_hz: 50.0
+  resample_method: slerp
+  include_contact_forces: true
+  include_surface_points: true
+  surface_points_per_segment: 8
+  surface_point_seed: 20260922
+  group_by:
+  - subject
+  - sequence
+  record_wireless_interval: true
+events:
+  trunk_angle_deg: 60.0
+  trunk_onset_fraction: 0.5
+  pelvis_height_fraction: 0.55
+  min_low_frames: 10
+  max_transition_s: 1.5
+  impact_height_m: 0.25
+  impact_speed_m_s: 1.0
+  settle_window_s: 0.5
+  settle_speed_m_s: 0.15
+  controlled_descent_speed_m_s: 1.2
+  divergence_limit_m: 5.0
+  penetration_limit_m: -0.05
+  recovery_height_fraction: 0.6

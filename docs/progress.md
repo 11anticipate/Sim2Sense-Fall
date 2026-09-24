@@ -1,5 +1,107 @@
 # 阶段进度
 
+本文件保留各轮原始记录；正文中的“当前”“下一步”“仍未做”只对应其日期和配置。
+当前状态与任务统一见 [计划](../task_plan.md)，全部指南与历史审计见 [文档索引](README.md)。
+
+## 2026-09-24 需求收敛与工程文档整理
+
+- 用户确认新增动作只需蹲下、起立、摔倒；不做主动避障，路线由用户键盘控制。
+  起立先按蹲姿到站姿规划；倒地后的地面起身未自动纳入，R 仍明确是传送复位。
+- 新登记用户人工行走反馈：左臂摆动较正常，右臂异常。列为 P0-A，尚未独立复现或修复；
+  计划对照原始 AMASS、循环目标、PhysX 实际肩肘腕和显示，不预设根因或强行镜像。
+- 计划保留碰撞体拟合、支撑脚/滑动、自主平衡、摔倒标签、手动路线接触及性能验收。
+  拳击、坐椅、抓握、搬物和蹲行不属于本轮新增动作；阶段 7 仍未完成。
+- 重写 `task_plan.md` 和人体当前指南；原内容保存在 `docs/history/`，历史审计保留原路径并加日期/替代证据导航。
+- 增加 `docs/README.md`，覆盖根目录、数据目录和全部工程 Markdown；更新 README、架构、键盘、场景、网格、无线契约及 Sionna 入口。
+  撤除现行说明中的 AMASS 缺失、GPU 不可用、Sionna 未接入等旧状态；旧 Sionna dB 结果在原表旁明确标为已撤回。
+- 本轮核对代码/配置与既有报告，没有改源代码、控制参数或动作配置，没有新增 Isaac/GPU 试验；
+  13.787°、9.86 mm、0.751 m/s 等均引用先前键盘实测，不算本轮新结果。
+- 文档校验：25 份工程 Markdown 全部纳入索引；144 个本地链接无缺失，归档后的相对链接已修复。
+  键盘/动作预览/Sionna 的 CLI 帮助与现行指南参数一致；compileall、Ruff、diff check 通过，
+  pytest 为 281 passed / 9 skipped。没有新增 Isaac/场景物理运行，基础回归不代表右臂或动作质量已通过。
+- 迁移补丁首次因同路径多操作被工具拒绝，未产生修改；拆分归档与新建后完成。
+
+## 2026-09-24 键盘交互与实时蒙皮
+
+- 新增 `scripts/humans/keyboard.py`，支持 W/S 前进后退、A/D 转向、空格制动、
+  松键站立、R 复位、Esc 退出。根控制为显式有限外力，普通移动不传送。
+- 物理回调覆盖每个时间步；显示网格预创建、仅更新点坐标，GUI 连续操作及复位正常。
+  自动测试通过实际 Carb 键盘事件队列，1236 步与 1236 回调一致；运行中视口截图已查看。
+- 最终 GUI 跟踪最大误差 13.787° 通过 15° 门槛，前进 1.098 m，制动末段速度 <0.028 m/s。
+  仍有 9.86 mm 皮肤穿地及脚底切向速度 p95=0.751 m/s，整体动作质量不通过。
+- 挡墙对照根最大 Y=2.355 m（墙面 2.49 m），2836 接触报告点，1599 个有 >0.01 Ns 冲量。
+  最大根目标偏离 0.10 m，保留阻挡响应；局部皮肤越墙约 51.2 mm 仍需修正。
+- CPU 281 passed / 9 skipped，compileall、Ruff、diff check 和场景 dry-run 通过。
+- 说明、启动命令、模型/数据/seed/指标及截图见 [键盘控制](keyboard-control.md)。
+  阶段 7 仍未完成，自主平衡和严格接触质量未因键盘接入而自动解决。
+
+## 2026-09-24 AMASS 动作实测复核
+
+- GPU 审批服务 HTTP 503 曾阻塞；用户修改权限后 RTX 4060 实测恢复，已实际运行 Isaac。
+- 修复局部/世界坐标混用、接触路径解码与 pelvis 归属、末端碰撞体缺失、速度目标缺失、限位漏检。
+- 物理基线复现通过，但自由 sit_stand 实测失败，截图确认前栽及头部穿地，不能作为成功动作。
+- 侧向行走 3 s 有限根力辅助试验通过：最大关节误差 8.147°，根位置最大误差 24.52 mm，
+  根姿态最大误差 3.264°，皮肤无穿地，853 个实际地板接触点，根位移约 (0.407,1.981,0.012) m。
+  这是外部力辅助的物理跟踪，非无辅助平衡；根没有逐帧传送。
+- 全长侧行 7.275 s 辅助通过：最大关节误差 8.147°、根位置 24.6 mm、根角 4.382°，
+  最低皮肤 -3.15 mm。全长后退 7.867 s 在出生点 (12,1.455) 辅助通过：10.793°、
+  27.4 mm、3.895°、最低皮肤 -3.70 mm。两者 `unassisted_action_reproduced=false`。
+- 同相机参考/实际截图已查看；挡墙对照实际产生 919 个墙接触点（178 帧），
+  峰值冲量 26.207 Ns，根被阻挡；约 25.2 mm 局部皮肤越过墙表面仍需解决。
+- 自由侧行失败（37.304°、根偏离 2.110 m）；快速拳击失败（33.34°）；
+  蹲行因左膝副轴超限 8.535° 提前拒绝。坐地、支撑切换及自主平衡未验收通过。
+- 最终坐地复测：全长因左髋副轴超限 2.992° 被预检拒绝；可表达的前 3 s
+  仍有 38.434° 最大关节误差、27.95 mm 皮肤穿地，不能作为完成的坐地起立动作。
+- 最终人体 Isaac 基线通过：22 碰撞体、PD 误差 11.462°、无驱动负对照 85°、
+  重力回落 1.0176 m、末段漂移 0.037 mm。CPU 277 passed / 9 skipped，
+  compileall、Ruff、git diff --check 通过。`uv` 的旧代理连接拒绝在清除该命令代理后解除。
+- 场景独立重建 `scene_rebuild/` 并通过 Isaac 复验，动态椅子抬高 0.25 m 后落回，
+  原公寓场景未改写。
+- 产物 `artifacts/amass_audit_20260924/`；完整方法、数据版本、seed、指标、截图与复现命令
+  见 [本轮审计](amass-physics-audit-2026-09-24.md)。阶段 7 仍部分完成。
+
+## 2026-09-23 — 手臂 T-pose 修复与两个可视化缺陷定位
+
+- **根因**：`human_smpl_*.yaml` 把肩和肘都声明成绕 `+Y` 的单轴关节，而 SMPL rest 的手臂指向 `+Y`（侧平举），所以绕 `Y` 转是**绕手臂自身轴的扭转**。实测肩绕 `Y` 转 90° 只把手腕移动 **0.034 m**，绕 `X` 才移动 **0.536 m**。2026-09-22 记录的"配置驱动肩下垂修复 T-pose"因此是一个静默空操作：`default_pose_rad` 的 ±π/2 从来没有把手臂放下来过。
+- **改法**：肩轴 `y→x`（内收/外展，限位左 `[-120,75]`、右 `[-75,120]`），肘轴 `y→z`（左 `[-145,10]`、右 `[-10,145]`）。下垂角实测为左 **−105°** / 右 **+105°**（腕到髋 0.067 m，含自然外展角；−90° 时是 0.130 m）。
+- **中性姿态只声明一次**：新增 `rig.apply_neutral_pose(clip, plan, neutral_rad)`，把 `visualization.default_pose_rad` 作为参考动作的基线加进对应轴槽位，`build_reference` 在重采样前应用。理由：程序化骨架的 rest 手臂已下垂、SMPL 资产的 rest 是 T-pose，若把 ∓105° 烤进每个动作文件，同一段动作在两种骨架下含义相反，且 rest 一变就全体过期。角度写入会校验关节限位，越界直接报错。
+- **实测结果**：站立参考残差 **0.000000°**（单轴 rig 完全能表达新参考）；记录网格的站立横向半跨度 **91.3 cm → 22.3 cm**。Isaac 两条试验仍全通过：站立 drop 1.26 mm / tilt 4.55° / drift 6.71 mm，`push_backward` 仍判 `fall`（撞击 0.93 s、末姿 0.31 m），且最低体表点由 −0.0321 m 改善到 **−0.0167 m**（手臂不再扫地板）。跟踪误差 0.827° / 13.743°，容限 15°。
+- **顺带清掉的动作**：`walk_in_place` 原有的左右肩反相正弦通道（绕 `Y`、幅值 18°）被删除——它是绕臂轴扭转，视觉上什么都不做；`reach_then_topple` 重写为"手臂抬离躯干 + 屈肘"，并在 notes 里写明它**不是**前伸，因为该 rig 没有肩屈曲自由度。
+- **发现一：GUI 从来没显示过真实姿态。** `build_human_stage` 只在建模时用静止模板写过一次 `/World/Human/Skin`，试验循环从不更新它；该 prim 是骨盆的刚性子节点，所以视口里人体会跟着骨盆倾倒但四肢不动，手部还会看起来"脱落"。逐帧蒙皮只写进记录数组，不写进 stage——**证据和画面来自两条不同的代码路径**。
+- **发现二：直接逐帧写 stage 皮肤会打断物理。** 试过在 `execute_trial` 每步写 6890 个顶点（先世界坐标→人体偏移出画，再改骨盆局部坐标→正确），第二条试验在 `runtime.joint_positions_rad()` 处抛 `AssertionError: Instance's physics tensor entity is not valid`，`[FAIL] trials completed without error`。逐帧 stage 写会作废 PhysX tensor 视图。该实现已完整回滚（含 `HumanRuntime.set_display_skin`），当前树恢复绿色；视口姿态显示需要另找路径（每 `app.update()` 而非每物理步写、或试验结束后单独回放捕获）。
+- 验证：`python3 -m pytest -q` = **249 passed / 9 skipped**（新增 `test_neutral_pose_offsets_deviations_without_choosing_a_rest_pose`），`ruff check .` 通过，`compileall` 干净，Isaac headless 两条试验 PASSED。姿态对比图见 `artifacts/review_20260923/gui_20260923/pose_before_after.png`。
+- `simulate.py` 新增 `--hold-seconds`（配合 `--gui`，`-1` = 关窗前一直显示）：报告打完就 `app.close()`，人眼看不到刚跑完的跌倒。实测单条试验无 hold 在 `[34.0s]` 关闭、`--hold-seconds 8` 在 `[43.1s]` 关闭，退出码 0。`view_amass.py` 的 GUI 分支本来就有 `while app.is_running()`，不需要该开关。
+- **仍未修**：试验视口只显示建模时写死一次的静止模板（四肢不动）。`view_amass.py --motion stand_neutral --capture-dir` 能看到真实垂臂姿态，因为它每帧写皮肤；两条路径的差别已记录在案。
+- **上一条已修（同日追加）**：视口现在能看到真实姿态。做法是 **物理结束后回放**，不是物理循环中写入：
+  - `usd_human.write_display_skin(stage, points, faces)` 在 `/World/DisplaySkin` 建一个**世界坐标、articulation 子树之外**的显示网格，并在会话层隐藏建模时写死的那个 `/World/Human/Skin`（非破坏式，与去顶同一策略）。
+  - `simulate.py play_back_trial()` 在 `finally` 里把最后一条已完成试验的 `mesh_vertices_xyz` 按记录时钟（`PLAYBACK_FPS = 20`，`time.sleep` 追时钟）回放，然后才 `--hold-seconds`。
+  - **为什么不逐帧写**：实测归因修正过一次。headless + 每帧写 + reset 全通过；GUI + 每帧写 + reset 会在下一条试验的 `joint_positions_rad()` 抛 `Instance's physics tensor entity is not valid`；而**完全不写、只做 6 次 reset** 又全部通过。所以触发条件是"GUI 下每帧改 stage"，不是 reset 本身，也不是写入本身。回放路径在物理停止后才碰 stage，从根上避开这个组合。
+  - 实测：GUI 双试验 `human simulate: PASSED` + `replayed 101 recorded frames`，无张量失效；截图 `artifacts/review_20260923/gui_20260923/isaac_playback_final_pose.png` 显示人体**仰卧于地板上、双臂垂放**，Stage 面板里 `DisplaySkin` 存在，此前"手部脱落/四肢冻结"的现象消失。
+
+
+## 2026-09-23 — AMASS 整机基修复、批量容错与筛选口径统一
+
+- **缺陷**：`retarget_amass_clip` 用 `up_axis_conversion("y","z")` 搬运 AMASS 的关节旋转，该基只保证 up 不变、表达不了偏航，把人体的左右轴放到了管线的前向轴上。这正是 `docs/mesh-orientation-defect.md` 记录过、网格路径已用 `body_frame_conversion` 修掉的同一类错误，AMASS 路径当时漏改。
+- **实测证据**：修复前髋/膝/踝/脊柱的屈伸能量落在管线 `x`（中位 15–19°），与 rig 声明的 `y` 完全错位；改用 `AMASS_BODY_FRAME = up=y, forward=z, left=x` 后同样的屈伸落到 `y`（膝 19.0°/19.3° 左右对称）。关节槽位映射另做独立确认：AMASS `poses` 第 10、11 槽在 40/40 条抽样序列中恒为零，正是 SMPL 两个叶子 foot 关节的特征，说明槽位 `k` 就是项目拓扑的第 `k` 个关节，不存在重排序。
+- **改动**：`motion.py` 新增公开 `BodyFrame` 与 `AMASS_BODY_FRAME`（含推导依据），`retarget_amass_clip` 改收整机基并删除 `source_up_axis`/`target_up_axis` 两个错误默认旋钮；`import_amass.py` 增加资产交叉校验，模板实测帧与 AMASS 假定帧不一致时直接失败。
+- **批量容错**：`load_amass_library` 原来遇到第一条不合格序列就抛错，实测 `amass__01_05_poses` 一处 122.8° 跳变即让 2198 条的筛查整体失败。现返回 `AmassLibraryLoad(clips, failures)`，逐文件跳过并记录原因，仅在全库无一条可读时报错。
+- **筛选口径**：`screen_amass_clip` 原来自带 25° 阈值，而运行期 `joint_values_from_clip` 用 1e-6 rad 直接抛错，两条规则互相矛盾，且投影逻辑重复三处。现在筛选直接调用运行期那条规则（`joint_values_from_clip` / 新抽出的 `axis_residuals`），并把"是不是跌倒"和"rig 能不能表达"拆成 `fall_candidate` 与 `rig_expressible` 两个字段分别上报，拒绝原因点名卡住的关节。
+- **真实数据结果**（`--limit 120`）：120 文件读取、1 条不可读被记录、119 条完成筛查，**28 条跌倒候选**（修复前该数字被合并进"off-axis 超限"而显示为 0），其中 **0 条可被当前单轴 rig 表达**；28 条的卡点全部在上肢（肘 23、肩 5）。
+- **下一阶段的硬事实**：把肘改成 `['y','z']`、肩改成 `['x','y','z']`（planner 已支持多轴链，实测 DOF 从 14 增至 20）后候选仍是 0/28。原因是 `axis_residuals` 对同一根关节的每个 DOF 都独立读取同一个原始 axis-angle 向量，只排除自己那一轴，因此第二个 DOF 永远不会降低第一个 DOF 的残差；同理，多轴关节的驱动分量只在角度很小时才近似有效。也就是说**多轴链在 planner 里已经实现，但 clip→DOF 映射器没有多轴分解**，这是 AMASS 接入的真实剩余工作量。
+- 验证：`python3 -m pytest -q` = **248 passed / 8 skipped**，`ruff check .` 全部通过，`compileall` 干净；`scripts/humans/plan.py` 与 `simulate.py --dry-run --all`（54/54 标签）均 PASSED。本轮只动 CPU 路径，未重跑 Isaac/Sionna。
+
+### 追加：Isaac 实跑复核、GUI 看不到人体（有屋顶）与两处使用陷阱
+
+- **物理零回归确认**：用 `~/isaacsim/python.sh scripts/humans/simulate.py --config configs/humans/human_smpl_stable.yaml --motions configs/humans/standing_validation.yaml --trial stand_neutral:none --trial stand_neutral:push_backward` 复跑，label、tracking 0.776/16.931°、`config_sha256`、`scene_sha256`、`motion_sha256` 与 `artifacts/review_20260923/final_physics` 归档**逐项一致**；同一条命令连跑两次结果逐位相同，说明该试验在当前环境内是确定性的。
+- **陷阱一（我自己先踩的）**：`stand_neutral` 在默认 `motions.yaml` 里是 **1.0 s**，在 `standing_validation.yaml` 里才是 **5.0 s**。用默认值时推搡后只剩 0.6 s 窗口，人被诚实判成 `no_fall / partial topple`，看起来像物理回归，实际是参数不一致。`motion_sha256` 覆盖编译后的 clip，所以换动作库一定会变哈希——这一点应优先于"结果变了"的猜测去核对。
+- **陷阱二（用户复现时暴露）**：`simulate.py --gui` 从不调用去顶视角，公寓是封闭的，视口只能看到屋顶，而试验照样报 PASSED。`view_amass.py`、`build.py`、`scripts/scenes/view.py` 三处各自重复"配置相机 + 把视口指过去"，`simulate.py` 是漏掉的那一处。
+- **修复**：`scenes/view.py` 新增 `apply_inspection_view(stage, mode, aspect_ratio, require_viewport)`，把"作者相机"和"选中相机"绑成一个动作；`simulate.py` 新增 `--view {human,top,roofless,exterior}`（默认 `human`，仅 `--gui` 时生效）并调用该 helper；三处重复实现全部收敛到它。此前 `configure_inspection_view` 的返回值在个别调用点被丢弃，正是"截图成功但画面里没有人体"的成因。
+- 验证（真 Isaac 解释器 + bundled OpenUSD 实测）：相机路径 `/InspectionCamera`、屋顶 `invisible`、屋顶**仍是碰撞体**、源图层字节未变、视锥覆盖人体 z=0/1/2 三点；headless 下 `get_active_viewport()` 仍返回对象，所以 `require_viewport=True` 只在完全没有 Kit 的解释器里抛错，GUI 入口才使用它。`python3 -m pytest -q` = **248 passed / 9 skipped**（新增 1 项需 pxr，在 CPU 解释器下跳过，已在 bundled USD 内手工验过同等断言），`ruff check .` 通过。
+- 捕获相机改为逐帧跟随人体（原来只在第 0 帧取景，位移较大的动作会走出画面而捕获仍报成功）。
+- **新发现的独立缺陷（尚未修）**：AMASS 预览没有竖直锚定。`normalize_root_motion` 只锚首帧平移与朝向，根高度直接取序列值；实测 `CMU/01/01_02` 源 `trans` 的 up 分量跨度 **4.01 m**、首帧 **-0.211 m**，回放到第 2896/4345 帧时骨盆已在 **+2.30 / +2.84 m**，第 1448 帧在 **-0.66 m**，所以画面里看不到人不是相机没跟上，而是人体在天花板上方或地板下方。该竖直漂移在旧 `up_axis_conversion` 与新整机基下完全相同（两者都把源 Y 映射到管线 Z），**不是本轮帧基修复引入的**。
+- **对筛选结论的影响**：`screen_amass_clip` 的 `root_drop_m` 与 `peak_down_speed_m_s` 用的就是这个会漂的根高度，因此"120 条抽样得 28 条跌倒候选"只能作为**上界**，不能当作已验证的候选数；候选判定需要改成以地面/最低体表点为参考，而不是以序列根高度为参考。
+
+
 ## 2026-09-22 — Transitions 录屏动作表现复核
 
 - 复核用户提供的 `/home/gsh/Videos/Screencasts/Screencast from 2026-09-22 23-30-10.mp4`（约 7.05 s）：画面从站立开始，中段下坐并后仰、腿部抬起，后段恢复站立。
@@ -418,6 +520,25 @@
 「没碰到东西」混为一谈，一次异常就能把整段接触历史抹成空而所有检查仍报 PASS。现在：
 逐帧中途失效 → 抛错拒绝出结果；稳定期可读但归因不到连杆 → 抛错；稳定期确实零接触 → 单独报错。
 
+> **2026-09-23 追加：把「请求坏视图」这件事本身也修掉了。** P0-2 第一步曾把
+> `simulate.py` / `verify.py` 的 `enable_contact_views` 打开成 `True`（理由是「必要但不充分」）。
+> 实测这个请求有代价、无收益：只要请求，`omni.physics.tensors` 就为**每条过滤路径**打一条
+> `[Error]`，同一场景单次运行共 **4,368 行**；更关键的是致命的一步发生在事件回调里——
+> `RigidPrim._on_physics_ready` 由 `SimulationManager` 以 weakref proxy **异步派生**，
+> 其中 `PhysxRigidContactView.check()` 解引用空 `_backend` 抛出的 `AttributeError`
+> （`'NoneType' object has no attribute 'check'`）**不经过脚本里任何 try/except**，直接进
+> app 的 stderr；时间线停止后 physics-ready 会再触发一次，所以 `--gui --hold-seconds -1`
+> 按中断时看到的那一屏正是它。两个入口现改为 `enable_contact_views=False`，`HumanRuntime`
+> 新增 `contact_tensor_view_reason`，把「没请求」与「请求了但坏了」「没有可请求的对象」
+> 分成三种事实记录。
+>
+> 真机对照（`/tmp/probe_contact_views.py`，同一 stage 各跑一次，两个方向都跑通）：
+> 请求 → **4,368 行 `[Error]`**；不请求 → **0 行 `[Error]`**，`[Warning]` 只剩显卡/手柄等
+> 环境噪音。端到端复跑用户原命令（去 GUI）
+> `simulate.py --trial stand_neutral:none --trial stand_neutral:push_backward` 全 PASS：
+> 接触 20 对、归因 `left_ankle/right_ankle`、每试 601 帧接触历史照旧
+> （`push_backward` 覆盖 9 个身体段），`contact_source=physx_contact_report` 不变。
+
 ### 新发现并修复：支撑面高度被 bbox API 静默算错
 
 `contact_is_support` 依赖「支撑面高度」标量，这条链路连踩三层：
@@ -733,3 +854,68 @@ torch 2.11.0+cu130、CUDA 可用（RTX 4060）。`verify_sionna.py` 全通过。
 - Sionna 场景用的是**内置 `floor_wall`**，不是本项目的公寓（公寓→Sionna 是另一件事）。
 - 人体几何是 `kinematic_replay`，传播是真的 Sionna RT —— 信道是非物理轨迹的函数。
 - 12 帧、max_depth=4 是**导入验证**，不是数据集生成。
+
+
+## 2026-09-23 独立复审（进行中）
+
+- 起点 6084df8，原总结只到 c6761de，工作树已有审计文档修改，已保留。
+- 原 238 passed / 8 skipped 已复现。发现 Sionna 丢弃虚部、逐帧改变时延网格、按文件名标 fall、未保存完整 ChannelSample 元数据；原 dB 数值撤回。
+- 已实现复数 sinc CIR / 固定绝对时延网格 / 等间隔源帧 / 显式 seed / 轨迹标签 / 完整 provenance。公寓 231 个几何部件转换通过 CPU，GPU 实际求得 60–89 条路径（5 帧试验）。
+- IFAC/Gabriel 来源已核对并写入 docs/human-em-material.md，Muscle 3.5 GHz 参数更正为 εr=51.44423，σ=2.55752 S/m。
+- 稳定期改为真实积分而非位置写入；无辅助站立仍在诊断，几种 PD/足部几何实验失败，失败产物保存在 artifacts/review_20260923，未标成成功。
+- 环境：沙箱 GPU 不可见，提权后 RTX 4060 可用；默认网络代理 127.0.0.1:7897 不监听，直连公开来源成功；uv snap 报 DBus Process 2 is a kernel thread，改用已有 /home/gsh/.local/bin/ruff。
+
+## 2026-09-23 本轮完成状态（取代上方“进行中”）
+
+- 完整复核与复现命令见 [verification-2026-09-23.md](verification-2026-09-23.md)。
+- 静态站立：5秒、无根支撑；下降1.195 mm、漂移7.593 mm、倾角4.668°、关节误差0.776°。新 stable 配置保留有限力矩，足部使用显式平足胶囊近似。
+- 后推物理跌倒：0.833 s失稳、0.933 s撞击代理，最低网格点−32.1 mm，通过既有−50 mm门槛；非零穿透如实记录。站立/后推最终两项均usable。
+- 公寓231个几何部件 + 实际后推人体 → 11帧复数CIR，在Sionna CUDA实跑通过；相对无人非相干增益约−11.74..−0.013 dB，旧数值撤回。
+- 材质来源已核对；相机最终四帧已目视确认；AMASS真实2198条树已切片，3条CMU导入通过。
+- 最终门禁：compileall/ruff/diff通过，pytest 246 passed / 8 skipped，bundled USD 9 passed，scene/human Isaac验收通过。
+- 未完成：自然行走/恢复、前推及控制失效穿地、动态家具传播同步、人体EM测量校准、50Hz数据集和检测模型。当前是单场景两类状态的smoke，不是完整研究系统。
+- 产物：artifacts/review_20260923/final_physics、final_physics_channel、captures_final、verification_summary.json。大文件保留在忽略目录，未提交/推送。
+
+## 2026-09-24 app.update() 时序缺陷实测与修复（Fix B）
+
+- **实测**：`scripts/humans/probe_loop_timing.py`（自由落体正对照）在本 build
+  （Isaac Sim 6.0.1-rc.7，python kit）上测得一次 `app.update()` 推进**固定 1/60 s
+  物理时间**（dt=1/120 s 时每 update 2 步；60 updates = 120 步 = 1.0 s，球落
+  4.946 m ≈ ½g·1.0²）。与 `omni.kit.loop-isaac` 开关无关（两模式逐字节一致），向
+  python kit 注入 GUI kit 的 `--/app/runLoops/main/manualModeEnabled=true` 与
+  `rateLimitEnabled=false` 也无效（参数确实传到 kit 命令行，行为不变）。日志：
+  `artifacts/humans/probe_loop_baseline.log`、`probe_loop_enabled.log`、
+  `probe_loop_manual.log`。
+- **确定性步进器**：`SimulationManager.step(steps=n, update_fabric=False)` 恰好推进
+  n 步且时钟与自由落体吻合（60 步 = 0.5 s，球落 1.247 m vs 期望 1.226 m）。
+  注意两个新的静默原生崩溃源：`update_fabric=True` 与 `timeline.set_play_speed(0.5)`
+  —— 均 exit 0、无 traceback（`probe_loop_halfspeed.log`）。
+- **修复**：`scripts/humans/common.py::step_physics(steps)` 封装 manager.step 并读回
+  步数计数断言（步进器静默失败会显式 RuntimeError）。verify.py 的 `hold()` 与
+  rest-sample 窗口、simulate.py 的 settle 窗口与逐帧试验循环全部换用；
+  `app.update()` 只保留在注册/视口/回放位置。`GRAVITY_SETTLE_SECONDS` 3.0→6.0
+  （旧标定在 2× 时序下完成，实际物理时长 6 s；换算保真）。
+- **复验**：`artifacts/humans/verify_multiaxis_stepper.log` 全绿 37 PASS / 0 FAIL。
+  重力正对照：pelvis 自 1.2381 m 下降 1.1031 m，末段 200 ms 蠕动 0.085 mm
+  （门槛 5 mm）；PD 跟踪最大误差 11.512°<15°；沉降后最低点 −0.0000 m 无穿地。
+- `src/sim2sense_fall/scenes/usd.py::step_simulation` 的 docstring 已改为记录实测
+  事实（每 update 固定 1/60 s）；scenes 侧秒数窗口仍是旧标定，使用前需重测。
+- CPU 门禁：compileall 通过、ruff 全过、pytest **269 passed / 9 skipped**。
+
+## 2026-09-24 AMASS 根运动锚定缺陷与修复（Fix A）
+
+- **实测**：失败试验 `trials_multiaxis_amass.log` 的 −5.0 m pelvis 是两个缺陷叠加：
+  (1) `simulate.py` 把采集坐标系 `root_translation[0]` 直接当公寓世界位姿，clip
+  10_05 的 pinned xy=(11.211, −0.683) 不在任何房间 → 身体坠入虚空；(2) settle 窗口
+  在 2× 时序下实际 1.2 s，自由落体足够坠到 −5.0 m。
+- **修复**：`simulate.py:main` 筛选循环先 `normalize_root_motion`（与
+  `view_amass.py:181` 一致）再 screen，试验共享同一锚定坐标系。
+- **CPU 筛选对照**（57 DOF 多轴 rig，`/tmp/amass_subset` 前 12 条，归一化后）：
+  12/12 `rig_expressible=True`（残差 0.000 rad），**3 条 accepted 跌倒候选**：
+  `135_02`（trunk 172.7°，drop 0.120 m）、`17_01`（177.6°，0.199 m）、
+  `22_03`（63.1°，0.778 m）。10_05 归一化后 fall=True→False：raw 的候选是被采集
+  全局朝向（整段倾斜）抬出来的假象；归一化后「第 0 帧直立」更符合「从站立跌倒」
+  的试验语义。
+- **Isaac 物理试验**（`--amass-root /tmp/amass_subset --amass-limit 12
+  --amass-fall-only`，多轴 rig，headless）：结果见
+  `artifacts/humans/trials_amass_anchored.log` 与 `artifacts/humans/trials_amass_anchored/`。

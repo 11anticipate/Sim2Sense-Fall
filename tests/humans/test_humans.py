@@ -69,6 +69,7 @@ from sim2sense_fall.humans.mesh_sequence import (
     pose_capsule_proxy_mesh,
 )
 from sim2sense_fall.humans.motion import (
+    AMASS_BODY_FRAME,
     FRAME_SOURCE_AMASS,
     MAX_FRAME_DELTA_RAD,
     MotionProvenance,
@@ -79,6 +80,8 @@ from sim2sense_fall.humans.motion import (
     up_axis_conversion,
 )
 from sim2sense_fall.humans.rig import (
+    apply_neutral_pose,
+    authors_deviations,
     forward_kinematics,
     plan_human_rig,
     pose_surface_points,
@@ -690,10 +693,18 @@ def test_amass_retargeting_maps_the_body_block_and_records_what_it_dropped():
     )
     clip = retarget_amass_clip(poses, trans, clip_id="amass_walk", fps=120.0, provenance=provenance)
     assert clip.joint_count == 24
-    # Root rotation and root translation are converted from Y-up to Z-up.
-    basis = up_axis_conversion("y", "z")
-    assert np.allclose(clip.root_rotation[0], basis @ poses[0, :3], atol=1e-12)
-    assert np.allclose(clip.root_translation[0], basis @ trans[0], atol=1e-12)
+    # The model-local basis differs from the Z-up capture world. Only local
+    # joint rotations are conjugated; the root maps between the two frames.
+    basis = AMASS_BODY_FRAME.basis()
+    assert np.allclose(basis @ np.array([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0])
+    assert np.allclose(basis @ np.array([0.0, 0.0, 1.0]), [1.0, 0.0, 0.0])
+    assert np.allclose(basis @ np.array([0.0, 1.0, 0.0]), [0.0, 0.0, 1.0])
+    assert np.allclose(
+        axis_angle_to_matrix(clip.root_rotation[0]),
+        axis_angle_to_matrix(poses[0, :3]) @ basis.T,
+        atol=1e-12,
+    )
+    assert np.allclose(clip.root_translation, trans, atol=1e-12)
     # Joint 0 carries no local rotation: the root orientation is the global one.
     assert np.allclose(clip.joint_rotations[:, 0, :], 0.0)
     # SMPL hand joints have no SMPL-H counterpart and stay at rest.
@@ -875,7 +886,7 @@ def test_forward_kinematics_joint_sign_semantics(plan, config):
         ("left_knee", 60.0, "left_ankle", 0, -1.0, "knee flexion sweeps the shank backward"),
         ("left_hip", -60.0, "left_knee", 0, 1.0, "hip flexion swings the thigh forward"),
         ("spine1", 60.0, "neck", 0, 1.0, "spine flexion tips the trunk forward"),
-        ("left_shoulder", -60.0, "left_elbow", 0, 1.0, "shoulder flexion swings the arm forward"),
+        ("left_shoulder", -60.0, "left_elbow", 1, -1.0, "shoulder adduction sweeps the arm inward"),
         ("left_elbow", -60.0, "left_wrist", 0, 1.0, "elbow flexion brings the hand forward"),
         ("left_ankle", 30.0, "left_foot", 2, -1.0, "ankle plantarflexion drives the foot down"),
     )
@@ -893,6 +904,82 @@ def test_forward_kinematics_joint_sign_semantics(plan, config):
     left = delta("left_knee", 45.0, "left_ankle")
     right = delta("right_knee", 45.0, "right_ankle")
     assert np.allclose(left, right, atol=1e-9)
+
+    # The arms are a mirror, not a copy: the same signed angle sweeps one inward and
+    # the other inward the other way, so the two agree only after the lateral flips.
+    left_arm = delta("left_shoulder", -60.0, "left_elbow")
+    right_arm = delta("right_shoulder", 60.0, "right_elbow")
+    assert np.allclose(left_arm * np.array([1.0, -1.0, 1.0]), right_arm, atol=1e-3)
+
+
+def test_neutral_pose_offsets_deviations_without_choosing_a_rest_pose(plan, config):
+    """A clip authors movement from the body's neutral pose, not from the file's rest.
+
+    The released SMPL template rests in a T-pose and the procedural skeleton rests with
+    the arms hanging, so a zero-pose clip means two different bodies unless one declared
+    neutral is added. That angle belongs in the human config, once -- not copy-pasted
+    into every motion file, where it would go stale the next time the rest changes.
+    """
+
+    neutral = config.visualization.pose_dict()
+    zero = compile_scripted_clip(
+        {
+            "id": "zero",
+            "fps": 60.0,
+            "generator": "keyframes",
+            "duration_s": 1.0,
+            "phase": "standing",
+            "tags": [],
+            "notes": "",
+        },
+        topology=config.topology,
+    )
+    posed = apply_neutral_pose(zero, plan, neutral)
+    for name, value in neutral.items():
+        joint = next(item for item in plan.joints if item.name == name)
+        slot = "xyz".index(joint.axis)
+        index = posed.joint_index(joint.chain_joint)
+        assert np.allclose(
+            posed.joint_rotations[:, index, slot], value
+        ), f"{name}: neutral angle was not added to its own axis slot"
+        # Every other slot stays exactly where the clip put it: the offset must not be
+        # able to author off-axis rotation the single-axis rig cannot express.
+        others = np.delete(posed.joint_rotations[:, index, :], slot, axis=1)
+        assert np.allclose(others, 0.0), f"{name}: the offset leaked into another axis"
+
+    # A deviation authored on top of the neutral composes, rather than replacing it.
+    lifted = apply_neutral_pose(
+        zero, plan, {**neutral, "left_shoulder": neutral["left_shoulder"] + 0.4}
+    )
+    index = lifted.joint_index("left_shoulder")
+    assert np.allclose(lifted.joint_rotations[:, index, 0], neutral["left_shoulder"] + 0.4)
+
+    with pytest.raises(ValueError, match="not a DOF"):
+        apply_neutral_pose(zero, plan, {"left_foot": 0.1})
+    # +105 deg of left adduction is outside the authored [-120, 75] range: an offset that
+    # silently exceeds the joint limit would be a target the controller can never reach.
+    with pytest.raises(ValueError, match="outside the authored limits"):
+        apply_neutral_pose(zero, plan, {"left_shoulder": math.radians(105.0)})
+
+    # Only deviation-authored clips get the offset. AMASS local rotations are absolute
+    # against the model's T-pose rest, so the arm-down adduction is already in the data
+    # and adding the neutral again would fold the arms through the body.
+    from dataclasses import replace
+
+    assert authors_deviations(zero)
+    amass = replace(
+        zero,
+        provenance=MotionProvenance(
+            kind=FRAME_SOURCE_AMASS,
+            source_id="amass",
+            subject="Subject1",
+            sequence="01/01_01",
+            representation="smplh_52",
+            license="non-commercial research",
+            license_url="https://example.invalid",
+        ),
+    )
+    assert not authors_deviations(amass)
 
 
 def test_forward_kinematics_is_root_relative_and_rigid(plan):
@@ -1545,8 +1632,12 @@ def test_shipped_config_loads_and_is_self_consistent(config):
 
 def test_display_pose_is_configured_in_radian_limits(config):
     pose = config.visualization.pose_dict()
-    assert pose["left_shoulder"] == pytest.approx(np.pi / 2)
-    assert pose["right_shoulder"] == pytest.approx(-np.pi / 2)
+    # Arms at the sides, matching the standing reference rather than the model's
+    # T-pose rest: +pi/2 here used to be a twist about the arm and changed nothing.
+    assert pose["left_shoulder"] == pytest.approx(math.radians(-105.0))
+    assert pose["right_shoulder"] == pytest.approx(math.radians(105.0))
+    assert pose["left_elbow"] == pytest.approx(-0.2)
+    assert pose["right_elbow"] == pytest.approx(0.2)
     payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     payload["visualization"]["default_pose_rad"]["left_shoulder"] = 3.0
     with pytest.raises(ValueError, match="outside"):
@@ -2475,6 +2566,69 @@ def test_segment_in_volumes_names_the_containing_limb() -> None:
     assert _segment_in_volumes((0.0, 0.0, 5.0), volumes) is None
     # An empty body has no limbs to attribute to.
     assert _segment_in_volumes((0.0, 0.0, 0.0), {}) is None
+
+
+def test_capsule_world_volume_tracks_the_link_pose() -> None:
+    """Composed volumes must move and rotate with the link they hang from.
+
+    This composition is what keeps contact volumes on the body once USD-stage
+    world reads go stale (the measured frame-2298 attribution escape), so both
+    the placement and the orientation of the offset matter: a convention mixup
+    would hang every capsule at a mirrored or swapped position and silently
+    misattribute contacts. The last block closes the loop with the rig's own
+    containment rule -- containment must be pose-invariant.
+    """
+
+    from sim2sense_fall.humans.rotations import quaternion_to_matrix
+    from sim2sense_fall.humans.usd_human import (
+        _capsule_world_volume,
+        _point_in_capsule,
+    )
+
+    geometry = ((0.1, -0.2, 0.3), 0.05, (0.0, 0.0, 0.25))
+
+    # Identity pose: the world volume is the authored offset translated as-is.
+    centre, radius, axis_half = _capsule_world_volume(
+        np.eye(3), np.array([1.0, 2.0, 3.0]), geometry
+    )
+    assert centre == pytest.approx((1.1, 1.8, 3.3))
+    assert radius == pytest.approx(0.05)
+    assert axis_half == pytest.approx((0.0, 0.0, 0.25))
+
+    # A 90-degree yaw carries the offset with the link: local +X becomes world +Y.
+    yaw_quarter = quaternion_to_matrix(
+        (math.cos(math.pi / 4.0), 0.0, 0.0, math.sin(math.pi / 4.0))
+    )
+    centre, _, _ = _capsule_world_volume(
+        yaw_quarter, np.zeros(3), ((0.4, 0.0, 0.0), 0.05, (0.0, 0.0, 0.25))
+    )
+    assert centre == pytest.approx((0.0, 0.4, 0.0))
+
+    # A +90-degree rotation about Y maps local +Z onto world +X: the capsule's
+    # half-axis vector must rotate with it, not stay world-upright.
+    tilt = quaternion_to_matrix((math.cos(math.pi / 4.0), 0.0, math.sin(math.pi / 4.0), 0.0))
+    _, _, axis_half = _capsule_world_volume(
+        tilt, np.array([0.0, 0.0, 0.5]), ((0.0, 0.0, 0.0), 0.05, (0.0, 0.0, 0.25))
+    )
+    assert axis_half[0] == pytest.approx(0.25)
+    assert axis_half[2] == pytest.approx(0.0, abs=1e-12)
+
+    # Round trip with an arbitrary unit quaternion pose: a point inside the
+    # authored capsule stays inside the composed world volume, and a far point
+    # stays outside, under the same containment rule attribution uses.
+    arbitrary_rotation = quaternion_to_matrix((0.8, 0.2, -0.4, 0.4))  # already unit
+    translation = np.array([12.5, -3.0, 0.4])
+    centre, radius, axis_half = _capsule_world_volume(
+        arbitrary_rotation, translation, geometry
+    )
+    inside = tuple(
+        arbitrary_rotation @ np.asarray((0.12, -0.21, 0.40), dtype=np.float64) + translation
+    )
+    assert _point_in_capsule(inside, centre, radius, axis_half)
+    outside = tuple(
+        arbitrary_rotation @ np.asarray((2.0, -0.2, 0.3), dtype=np.float64) + translation
+    )
+    assert not _point_in_capsule(outside, centre, radius, axis_half)
 
 
 def test_world_box_max_z_maps_every_corner_not_just_the_local_maximum() -> None:
