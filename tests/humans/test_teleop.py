@@ -68,7 +68,10 @@ def test_blocked_root_target_does_not_wind_up_and_release_stops():
         target = ctrl.advance((1.0, 1.0), 1 / 120, actual, 0.0)
         assert np.linalg.norm(target.position[:2] - actual[:2]) <= 0.100001
         assert abs(ctrl.heading) <= np.deg2rad(15.0001)
-        assert np.abs(target.joints - previous).max() <= 4.0 / 120 + 1e-10
+        assert (
+            np.abs(target.joints - previous).max()
+            <= ctrl.config.max_joint_speed_rad_s / 120 + 1e-10
+        )
         previous = target.joints
     for _ in range(240):
         target = ctrl.advance((0.0, 0.0), 1 / 120, actual, 0.0)

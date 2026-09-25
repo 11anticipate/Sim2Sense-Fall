@@ -76,7 +76,7 @@ def build_plan(settings: dict[str, Any]) -> Any:
     mesh = fit_mesh_to_rest_joints(mesh, np.asarray(plan.rest_joint_positions))
     if settings.get("collision_fit", {}).get("enabled", False):
         plan, _audit = fit_collision_capsules(
-            plan, mesh, margin_m=settings["collision_fit"]["margin_m"]
+            plan, mesh, **{k: v for k, v in settings["collision_fit"].items() if k != "enabled"}
         )
     return plan
 

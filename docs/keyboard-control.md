@@ -1,6 +1,12 @@
 # 键盘控制与实时物理显示
 
-维护日期：2026-09-24。[文档索引](README.md) · [当前计划](../task_plan.md)。
+维护日期：2026-09-25。[文档索引](README.md) · [当前计划](../task_plan.md)。
+
+足部碰撞现用 SMPL 足部表面凸包，替换会先于皮肤触地的包围盒。质量门改为逐动作检查，
+滑步控制现采用世界坐标足部位姿规划：支撑脚保持位置/朝向，摆动脚先抬起再移动，
+停车和反向单独预测落点。保留AMASS上身参考、重定向下肢，默认速度仍0.4 m/s。
+根外力辅助和真实PhysX接触保留。最新各协议实测及剩余蹲姿/动作问题见
+[滑步专项](slip-resolution-2026-09-25.md)，未恢复批量训练数据生成。
 
 ## 启动与键位
 
@@ -17,8 +23,8 @@
 | --- | --- |
 | W / 上箭头 | 向人物朝向前进 |
 | S / 下箭头 | 后退 |
-| A / 左箭头 | 左转，可与前后移动同时按 |
-| D / 右箭头 | 右转，可与前后移动同时按 |
+| A / 左箭头 | 与 W/S 同时按时左转；站立时无效 |
+| D / 右箭头 | 与 W/S 同时按时右转；站立时无效 |
 | 空格 / 松开方向键 | 减速停止并恢复站姿 |
 | C | 蹲下。走路中按下会先自动刹停（`braking_for_crouch`），再按 `transition_s` 下蹲，最后蹲姿保持 |
 | V | 从蹲姿起立。起立过程中方向键继续无效，完全站直后恢复 |
@@ -36,6 +42,15 @@ C/V/F 的移动指令在动作期间被屏蔽；蹲下/起立/摔倒不会因根
 `recording.npz` 为实际物理姿态蒙皮，`report.json` 为来源和质量门槛。
 内存采用有界历史，默认保留最近约 120 s 的控制与显示记录；长时间使用不会无限累计网格。
 报告的质量指标仅覆盖保留时间窗，不代表整段任意长会话全部通过。
+超过保留窗的会话会在 `complete_recording_window` 门被拒收，不能凭最后一段通过而导出整段训练数据。
+
+诊断动作协议：`--config configs/humans/acceptance_matrix.yaml --demo --headless`。
+它固定前进、左右行走转向、后退、蹲/起、摔倒和复位，启用
+`record_mesh_at_physics_hz: true`：120 Hz 实际网格与控制同一 pre-step 时间采样，显示仍为 30 Hz。
+该选项增加记录开销；普通交互默认保持显示频率采样。质量报告分开记录每个动作和左右行走转向。
+另有 `configs/humans/locomotion_acceptance.yaml`：52.7 s反复起停、直接反向、短按键及后退转向。
+配置中的 `contact_planner` 与两方向 `contact_cycle` 必须一致，不能同时开启旧 `stance` 控制器。
+改动后需重启此脚本；已运行的 Isaac 进程不会自动热加载Python或YAML。
 
 CPU 和自动 GUI 测试：
 
@@ -96,7 +111,9 @@ python3 scripts/humans/keyboard.py --dry-run --out artifacts/keyboard_control_20
 
 ## 2026-09-24 实测
 
-最终动作配置为 `keyboard.yaml` + `human_smpl_multiaxis.yaml` + `root_assist.yaml`。
+该轮动作配置为 `keyboard.yaml` + `human_smpl_multiaxis.yaml` + `root_assist.yaml`。
+09-25滑步专项后，普通行走/站立使用 `root_assist_contact.yaml`（重力补偿0.6），
+蹲/起保留 `root_assist.yaml`，以0.35 s平滑切换；实际总辅助另行实测。
 数据源为本地 `Transitions_mocap/mazen_c3d/walkbackwards_stand_poses.npz`，
 前进片段 3.9167–4.9583 s，后退片段 0.8–1.5917 s，站姿取 3.4 s。
 保留源躯干倾斜，用户控制世界偏航；步态接缝修正、速度缩放和平滑均属派生参考。

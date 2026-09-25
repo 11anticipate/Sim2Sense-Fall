@@ -15,9 +15,14 @@ from .rig import HumanRigPlan, LinkTransform, forward_kinematics, quaternion_fro
 from .rotations import matrix_to_axis_angle, quaternion_to_matrix
 from .skinning import SmplMesh
 
+#: Thickness of the sole band the foot collision box is fitted to.
+FOOT_SOLE_BAND_M = 0.04
+
 
 def fit_collision_capsules(
-    plan: HumanRigPlan, mesh: SmplMesh, *, margin_m: float
+    plan: HumanRigPlan, mesh: SmplMesh, *, margin_m: float,
+    foot_shape: str = "box", sole_band_m: float = FOOT_SOLE_BAND_M,
+    hand_shape: str = "capsule",
 ) -> tuple[HumanRigPlan, list[dict[str, Any]]]:
     """Enclose dominant-weight skin regions in deterministic principal-axis capsules.
 
@@ -26,6 +31,12 @@ def fit_collision_capsules(
     """
     if not np.isfinite(margin_m) or not 0 <= margin_m <= 0.02:
         raise ValueError("collision margin must be finite in [0, 0.02] m")
+    if foot_shape not in {"box", "convex_hull"}:
+        raise ValueError("foot_shape must be box or convex_hull")
+    if hand_shape not in {"capsule", "convex_hull"}:
+        raise ValueError("hand_shape must be capsule or convex_hull")
+    if not np.isfinite(sole_band_m) or sole_band_m <= 0:
+        raise ValueError("sole_band_m must be finite and positive")
     owners = np.asarray(mesh.topology.joint_names)[mesh.weights.argmax(axis=1)]
     owners = owners.copy()
     for side in ("left", "right"):
@@ -38,16 +49,37 @@ def fit_collision_capsules(
             links.append(link)
             continue
         if link.name in {"left_ankle", "right_ankle"}:
-            low, high = points.min(axis=0) - margin_m, points.max(axis=0) + margin_m
+            # Fit the foot box to the SOLE BAND only (the bottom 4 cm of the foot
+            # region). A full-foot box pitches with the ankle and then rests on a
+            # virtual corner that sits tens of millimetres below the actual sole
+            # edge -- the visible foot floats above the floor while the collider
+            # "touches" (measured 38 mm skin vs 6 mm collider). A thin sole slab
+            # corners down exactly where the sole edge is, so the skin tracks the
+            # contact at any ankle pitch. The instep loses its collider: flat-floor
+            # contact happens at the sole.
+            sole_top = points[:, 2].min() + sole_band_m
+            band = points[points[:, 2] <= sole_top]
+            low, high = band.min(axis=0) - margin_m, band.max(axis=0) + margin_m
             center = (low + high) / 2
             size = high - low
             inertia = link.mass_kg / 12 * (np.sum(size**2) - size**2)
+            vertices, faces = (), ()
+            if foot_shape == "convex_hull":
+                # Use the actual surface patch, not fictitious bounding-box corners.
+                # PhysX cooks its convex hull; the source patch need not be watertight.
+                selected = mesh.faces[np.all(owners[mesh.faces] == link.name, axis=1)]
+                indices, inverse = np.unique(selected, return_inverse=True)
+                vertices = tuple(tuple(map(float, p))
+                                 for p in mesh.vertices[indices] - link.rest_position)
+                faces = tuple(tuple(map(int, face)) for face in inverse.reshape(-1, 3))
             links.append(
                 replace(
                     link,
                     center_of_mass=tuple(center),
                     inertia_kg_m2=tuple(inertia),
-                    collision_box_bounds=(tuple(low), tuple(high)),
+                    collision_box_bounds=(tuple(low), tuple(high)) if foot_shape == "box" else None,
+                    collision_mesh_vertices=vertices,
+                    collision_mesh_faces=faces,
                 )
             )
             audit.append(
@@ -55,7 +87,8 @@ def fit_collision_capsules(
                     "link": link.name,
                     "vertices": len(points),
                     "margin_m": margin_m,
-                    "method": "dominant_skin_weight_foot_box",
+                    "method": f"dominant_skin_weight_foot_{foot_shape}",
+                    "inertia_model": "sole_band_box_fixed_across_shape_ablation",
                     "bounds_m": [low.tolist(), high.tolist()],
                 }
             )
@@ -86,14 +119,20 @@ def fit_collision_capsules(
         )
         axial = 0.5 * link.mass_kg * radius**2
         transverse = link.mass_kg * (3 * radius**2 + length**2) / 12
-        links.append(
-            replace(
-                link,
-                capsule=fitted,
-                center_of_mass=fitted.center,
-                inertia_kg_m2=(transverse, transverse, axial),
-            )
-        )
+        fitted_link = replace(
+            link, capsule=fitted, center_of_mass=fitted.center,
+            inertia_kg_m2=(transverse, transverse, axial))
+        is_hand_hull = hand_shape == "convex_hull" and link.name in {"left_hand", "right_hand"}
+        if is_hand_hull:
+            # Keep the capsule-derived inertial model fixed during shape comparison.
+            selected = mesh.faces[np.all(owners[mesh.faces] == link.name, axis=1)]
+            indices, inverse = np.unique(selected, return_inverse=True)
+            fitted_link = replace(
+                fitted_link,
+                collision_mesh_vertices=tuple(tuple(map(float, p))
+                                             for p in mesh.vertices[indices] - link.rest_position),
+                collision_mesh_faces=tuple(tuple(map(int, f)) for f in inverse.reshape(-1, 3)))
+        links.append(fitted_link)
         audit.append(
             {
                 "link": link.name,
@@ -101,7 +140,9 @@ def fit_collision_capsules(
                 "radius_m": radius,
                 "length_m": length,
                 "margin_m": margin_m,
-                "method": "dominant_skin_weight_principal_axis_enclosure",
+                "method": "dominant_skin_weight_hand_convex_hull" if is_hand_hull
+                else "dominant_skin_weight_principal_axis_enclosure",
+                "inertia_model": "principal_axis_capsule_fixed_across_shape_ablation",
             }
         )
     fitted_plan = replace(plan, links=tuple(links))
@@ -148,6 +189,10 @@ def sideways_leg_dofs(
 
 
 def capsule_bottom(plan: HumanRigPlan, poses: dict[str, LinkTransform], name: str) -> float:
+    vertices = plan.link(name).collision_mesh_vertices
+    if vertices:
+        pose = poses[name]
+        return float((np.asarray(vertices) @ pose.rotation[2] + pose.translation[2]).min())
     bounds = plan.link(name).collision_box_bounds
     if bounds is not None:
         low, high = np.asarray(bounds)
@@ -183,8 +228,14 @@ class StanceFootController:
         measured_root_feedback: bool = False,
         abduction_weight: float = 1.0,
         release_residual_m: float | None = None,
+        support_gain: float = 0.0,
+        support_max_m: float = 0.08,
+        measured_anchor: bool = False,
+        sideways_correction_rad: float | None = None,
     ) -> None:
-        values = [height_m, max_correction_rad, damping, orientation_weight, swing_clearance_m]
+        values = [height_m, max_correction_rad, damping, orientation_weight]
+        if not np.isfinite(swing_clearance_m) or swing_clearance_m < 0:
+            raise ValueError("swing clearance must be finite and nonnegative")
         if (
             not np.isfinite(values).all()
             or min(values) <= 0
@@ -209,6 +260,14 @@ class StanceFootController:
         if not isinstance(measured_root_feedback, bool):
             raise ValueError("measured_root_feedback must be boolean")
         self.measured_root_feedback = measured_root_feedback
+        if (not isinstance(measured_anchor, bool)
+                or (measured_anchor and not measured_root_feedback)):
+            raise ValueError("measured_anchor requires measured_root_feedback")
+        if sideways_correction_rad is not None and (
+            not np.isfinite(sideways_correction_rad) or sideways_correction_rad <= 0
+        ):
+            raise ValueError("sideways correction bound must be finite and positive")
+        self.measured_anchor = measured_anchor
         self.abduction_weight = float(abduction_weight)
         self.release_residual_m = release_residual_m
         self.lower = np.deg2rad([j.lower_deg for j in plan.joints])
@@ -228,6 +287,11 @@ class StanceFootController:
         # those are comes from the geometry, not from the axis letter.
         sideways = set(sideways_leg_dofs(plan))
         self.sideways_dofs = sorted(sideways)
+        self.correction_bounds = np.array([
+            min(max_correction_rad, sideways_correction_rad)
+            if sideways_correction_rad is not None and joint.name in sideways
+            else max_correction_rad for joint in plan.joints
+        ])
         self.weights = {
             side: np.where(
                 [plan.joints[i].name in sideways for i in indices], float(abduction_weight), 1.0
@@ -239,6 +303,23 @@ class StanceFootController:
         self.released_anchors = 0
         self.anchors: dict[str, LinkTransform] = {}
         self.residual_m = 0.0
+        # Stance-leg weight support: an integral joint-space extension per leg.
+        # The root assist's constant gravity fraction carries most of the weight
+        # (measured: actuator 0.82 body weight, ground 0.18), and the per-step
+        # anchor budget (0.087 rad, re-derived from the fresh reference each step)
+        # can never accumulate the ~0.3 rad a real 4 cm sink needs -- the same
+        # structural flaw the swing lift had. The offset grows while the body sits
+        # below its target height and decays when it does not, so the stance leg
+        # actively pushes the body up and the ground carries its share.
+        self.support_gain = float(support_gain)
+        self.support_max_m = float(support_max_m)
+        # Per-foot anchor lowering (metres). Grows while the body sits below its
+        # target height, decays when it does not; the anchor IK then presses the
+        # stance foot into the floor and the ground reaction carries the share the
+        # constant gravity fraction no longer does.
+        self.support_m: dict[str, float] = {}
+        if not np.isfinite([support_gain, support_max_m]).all() or support_max_m <= 0:
+            raise ValueError("support settings must be finite with a positive cap")
         # Reuse only the two leg chains. Rebuilding all 62 body transforms for
         # each IK iteration made input processing substantially slower than physics.
         by_child = {joint.child_link: (index, joint) for index, joint in enumerate(plan.joints)}
@@ -253,6 +334,7 @@ class StanceFootController:
 
     def reset(self) -> None:
         self.anchors.clear()
+        self.support_m.clear()
         self.residual_m = 0.0
 
     def correct(
@@ -266,8 +348,22 @@ class StanceFootController:
         swing_fraction: dict[str, float] | None = None,
         measured_position: np.ndarray | None = None,
         measured_quaternion: np.ndarray | None = None,
+        measured_joints: np.ndarray | None = None,
     ) -> np.ndarray:
         q = joints.copy()
+        if self.measured_anchor and (
+            measured_joints is None or measured_position is None or measured_quaternion is None
+            or measured_joints.shape != joints.shape or not np.isfinite(measured_joints).all()
+        ):
+            raise ValueError("measured anchors require finite measured root and joint states")
+        # Body sink below the target height: the support scalar's input. Read
+        # before the measured-feedback gate, which only governs the anchor IK's
+        # root convention, not the support.
+        sink = (
+            float(position[2] - measured_position[2])
+            if measured_position is not None
+            else 0.0
+        )
         if not self.measured_root_feedback:
             measured_position = measured_quaternion = None
 
@@ -302,18 +398,31 @@ class StanceFootController:
             )
             if swinging:
                 self.anchors.pop(foot, None)
+                self.support_m.pop(foot, None)
                 fraction = (swing_fraction or {}).get(foot, 0.5)
                 clearance = self.swing_clearance_m * np.sin(np.pi * fraction)
                 translation = poses[foot].translation.copy()
                 translation[2] += max(0.0, clearance - bottom)
                 anchor = LinkTransform(poses[foot].rotation.copy(), translation)
             elif foot not in self.anchors:
-                translation = poses[foot].translation.copy()
-                translation[2] -= bottom
-                self.anchors[foot] = LinkTransform(poses[foot].rotation.copy(), translation)
+                self.support_m[foot] = 0.0
+                touchdown = poses_for(measured_joints, side, measured=True) if (
+                    self.measured_anchor) else poses
+                translation = touchdown[foot].translation.copy()
+                translation[2] -= capsule_bottom(self.plan, touchdown, foot)
+                self.anchors[foot] = LinkTransform(touchdown[foot].rotation.copy(), translation)
                 anchor = self.anchors[foot]
             else:
-                anchor = self.anchors[foot]
+                if self.support_gain > 0:
+                    grown = self.support_m.get(foot, 0.0)
+                    if sink > 0:
+                        grown = min(grown + self.support_gain * sink, self.support_max_m)
+                    else:
+                        grown = max(0.0, grown * 0.97)
+                    self.support_m[foot] = grown
+                anchor_translation = self.anchors[foot].translation.copy()
+                anchor_translation[2] -= self.support_m.get(foot, 0.0)
+                anchor = LinkTransform(self.anchors[foot].rotation.copy(), anchor_translation)
             for _ in range(self.iterations):
                 poses = poses_for(q, side, measured=True)
                 actual = poses[foot]
@@ -344,8 +453,10 @@ class StanceFootController:
                 ) * scale
                 q[indices] = np.clip(
                     q[indices] + delta,
-                    np.maximum(self.lower[indices], joints[indices] - self.max_correction_rad),
-                    np.minimum(self.upper[indices], joints[indices] + self.max_correction_rad),
+                    np.maximum(self.lower[indices],
+                               joints[indices] - self.correction_bounds[indices]),
+                    np.minimum(self.upper[indices],
+                               joints[indices] + self.correction_bounds[indices]),
                 )
             residual = float(
                 np.linalg.norm(

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Attribute the measured floor slip of stance feet to its three physical sources.
 
-The slip gate (p95 tangent speed of contacting ankle points <= 0.15 m/s) fails on
-every shipped session, but "it fails" is not actionable: the recorded slip is the
-sum of three independent terms with three different owners.
+Decompose legacy sessions that fail the contact slip gate. The terms are a
+diagnostic vector decomposition, not independent causal effects or the gate's
+contact-point measurement. Their speed norms do not add arithmetically.
 
 For every physics step where an ankle is in floor contact (normal impulse above
 the slip threshold), the ankle's world velocity is differentiated from forward
@@ -24,10 +24,12 @@ which yields
 - **joint_tracking** -- actual minus target relative foot motion. Owner: PD
   gains, joint speed limits, stance-IK corrections.
 
-The three terms add up to the actual by construction (up to angular-velocity of
-the root, ignored here: a straight walk pitches/rolls by fractions of a degree,
-and the recorded slip it is compared against uses the same COM+omega definition
-only in the shipped report, while this tool grades the ankle point directly).
+The vectors add up to the actual ankle velocity by construction. Root rotation
+is retained in both FK paths and hence in the target-motion term; it is not
+separately attributed. The actual gate evaluates material contact points, while
+this tool evaluates ankle origins. Use diagnose_slip.py for contact-point and
+independent measured mesh displacement checks. The old world-speed subtraction
+was corrected on 2026-09-25; archived 0.4 m/s attribution claims are withdrawn.
 
 Read-only: consumes an existing run's ``control.npz`` and ``keyboard.yaml``. No
 Isaac Sim.
@@ -78,7 +80,7 @@ def build_plan(settings: dict[str, Any]) -> Any:
         from sim2sense_fall.humans.contact_control import fit_collision_capsules
 
         plan, _ = fit_collision_capsules(
-            plan, mesh, margin_m=settings["collision_fit"]["margin_m"]
+            plan, mesh, **{k: v for k, v in settings["collision_fit"].items() if k != "enabled"}
         )
     return plan
 
@@ -152,7 +154,9 @@ def audit_run(run: Path) -> dict[str, Any]:
     mode = np.asarray(control["mode"]).astype(str)
     weight = np.asarray(control["gait_weight"], dtype=np.float64)
     time_s = np.asarray(control["time_s"], dtype=np.float64)
-    root_vel = np.asarray(control["velocity"], dtype=np.float64)
+    # Use the same positional derivative as the point velocities: COM velocity
+    # and actor-origin displacement are not interchangeable during root rotation.
+    root_vel = np.gradient(np.asarray(control["root"], dtype=np.float64), dt, axis=0)
 
     act = ankle_world_positions(plan, control, "joints", np.arange(len(time_s)))
     tgt = ankle_world_positions(plan, control, "joint_target", np.arange(len(time_s)))
@@ -195,7 +199,11 @@ def audit_run(run: Path) -> dict[str, Any]:
                 )[f"{side}_ankle"].translation
                 rel_speed = (p1[0] - p0[0]) / (gait.duration_s / (len(gait.joints) - 1))
                 # world speed if the root advanced at exactly the commanded speed
-                ref_slide[side].append(abs(command_speed + sign * rel_speed))
+                playback_sign = sign * float(gait.provenance.get("source_forward_sign", sign))
+                ref_slide[side].append(abs(
+                    sign * command_speed
+                    + playback_sign * command_speed / gait.speed_m_s * rel_speed
+                ))
         ref_stats = {
             side: speed_stats(np.asarray(ref_slide[side])) for side in SIDES
         }
@@ -219,7 +227,10 @@ def audit_run(run: Path) -> dict[str, Any]:
                     float(np.linalg.norm(root_vel[index, :2] - v_command))
                 )
                 per_term[f"{side}_reference_slide"].append(
-                    float(np.linalg.norm(v_target - v_command))
+                    # v_target already includes actual root translation. Replace
+                    # that translation by the commanded one; do not subtract the
+                    # command from a world-static foot (which falsely yields 0.4).
+                    float(np.linalg.norm(v_target - root_vel[index, :2] + v_command))
                 )
                 per_term[f"{side}_joint_tracking"].append(
                     float(np.linalg.norm(v_actual - v_target))

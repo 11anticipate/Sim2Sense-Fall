@@ -470,14 +470,52 @@ def _author_metadata(runtime: SimpleNamespace, prim: Any, entries: Mapping[str, 
             prim.CreateAttribute(name, types.String, custom=True).Set(str(value))
 
 
+def _author_friction_material(
+    runtime: SimpleNamespace, stage: Any, path: str, static_friction: float, dynamic_friction: float
+) -> str:
+    """One UsdPhysics.Material for every human collider.
+
+    The friction audit measured the human colliders with *no* physics material:
+    PhysX falls back to its 0.5/0.5 default and combines by average with the
+    floor's 0.55/0.65, so the effective shoe-floor mu was ~0.525. Authoring an
+    explicit material makes the effective mu configurable and the sweep honest
+    (average combine: mu_eff = (mu_human + 0.55) / 2 on the shipped floor).
+    """
+
+    # This OpenUSD build carries physics materials as UsdPhysics.MaterialAPI
+    # applied on a UsdShade.Material prim (there is no UsdPhysics.Material prim
+    # class here); the binding side is the same UsdShade relationship either way.
+    shade_material = runtime.UsdShade.Material.Define(stage, path)
+    material_api = runtime.UsdPhysics.MaterialAPI.Apply(shade_material.GetPrim())
+    material_api.CreateStaticFrictionAttr().Set(float(static_friction))
+    material_api.CreateDynamicFrictionAttr().Set(float(dynamic_friction))
+    runtime.PhysxSchema.PhysxMaterialAPI.Apply(
+        shade_material.GetPrim()
+    ).CreateFrictionCombineModeAttr().Set("average")
+    return path
+
+
 def _author_capsule(
-    runtime: SimpleNamespace, stage: Any, plan: HumanRigPlan, link_name: str
+    runtime: SimpleNamespace,
+    stage: Any,
+    plan: HumanRigPlan,
+    link_name: str,
+    friction_material_path: str | None = None,
 ) -> str | None:
     link = plan.link(link_name)
     capsule = link.capsule
     if capsule is None:
         return None
-    if link.collision_box_bounds is None:
+    if link.collision_mesh_vertices:
+        geometry = runtime.UsdGeom.Mesh.Define(stage, capsule.path)
+        geometry.CreatePointsAttr().Set([runtime.Gf.Vec3f(*map(float, p))
+                                        for p in link.collision_mesh_vertices])
+        geometry.CreateFaceVertexCountsAttr().Set([3] * len(link.collision_mesh_faces))
+        geometry.CreateFaceVertexIndicesAttr().Set(
+            [int(i) for face in link.collision_mesh_faces for i in face])
+        runtime.UsdPhysics.MeshCollisionAPI.Apply(geometry.GetPrim()).CreateApproximationAttr().Set(
+            "convexHull")
+    elif link.collision_box_bounds is None:
         geometry = runtime.UsdGeom.Capsule.Define(stage, capsule.path)
         geometry.CreateAxisAttr(runtime.UsdGeom.Tokens.z)
         geometry.CreateHeightAttr(float(capsule.cylinder_length_m))
@@ -487,7 +525,9 @@ def _author_capsule(
         geometry.CreateSizeAttr(1.0)
     xformable = runtime.UsdGeom.Xformable(geometry.GetPrim())
     xformable.ClearXformOpOrder()
-    if link.collision_box_bounds is None:
+    if link.collision_mesh_vertices:
+        pass  # Source points are already in link-local coordinates.
+    elif link.collision_box_bounds is None:
         xformable.AddTranslateOp().Set(runtime.Gf.Vec3d(*[float(v) for v in capsule.center]))
         xformable.AddOrientOp().Set(
             runtime.Gf.Quatf(
@@ -517,6 +557,10 @@ def _author_capsule(
     # floor is still touching it.
     contact_report = runtime.PhysxSchema.PhysxContactReportAPI.Apply(prim)
     contact_report.CreateThresholdAttr().Set(0.0)
+    if friction_material_path is not None:
+        binding = runtime.UsdShade.MaterialBindingAPI.Apply(prim)
+        binding.Bind(runtime.UsdShade.Material.Get(stage, friction_material_path),
+                     materialPurpose="physics")
     _author_metadata(
         runtime,
         prim,
@@ -607,6 +651,7 @@ def author_human(
     root_path: str = HUMAN_ROOT_PATH,
     skin_points: np.ndarray | None = None,
     skin_faces: np.ndarray | None = None,
+    friction: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Author the articulation into an existing stage under ``root_path``.
 
@@ -656,6 +701,18 @@ def author_human(
     )
 
     # --- child links ---------------------------------------------------------
+    friction_material_path: str | None = None
+    if friction is not None:
+        static_friction, dynamic_friction = (float(v) for v in friction)
+        if not np.isfinite([static_friction, dynamic_friction]).all() or min(friction) < 0:
+            raise ValueError("friction must be finite and nonnegative")
+        friction_material_path = _author_friction_material(
+            runtime,
+            stage,
+            f"{root_path}/contact_material",
+            static_friction=static_friction,
+            dynamic_friction=dynamic_friction,
+        )
     collider_paths: list[str] = []
     for link in plan.links:
         if link.name == plan.root_link:
@@ -690,7 +747,7 @@ def author_human(
                     "sim2sense:linkRole": link.role,
                 },
             )
-        capsule_path = _author_capsule(runtime, stage, plan, link.name)
+        capsule_path = _author_capsule(runtime, stage, plan, link.name, friction_material_path)
         if capsule_path:
             collider_paths.append(capsule_path)
 
@@ -804,6 +861,7 @@ def build_human_stage(
     root_path: str = HUMAN_ROOT_PATH,
     skin_points: np.ndarray | None = None,
     skin_faces: np.ndarray | None = None,
+    friction: tuple[float, float] | None = None,
 ) -> Path:
     """Author the human, optionally into a copy of an existing scene, and save.
 
@@ -840,6 +898,7 @@ def build_human_stage(
         root_path=root_path,
         skin_points=skin_points,
         skin_faces=skin_faces,
+        friction=friction,
     )
     position = tuple(float(v) for v in (spawn_position or plan.spawn_root_position))
     root_prim = stage.GetPrimAtPath(root_path)
@@ -1761,6 +1820,13 @@ class HumanRuntime:
                 rotation=quaternion_to_matrix(quaternion), translation=position
             )
         return poses
+
+    def link_pose(self, name: str) -> LinkTransform:
+        """Read one actual physics link without rebuilding the whole skeleton."""
+        if name not in self._rigids:
+            raise ValueError(f"unknown body: {name}")
+        position, quaternion = self._world_pose_of(name)
+        return LinkTransform(quaternion_to_matrix(quaternion), position)
 
     def link_positions(self) -> np.ndarray:
         """World translations of every link, in plan order."""

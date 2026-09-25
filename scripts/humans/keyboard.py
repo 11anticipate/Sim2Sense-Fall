@@ -33,8 +33,9 @@ from sim2sense_fall.humans.contact_control import (
     measured_support_feet,
 )
 from sim2sense_fall.humans.mesh_sequence import fit_mesh_to_rest_joints, skin_mesh_sequence_frame
+from sim2sense_fall.humans.quality import MotionQualityConfig, motion_quality
 from sim2sense_fall.humans.recording import ChunkRecorder
-from sim2sense_fall.humans.rig import fit_rest_skeleton, plan_human_rig
+from sim2sense_fall.humans.rig import LinkTransform, fit_rest_skeleton, plan_human_rig
 from sim2sense_fall.humans.root_control import RootAssistConfig, root_wrench
 from sim2sense_fall.humans.rotations import matrix_to_axis_angle, quaternion_to_matrix
 from sim2sense_fall.humans.teleop import (
@@ -69,7 +70,7 @@ def prepare(path: Path) -> tuple[dict[str, Any], Any, Any, Any, TeleopController
     settings["collision_fit_audit"] = []
     if settings.get("collision_fit", {}).get("enabled", False):
         plan, settings["collision_fit_audit"] = fit_collision_capsules(
-            plan, mesh, margin_m=settings["collision_fit"]["margin_m"]
+            plan, mesh, **{k: v for k, v in settings["collision_fit"].items() if k != "enabled"}
         )
     dt = config.simulation.physics_dt_s
     planted = settings.get("max_stance_slip_m_s")
@@ -78,15 +79,29 @@ def prepare(path: Path) -> tuple[dict[str, Any], Any, Any, Any, TeleopController
         for key, spec in settings["gaits"].items()
     }
     idle = load_gait(settings["idle"], plan, dt_s=dt, max_stance_slip_m_s=planted)
-    # The turn-in-place reference derives its mask from foot height, not root
-    # travel, and its anchors are not gated on stance slip.
-    turn = (
-        load_gait(settings["turn"], plan, dt_s=dt, max_stance_slip_m_s=None)
-        if "turn" in settings
-        else None
-    )
+    if settings.get("contact_planner"):
+        from sim2sense_fall.humans.contact_gait import (
+            ContactFootPlanner,
+            ContactGaitConfig,
+            fit_contact_idle,
+        )
+
+        planner_config = ContactGaitConfig(**settings["contact_planner"])
+        # The idle pose stands with each foot directly under its hip, so unlike the
+        # gait it needs no stride-reach allowance. Pinning it to the gait's capped
+        # height left ~4.7 cm of slack leg that the IK spent as 37-43 deg of standing
+        # knee flexion (scripts/humans/audit_idle_posture.py). The full standing
+        # height itself overcorrects to a 3 deg near-singular column, which bounces
+        # on the floor contact and skids the feet (stand slip p95 0.797 m/s vs the
+        # bent baseline's 0.010); a relaxed stand keeps a few degrees of knee
+        # flexion for axial compliance. Starting to walk still descends smoothly:
+        # TeleopController.advance blends idle->gait height.
+        idle_height = float(plan.standing_root_height_m) * settings["idle_stand_height_fraction"]
+        fit_contact_idle(idle, plan, idle_height, planner_config)
+        settings["contact_foot_planner"] = ContactFootPlanner(
+            plan, planner_config, settings["speed_m_s"], settings["acceleration_m_s2"])
     controller = TeleopController(
-        settings["controller"], gaits, idle, plan, np.deg2rad(settings["heading_deg"]), turn=turn
+        settings["controller"], gaits, idle, plan, np.deg2rad(settings["heading_deg"])
     )
     if "actions" in settings:
         posture = load_posture(settings["crouch"], plan)
@@ -131,10 +146,24 @@ def main() -> int:
     settings, config, plan, mesh, controller = prepare(args.config)
     actions = settings.get("action_state")
     stance = settings.get("stance_controller")
+    contact_planner = settings.get("contact_foot_planner")
     args.out.mkdir(parents=True, exist_ok=True)
     assistance = RootAssistConfig.load(settings["root_assist"])
+    locomotion_assistance = RootAssistConfig.load(
+        settings.get("locomotion_root_assist", settings["root_assist"])
+    )
+    assist_blend = 1.0
+    quality_config = MotionQualityConfig(**settings.get("quality", {}))
+    native_mesh = settings.get("record_mesh_at_physics_hz", False)
+    if not isinstance(native_mesh, bool):
+        raise ValueError("record_mesh_at_physics_hz must be boolean")
     scene = args.scene or settings["scene"]
     provenance = {
+        "controller_sources_sha256": {
+            str(path.relative_to(REPO_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in [Path(__file__),
+                         *sorted((REPO_ROOT / "src/sim2sense_fall/humans").glob("*.py"))]
+        },
         "mode": "keyboard_bounded_external_root_assistance",
         "unassisted": settings["root_assist_scale"] == 0,
         "root_assist_scale": settings["root_assist_scale"],
@@ -144,11 +173,17 @@ def main() -> int:
         "keyboard_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
         "scene_sha256": hashlib.sha256(scene.read_bytes()).hexdigest(),
         "root_assist_sha256": hashlib.sha256(settings["root_assist"].read_bytes()).hexdigest(),
+        "locomotion_root_assist_sha256": hashlib.sha256(
+            settings.get("locomotion_root_assist", settings["root_assist"]).read_bytes()
+        ).hexdigest(),
         "gaits": {key: gait.provenance for key, gait in controller.gaits.items()},
         "model": settings["model"],
         "idle": controller.idle.provenance,
         "root_assistance": asdict(assistance),
+        "locomotion_root_assistance": asdict(locomotion_assistance),
+        "assistance_transition_s": controller.config.transition_s,
         "physics_dt_s": config.simulation.physics_dt_s,
+        "mesh_sampling": "physics_pre_step" if native_mesh else "render_update",
         "tracking_tolerance_deg": config.control.tracking_tolerance_deg,
         "skin_penetration_tolerance_m": settings["skin_penetration_tolerance_m"],
         "ordinary_motion_teleports": 0,
@@ -158,6 +193,7 @@ def main() -> int:
         "crouch": settings.get("crouch_provenance"),
         "actions": settings.get("actions"),
         "stance": settings.get("stance"),
+        "contact_planner": settings.get("contact_planner"),
         "demo": settings["demo"] if args.demo or args.dry_run else None,
         "controller_settings": asdict(controller.config),
     }
@@ -234,13 +270,19 @@ def main() -> int:
     skin_capacity = (
         int(
             np.ceil(
-                settings["record_frames"] * config.simulation.physics_dt_s * settings["render_hz"]
+                settings["record_frames"] * (
+                    1 if native_mesh else config.simulation.physics_dt_s * settings["render_hz"]
+                )
             )
         )
         + 1
     )
     skins: deque[np.ndarray] = deque(maxlen=skin_capacity)
     skin_times: deque[float] = deque(maxlen=skin_capacity)
+    foot_heights: deque[np.ndarray] = deque(maxlen=skin_capacity)
+    owners = np.asarray(mesh.topology.joint_names)[mesh.weights.argmax(axis=1)]
+    foot_masks = [np.isin(owners, [f"{side}_ankle", f"{side}_foot"])
+                  for side in ("left", "right")]
     errors: list[str] = []
     captures: list[dict[str, Any]] = []
     intent = KeyboardIntent()
@@ -264,6 +306,7 @@ def main() -> int:
             base_scene=scene,
             skin_points=mesh.vertices,
             skin_faces=mesh.faces,
+            friction=settings.get("human_friction"),
         )
         stage = open_scene(app, args.out / "human_keyboard.usda")
         # Create all visual structure before the tensor views. Only points change later.
@@ -286,10 +329,14 @@ def main() -> int:
             app.update()
 
         def reset() -> None:
+            nonlocal assist_blend
+            assist_blend = 1.0
             if actions:
                 actions.reset()
             if stance:
                 stance.reset()
+            if contact_planner:
+                contact_planner.reset()
             if not runtime.set_control_scale(1.0):
                 raise RuntimeError("could not restore joint drives on reset")
             controller.reset(
@@ -298,7 +345,11 @@ def main() -> int:
             target = controller.advance(
                 (0.0, 0.0), measured_dt, controller.position, controller.heading
             )
-            runtime.set_root_pose(target.position, target.quaternion)
+            # The negative offset is a force-control target, not a spawn teleport.
+            # Applying it to the reset pose starts the hull/skin inside the floor.
+            spawn_position = target.position.copy()
+            spawn_position[2] -= controller.config.root_z_offset_m
+            runtime.set_root_pose(spawn_position, target.quaternion)
             runtime.set_joint_positions(target.joints)
             runtime.set_joint_targets(target.joints)
             runtime.reset_velocities()
@@ -337,7 +388,7 @@ def main() -> int:
         buffered_keys: set[str] = set()
 
         def before_step(dt: float, _context: Any) -> None:
-            nonlocal clock_s, previous_target, previous_stance_mode
+            nonlocal clock_s, previous_target, previous_stance_mode, assist_blend
             if errors:
                 return
             try:
@@ -398,39 +449,51 @@ def main() -> int:
                         stance.reset()
                     previous_stance_mode = stance_mode
                     if stance_mode == "transition" or abs(controller.turn_rate) > 0.01:
+                        # Turning while walking re-plants feet at new headings; the
+                        # travel-derived anchors would fight that, so no anchors.
                         stance.reset()
-                    if stance_mode == "turning":
-                        # The stepped-turn reference lifts and re-plants the feet
-                        # itself; anchoring here would pin a foot while the body
-                        # rotates -- the skating pivot this mode exists to remove.
-                        stance.residual_m = 0.0
+                    reference_feet = controller.gaits[controller.mode].supporting_feet(
+                        controller.phase
+                    )
+                    if measured_feet is None or reference_feet is None:
+                        # model mode, or a gait without a support mask: as before.
+                        support = measured_feet if measured_feet is not None else reference_feet
+                    elif anchor_source == "contact":
+                        support = measured_feet
                     else:
-                        reference_feet = controller.gaits[controller.mode].supporting_feet(
+                        # contact_and_model: anchor only where both agree. The intersection
+                        # can only remove anchors, never add them, so it tightens the gate
+                        # without inventing stance the reference does not claim.
+                        support = reference_feet & measured_feet
+                    corrected = stance.correct(
+                        target.joints,
+                        target.position,
+                        target.quaternion,
+                        standing=abs(controller.speed) < 0.01,
+                        support_feet=support,
+                        swing_fraction=controller.gaits[controller.mode].swing_fraction(
                             controller.phase
-                        )
-                        if measured_feet is None or reference_feet is None:
-                            # model mode, or a gait without a support mask: as before.
-                            support = measured_feet if measured_feet is not None else reference_feet
-                        elif anchor_source == "contact":
-                            support = measured_feet
-                        else:
-                            # contact_and_model: anchor only where both agree. The intersection
-                            # can only remove anchors, never add them, so it tightens the gate
-                            # without inventing stance the reference does not claim.
-                            support = reference_feet & measured_feet
-                        corrected = stance.correct(
-                            target.joints,
-                            target.position,
-                            target.quaternion,
-                            standing=abs(controller.speed) < 0.01,
-                            support_feet=support,
-                            swing_fraction=controller.gaits[controller.mode].swing_fraction(
-                                controller.phase
-                            ),
-                            measured_position=position,
-                            measured_quaternion=quaternion,
-                        )
-                        target = replace(target, joints=corrected)
+                        ),
+                        measured_position=position,
+                        measured_quaternion=quaternion,
+                        measured_joints=runtime.joint_positions_rad(),
+                    )
+                    target = replace(target, joints=corrected)
+                if contact_planner and target.mode in {"forward", "backward", "stand"}:
+                    root_position = target.position.copy()
+                    root_position[:2] = position[:2]
+                    # Cancel horizontal root tracking lag. Keep target height and
+                    # rotation: feeding back full orientation amplified contact
+                    # chatter in the recorded orientation_matrix comparison.
+                    corrected = contact_planner.correct(
+                        target.joints, LinkTransform(quaternion_to_matrix(target.quaternion),
+                                                    root_position),
+                        {f"{s}_ankle": runtime.link_pose(f"{s}_ankle") for s in ("left", "right")},
+                        heading=controller.heading, turn_rate=controller.turn_rate,
+                        speed=controller.speed, command=intent.command()[0], dt_s=dt)
+                    target = replace(target, joints=corrected)
+                elif contact_planner:
+                    contact_planner.reset()
                 delta = np.clip(
                     target.joints - previous_target.joints,
                     -controller.config.max_joint_speed_rad_s * dt,
@@ -449,8 +512,23 @@ def main() -> int:
                 )
                 previous_target = target
                 linear, angular = runtime.root_velocities()
+                ordinary = target.mode in {"forward", "backward", "stand"}
+                assist_blend = float(np.clip(
+                    assist_blend + (1 if ordinary else -1)*dt/controller.config.transition_s,
+                    0., 1.,
+                ))
+                if assist_blend == 1:
+                    active_assistance = locomotion_assistance
+                elif assist_blend == 0:
+                    active_assistance = assistance
+                else:
+                    active_assistance = RootAssistConfig(**{
+                        key: value*(1-assist_blend)
+                        + getattr(locomotion_assistance, key)*assist_blend
+                        for key, value in asdict(assistance).items()
+                    })
                 force, torque = root_wrench(
-                    assistance,
+                    active_assistance,
                     position=position,
                     quaternion=quaternion,
                     linear_velocity=linear,
@@ -509,7 +587,11 @@ def main() -> int:
                         "mode": target.mode,
                         "gait_phase": controller.phase,
                         "gait_weight": controller.weight,
+                        "reset_id": provenance["reset_count"],
                         "stance_residual_m": 0.0 if stance is None else stance.residual_m,
+                        "foot_planner_residual_m": 0. if contact_planner is None
+                        else contact_planner.last_residual_m,
+                        "locomotion_assist_blend": assist_blend,
                         "contacts": [s.collider1_path for s in contacts],
                         "contact_detail": [s.as_dict() for s in contacts],
                         "floor_contact_slips_m_s": slips,
@@ -517,6 +599,11 @@ def main() -> int:
                     }
                 )
                 recorder.append(records[-1])
+                if native_mesh:
+                    vertices = skin_mesh_sequence_frame(mesh, runtime.link_poses())
+                    skins.append(vertices.astype(np.float32))
+                    skin_times.append(clock_s)
+                    foot_heights.append(np.array([vertices[mask, 2].min() for mask in foot_masks]))
                 clock_s += dt
             except Exception as exc:
                 LOGGER.exception("physics keyboard callback failed")
@@ -575,21 +662,28 @@ def main() -> int:
                 render_count += 1
                 vertices = skin_mesh_sequence_frame(mesh, runtime.link_poses())
                 points_attr.Set(Vt.Vec3fArray.FromNumpy(vertices.astype(np.float32)))
-                skins.append(vertices.astype(np.float32))
-                skin_times.append(clock_s)
-                position, _ = runtime.root_pose()
-                target_view = np.array([position[0], position[1], 0.8])
-                el, az = np.deg2rad(
-                    [settings["camera_elevation_deg"], settings["camera_azimuth_deg"]]
-                )
-                eye = target_view + settings["camera_distance_m"] * np.array(
-                    [np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), np.sin(el)]
-                )
-                camera_op.Set(
-                    Gf.Matrix4d()
-                    .SetLookAt(Gf.Vec3d(*eye), Gf.Vec3d(*target_view), Gf.Vec3d(0, 0, 1))
-                    .GetInverse()
-                )
+                if not native_mesh:
+                    skins.append(vertices.astype(np.float32))
+                    skin_times.append(clock_s)
+                    foot_heights.append(np.array([vertices[mask, 2].min() for mask in foot_masks]))
+                if settings.get("camera_follow", True):
+                    # camera_follow: false leaves the viewport camera to the user
+                    # (orbit/fly in the GUI); we never overwrite it again.
+                    position, _ = runtime.root_pose()
+                    target_view = np.array([
+                        position[0], position[1], settings.get("camera_target_height_m", 0.8)
+                    ])
+                    el, az = np.deg2rad(
+                        [settings["camera_elevation_deg"], settings["camera_azimuth_deg"]]
+                    )
+                    eye = target_view + settings["camera_distance_m"] * np.array(
+                        [np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), np.sin(el)]
+                    )
+                    camera_op.Set(
+                        Gf.Matrix4d()
+                        .SetLookAt(Gf.Vec3d(*eye), Gf.Vec3d(*target_view), Gf.Vec3d(0, 0, 1))
+                        .GetInverse()
+                    )
                 next_render = clock_s + 1 / settings["render_hz"]
                 state_label.text = f"State: {records[-1]['mode']}" if records else "State: stand"
                 assist_label.text = "External root assistance: " + (
@@ -669,7 +763,10 @@ def main() -> int:
                     "mode",
                     "gait_phase",
                     "gait_weight",
+                    "reset_id",
                     "stance_residual_m",
+                    "foot_planner_residual_m",
+                    "locomotion_assist_blend",
                     "impulse_ns",
                 )
             }
@@ -734,15 +831,26 @@ def main() -> int:
             while records and skin_times[0] < records[0]["time_s"] and len(skins) > 1:
                 skins.popleft()
                 skin_times.popleft()
+                foot_heights.popleft()
             np.savez_compressed(
                 args.out / "recording.npz",
                 time_s=np.asarray(skin_times),
                 mesh_vertices_xyz=np.stack(skins),
                 mesh_faces=mesh.faces,
+                foot_min_z_m=np.stack(foot_heights),
             )
             provenance["skin_min_z_m"] = float(min(skin[:, 2].min() for skin in skins))
         provenance["fall"] = None if actions is None else actions.fall_report()
+        provenance["motion_quality"] = motion_quality(
+            list(records), np.asarray(skin_times), np.asarray(foot_heights),
+            config=quality_config, dt_s=config.simulation.physics_dt_s,
+            mass_kg=plan.total_mass_kg, gravity_m_s2=config.simulation.gravity_m_s2,
+        )
         acceptance = {
+            "complete_recording_window": bool(records)
+            and len(records) == provenance.get("callback_steps")
+            and bool(skin_times) and skin_times[0] <= 2 * config.simulation.physics_dt_s,
+            "per_activity_motion_quality": provenance["motion_quality"]["accepted"],
             "joint_tracking": bool(records)
             and provenance["joint_error_max_deg"] is not None
             and provenance["joint_error_max_deg"] <= config.control.tracking_tolerance_deg,

@@ -67,7 +67,7 @@ def build(settings: dict[str, Any], stance_overrides: dict[str, Any]):
     mesh = fit_mesh_to_rest_joints(mesh, np.asarray(plan.rest_joint_positions))
     if settings.get("collision_fit", {}).get("enabled", False):
         plan, _audit = fit_collision_capsules(
-            plan, mesh, margin_m=settings["collision_fit"]["margin_m"]
+            plan, mesh, **{k: v for k, v in settings["collision_fit"].items() if k != "enabled"}
         )
     dt = config.simulation.physics_dt_s
     planted = settings.get("max_stance_slip_m_s")

@@ -331,6 +331,8 @@ class LinkSpec:
     collision_box_bounds: tuple[tuple[float, float, float], tuple[float, float, float]] | None = (
         None
     )
+    collision_mesh_vertices: tuple[tuple[float, float, float], ...] = ()
+    collision_mesh_faces: tuple[tuple[int, int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.role not in ("root", "segment", "dof_proxy"):
@@ -357,6 +359,17 @@ class LinkSpec:
                 or np.any(bounds[1] <= bounds[0])
             ):
                 raise ValueError(f"{self.name}: collision box must have finite positive extents")
+        if self.collision_mesh_vertices or self.collision_mesh_faces:
+            points = np.asarray(self.collision_mesh_vertices)
+            faces = np.asarray(self.collision_mesh_faces)
+            if (points.ndim != 2 or points.shape[1] != 3 or len(points) < 4
+                    or not np.isfinite(points).all() or faces.ndim != 2
+                    or faces.shape[1] != 3 or len(faces) < 1
+                    or not np.issubdtype(faces.dtype, np.integer)
+                    or faces.min() < 0 or faces.max() >= len(points)):
+                raise ValueError(f"{self.name}: invalid convex collision mesh")
+            if self.collision_box_bounds is not None:
+                raise ValueError(f"{self.name}: choose either box or convex mesh")
 
     @property
     def has_collider(self) -> bool:
@@ -378,6 +391,8 @@ class LinkSpec:
             "has_collider": self.has_collider,
             "capsule": None if self.capsule is None else self.capsule.as_dict(),
             "collision_box_bounds": self.collision_box_bounds,
+            "collision_mesh_vertices": self.collision_mesh_vertices,
+            "collision_mesh_faces": self.collision_mesh_faces,
             "tags": list(self.tags),
         }
 

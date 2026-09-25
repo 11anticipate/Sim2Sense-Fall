@@ -10,6 +10,7 @@ from sim2sense_fall.humans.config import load_human_config
 from sim2sense_fall.humans.contact_control import (
     StanceFootController,
     capsule_bottom,
+    fit_collision_capsules,
     measured_support_feet,
     sideways_leg_dofs,
 )
@@ -69,6 +70,61 @@ def test_box_support_uses_all_rotated_extents():
     )
     expected = min(poses[foot.name].transform_point(point)[2] for point in corners)
     assert capsule_bottom(rig, poses, foot.name) == pytest.approx(expected)
+
+
+def test_convex_support_does_not_invent_box_corners():
+    rig = plan()
+    vertices = ((-.1, -.02, 0.), (.2, 0., .04), (-.1, .02, 0.), (0., 0., .1))
+    foot = replace(rig.link("left_ankle"), collision_mesh_vertices=vertices,
+                   collision_mesh_faces=((0, 1, 2), (0, 1, 3), (1, 2, 3), (2, 0, 3)))
+    rig = replace(rig, links=tuple(foot if p.name == foot.name else p for p in rig.links))
+    poses = forward_kinematics(rig, {"left_ankle": .35}, root_position=(0, 0, 1))
+    expected = min(poses[foot.name].transform_point(v)[2] for v in vertices)
+    assert capsule_bottom(rig, poses, foot.name) == pytest.approx(expected)
+
+
+def test_hand_surface_hull_keeps_capsule_mass_properties():
+    from sim2sense_fall.humans.skeleton import smpl_skeleton
+    from sim2sense_fall.humans.skinning import SmplMesh
+
+    rig = plan()
+    topology = smpl_skeleton()
+    points = np.array([[0., 0., 0.], [.1, 0., 0.], [0., .05, 0.], [0., 0., .03]])
+    weights = np.zeros((4, topology.joint_count))
+    weights[:, topology.joint_names.index("right_hand")] = 1.
+    mesh = SmplMesh(
+        vertices=points + rig.link("right_hand").rest_position,
+        faces=np.array([[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]]),
+        weights=weights, topology=topology, source="synthetic_hand_tetrahedron")
+    capsule, _ = fit_collision_capsules(rig, mesh, margin_m=.003)
+    hull, _ = fit_collision_capsules(rig, mesh, margin_m=.003, hand_shape="convex_hull")
+    old, new = capsule.link("right_hand"), hull.link("right_hand")
+    assert old.mass_kg == new.mass_kg
+    assert old.inertia_kg_m2 == new.inertia_kg_m2
+    assert old.center_of_mass == new.center_of_mass
+    np.testing.assert_allclose(new.collision_mesh_vertices, points, atol=1e-12)
+
+
+def test_measured_touchdown_anchor_and_lateral_bound():
+    rig = plan()
+    controller = StanceFootController(
+        rig, height_m=.025, iterations=5, max_correction_rad=.35,
+        damping=.0001, orientation_weight=.12, measured_root_feedback=True,
+        measured_anchor=True, sideways_correction_rad=.01,
+    )
+    q = np.zeros(len(rig.joints))
+    measured = q.copy()
+    measured[rig.dof_names.index("left_knee")] = .2
+    pos = np.array([0., 0., rig.ground_offset_m])
+    quat = np.array([1., 0., 0., 0.])
+    actual = forward_kinematics(rig, dict(zip(rig.dof_names, measured, strict=True)),
+                               root_position=pos)
+    corrected = controller.correct(q, pos, quat, standing=True, measured_position=pos,
+                                   measured_quaternion=quat, measured_joints=measured)
+    np.testing.assert_allclose(controller.anchors["left_ankle"].translation[:2],
+                               actual["left_ankle"].translation[:2])
+    for name in controller.sideways_dofs:
+        assert abs(corrected[rig.dof_names.index(name)]) <= .01 + 1e-9
 
 
 def test_stance_ik_holds_contact_after_root_motion_and_releases_swing():
@@ -296,3 +352,94 @@ def test_measured_support_feet_is_empty_when_nothing_is_on_the_floor():
 
     with pytest.raises(ValueError, match="min_impulse_ns"):
         measured_support_feet(on_floor, min_impulse_ns=float("nan"))
+
+
+def test_support_grows_while_sinking_and_decays_when_not():
+    """The weight-support integral: sink below target grows it, recovery decays it."""
+
+    rig = plan()
+    controller = StanceFootController(
+        rig,
+        height_m=0.025,
+        iterations=3,
+        max_correction_rad=0.087,
+        damping=0.0001,
+        orientation_weight=0.12,
+        support_gain=0.1,
+        support_max_m=0.08,
+    )
+    q = np.zeros(len(rig.joints))
+    position = np.array([0.0, 0.0, rig.ground_offset_m])  # target root height
+    sunk = np.array([0.0, 0.0, rig.ground_offset_m - 0.03])  # 3 cm below target
+    for _ in range(30):
+        controller.correct(
+            q, position, np.array([1.0, 0, 0, 0]), standing=True, measured_position=sunk
+        )
+    assert controller.support_m["left_ankle"] > 0.01
+    assert controller.support_m["left_ankle"] <= 0.08
+    for _ in range(120):  # body back at target: decay, never below zero
+        controller.correct(
+            q, position, np.array([1.0, 0, 0, 0]), standing=True, measured_position=position
+        )
+    assert controller.support_m["left_ankle"] < 0.005
+
+
+def test_support_disabled_by_default_and_reset_on_swing():
+    rig = plan()
+    controller = StanceFootController(
+        rig,
+        height_m=0.025,
+        iterations=3,
+        max_correction_rad=0.087,
+        damping=0.0001,
+        orientation_weight=0.12,
+    )
+    q = np.zeros(len(rig.joints))
+    position = np.array([0.0, 0.0, rig.ground_offset_m])
+    sunk = np.array([0.0, 0.0, rig.ground_offset_m - 0.03])
+    for _ in range(20):
+        controller.correct(
+            q, position, np.array([1.0, 0, 0, 0]), standing=True, measured_position=sunk
+        )
+    assert controller.support_m.get("left_ankle", 0.0) == 0.0
+
+    supported = StanceFootController(
+        rig,
+        height_m=0.025,
+        iterations=3,
+        max_correction_rad=0.087,
+        damping=0.0001,
+        orientation_weight=0.12,
+        support_gain=0.1,
+        support_max_m=0.08,
+    )
+    for _ in range(20):
+        supported.correct(
+            q, position, np.array([1.0, 0, 0, 0]), standing=True, measured_position=sunk
+        )
+    assert supported.support_m["left_ankle"] > 0.0
+    # A swing foot releases its support state entirely (fresh touchdown at 0).
+    supported.correct(
+        q,
+        position,
+        np.array([1.0, 0, 0, 0]),
+        standing=False,
+        support_feet={"right_ankle"},
+        measured_position=sunk,
+    )
+    assert "left_ankle" not in supported.support_m
+
+
+def test_support_settings_are_validated():
+    rig = plan()
+    common = dict(
+        height_m=0.025,
+        iterations=1,
+        max_correction_rad=0.087,
+        damping=0.0001,
+        orientation_weight=0.12,
+    )
+    with pytest.raises(ValueError, match="positive cap"):
+        StanceFootController(rig, support_max_m=0.0, **common)
+    with pytest.raises(ValueError, match="finite"):
+        StanceFootController(rig, support_gain=float("nan"), **common)

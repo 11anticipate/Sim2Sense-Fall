@@ -36,15 +36,20 @@ class TeleopConfig:
     max_joint_speed_rad_s: float
     max_target_lead_m: float
     max_heading_lead_deg: float
-    # Turning in place with both feet planted pivots the flat feet on the floor --
-    # the user sees the body rotate like a skater. Above this turn rate (and with
-    # the root stopped) the controller plays the stepping-turn reference instead,
-    # so the body re-plants a lifted foot while it rotates.
-    turn_step_min_deg_s: float = 5.0
+    # Optional force-target height offset; never used as spawn/reset teleport.
+    # Contact-retargeted locomotion uses zero (height follows reachable feet).
+    root_z_offset_m: float = 0.0
 
     def __post_init__(self) -> None:
-        if any(not np.isfinite(v) or v <= 0 for v in vars(self).values()):
+        positive = all(
+            np.isfinite(v) and v > 0
+            for key, v in vars(self).items()
+            if key != "root_z_offset_m"
+        )
+        if not positive:
             raise ValueError("teleop controller settings must be finite and positive")
+        if not np.isfinite(self.root_z_offset_m) or self.root_z_offset_m > 0:
+            raise ValueError("root_z_offset_m must be finite and <= 0")
 
 
 ANCHOR_SOURCES = frozenset({"model", "contact", "contact_and_model"})
@@ -71,6 +76,13 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
             f"anchor_source must be one of {sorted(ANCHOR_SOURCES)}, "
             f"got {payload['anchor_source']!r}"
         )
+    # Standing height fraction for the contact-retargeted idle pose. 1.0 would be
+    # a near-singular straight leg that bounces on its floor contact; anything
+    # below ~0.97 reintroduces the crouch the standing fix removed.
+    payload.setdefault("idle_stand_height_fraction", 0.988)
+    fraction = payload["idle_stand_height_fraction"]
+    if not np.isfinite(fraction) or not 0.9 < fraction <= 1.0:
+        raise ValueError("idle_stand_height_fraction must be finite in (0.9, 1.0]")
     payload["controller"] = TeleopConfig(
         **{
             key: payload[key]
@@ -80,11 +92,15 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
     )
     for key in ("rig", "assets", "scene", "root_assist"):
         payload[key] = (project_root / payload[key]).resolve()
+    if "locomotion_root_assist" in payload:
+        if not payload.get("contact_planner"):
+            raise ValueError("locomotion_root_assist requires contact_planner")
+        payload["locomotion_root_assist"] = (
+            project_root / payload["locomotion_root_assist"]
+        ).resolve()
     specs = [*payload["gaits"].values(), payload["idle"]]
     if "crouch" in payload:
         specs.append(payload["crouch"])
-    if "turn" in payload:
-        specs.append(payload["turn"])
     for spec in specs:
         spec["file"] = (project_root / spec["file"]).resolve()
         if not np.isfinite([spec["start_s"], spec["duration_s"]]).all():
@@ -96,8 +112,31 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
             not np.isfinite(lift) or not 0 < lift <= SWING_LIFT_MAX_M
         ):
             raise ValueError(f"swing_lift_m must be finite in (0, {SWING_LIFT_MAX_M}]")
+        plant = spec.get("stance_plant_speed_m_s")
+        if plant is not None and (not np.isfinite(plant) or plant <= 0):
+            raise ValueError("stance_plant_speed_m_s must be finite and positive")
+        if plant is not None and abs(float(plant) - float(payload["speed_m_s"])) > 1e-9:
+            raise ValueError(
+                "stance_plant_speed_m_s must equal speed_m_s: planting holds the "
+                "foot world-static against the root at exactly the commanded speed"
+            )
     if set(payload["gaits"]) != {"forward", "backward"}:
         raise ValueError("keyboard mode requires forward and backward gaits")
+    if "contact_planner" in payload:
+        from .contact_gait import ContactGaitConfig
+
+        planner = payload["contact_planner"]
+        if not isinstance(planner, dict) or not planner:
+            raise ValueError("contact_planner must be a nonempty settings mapping")
+        planner_config = ContactGaitConfig(**planner)
+        if payload.get("stance", {}).get("enabled", False):
+            raise ValueError("contact_planner and legacy stance controller are mutually exclusive")
+        for spec in payload["gaits"].values():
+            cycle = spec.get("contact_cycle")
+            if not isinstance(cycle, dict) or not cycle:
+                raise ValueError("contact_planner requires contact_cycle on both gaits")
+            if ContactGaitConfig(**cycle) != planner_config:
+                raise ValueError("contact_cycle settings must match contact_planner")
     if np.shape(payload["spawn_xy"]) != (2,) or not np.isfinite(payload["spawn_xy"]).all():
         raise ValueError("spawn_xy must be a finite pair")
     for key in (
@@ -112,12 +151,19 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
             raise ValueError(f"{key} must be finite and positive")
     if int(payload["record_frames"]) != payload["record_frames"]:
         raise ValueError("record_frames must be an integer")
+    friction = payload.get("human_friction")
+    if friction is not None:
+        if not np.isfinite(friction).all() or len(friction) != 2 or min(friction) < 0:
+            raise ValueError("human_friction must be a finite (static, dynamic) pair >= 0")
+        payload["human_friction"] = [float(friction[0]), float(friction[1])]
     planted = payload.get("max_stance_slip_m_s")
     if planted is not None and (not np.isfinite(planted) or planted <= 0):
         raise ValueError("max_stance_slip_m_s must be finite and positive")
     for key in ("heading_deg", "camera_elevation_deg", "camera_azimuth_deg"):
         if not np.isfinite(payload[key]):
             raise ValueError(f"{key} must be finite")
+    if not np.isfinite(payload.get("camera_target_height_m", 0.8)):
+        raise ValueError("camera_target_height_m must be finite")
     if not 0 < payload["camera_elevation_deg"] < 90:
         raise ValueError("camera elevation must be between 0 and 90 degrees")
     for segment in payload["demo"]:
@@ -307,6 +353,9 @@ def bake_swing_clearance(
     clearance_m: float,
     max_correction_rad: float = 0.5,
     iterations: int = 60,
+    stance_speed_m_s: float | None = None,
+    stance_direction: float = 1.0,
+    geometry_mask: np.ndarray | None = None,
 ) -> Gait:
     """Raise swing feet that skim the floor, inside the reference itself.
 
@@ -333,9 +382,13 @@ def bake_swing_clearance(
     same abduction penalty the stance controller uses, chosen by FK probe.
     """
 
-    if not np.isfinite(clearance_m) or not 0 < clearance_m <= SWING_LIFT_MAX_M:
-        raise ValueError(f"clearance_m must be finite in (0, {SWING_LIFT_MAX_M}]")
-    mask = gait.support_mask
+    if not np.isfinite(clearance_m) or not 0 <= clearance_m <= SWING_LIFT_MAX_M:
+        # 0 is legitimate: plant the stance feet without adding any swing lift.
+        raise ValueError(f"clearance_m must be finite in [0, {SWING_LIFT_MAX_M}]")
+    # The run structure and planting follow the *geometry* mask (full stance/swing
+    # alternation from foot travel); the runtime anchor mask (planted subset) is a
+    # runtime concern and may fragment runs with gaps.
+    mask = geometry_mask if geometry_mask is not None else gait.support_mask
     if mask is None:
         raise ValueError("bake_swing_clearance needs a support mask (swing = not support)")
     names = list(plan.dof_names)
@@ -358,24 +411,150 @@ def bake_swing_clearance(
                 after += 1
             run_length[index, column] = before + after + 1
             fraction[index, column] = (before + 0.5) / run_length[index, column]
+    # Horizontal foot planting, chained around the cycle. Per foot, per stance
+    # run: the foot's body-frame x moves backwards at exactly the commanded root
+    # speed (world-static foot -- the source clips' stance feet slide, and the
+    # support A/B showed that slide is transmitted as drag once the feet are
+    # pressed onto the floor). Per swing run: a minimum-jerk return from the
+    # stance-end position to the next touchdown, so the landing velocity is zero
+    # in both axes (a foot arriving at up to double the walking speed skids for
+    # ~0.3 s every step -- the measured steady-slip tail).
+    planted_x = np.full((count, 2), np.nan)
+    swing_x = np.full((count, 2), np.nan)
+    if stance_speed_m_s is not None and stance_speed_m_s > 0:
+        cycle_wall_s = gait.speed_m_s * gait.duration_s / stance_speed_m_s
+        wall_per_frame = cycle_wall_s / max(count - 1, 1)
+        for column, (side, _c) in enumerate(SIDE_COLUMNS):
+            stance = mask[:, column]
+
+            def x_at(frame: int, side: str = side) -> float:
+                q0, h0 = gait.sample((frame % count) / (count - 1))
+                return _foot_fore_aft(
+                    plan, names, q0, h0, gait.tilt((frame % count) / (count - 1)), side
+                )
+
+            # Walk the circular run structure; each stance run is planted from its
+            # touchdown x, and the swing that follows returns minimum-jerk to the
+            # SAME touchdown x (periodic gait: the foot lands at the same
+            # body-frame x every cycle while the root advances underneath).
+            start = next(
+                (i for i in range(count) if stance[i] and not stance[(i - 1) % count]), None
+            )
+            if start is not None:
+                x_land = x_at(start)
+                index = 0
+                while index < count:
+                    # --- stance run: plant world-static ---
+                    stance_len = 0
+                    while (
+                        index + stance_len < count
+                        and stance[(start + index + stance_len) % count]
+                    ):
+                        stance_len += 1
+                    for step in range(stance_len):
+                        planted_x[(start + index + step) % count, column] = x_land - (
+                            stance_direction
+                            * stance_speed_m_s
+                            * (index + step)
+                            * wall_per_frame
+                        )
+                    index += stance_len
+                    # --- swing run: minimum-jerk return to the same landing x ---
+                    swing_len = 0
+                    while (
+                        index + swing_len < count
+                        and not stance[(start + index + swing_len) % count]
+                    ):
+                        swing_len += 1
+                    x_start_swing = x_land - (
+                        stance_direction * stance_speed_m_s * stance_len * wall_per_frame
+                    )
+                    delta_x = stance_direction * stance_speed_m_s * stance_len * wall_per_frame
+                    for step in range(swing_len):
+                        u = (step + 1) / max(swing_len, 1)
+                        smooth = 10 * u ** 3 - 15 * u ** 4 + 6 * u ** 5
+                        swing_x[(start + index + step) % count, column] = (
+                            x_start_swing + delta_x * smooth
+                        )
+                    index += swing_len
 
     endpoints_before = float(np.rad2deg(np.abs(gait.joints[-1] - gait.joints[0])).max())
     joints = gait.joints.copy()
     lifted = 0
     un_penetrated = 0
+    flight_grounded = 0
+    planted = 0
+    grounded_this_frame = ""
     for index in range(count):
         phase = index / (count - 1)
         q, height = gait.sample(phase)
+        q_reference = q.copy()
         tilt = gait.tilt(phase)
+        bottoms = {side: _foot_bottom(plan, names, q, height, tilt, side)
+                   for side, _column in SIDE_COLUMNS}
+        if not mask[index].any() and all(
+            bottom > FOOT_HEIGHT_STANCE_M for bottom in bottoms.values()
+        ):
+            # Only intervene when the phase schedule has no support foot. A planned
+            # stance foot is grounded below; pinning the lower SWING foot first
+            # would skip its lift and turn it into an unintended sliding contact.
+            # Both feet airborne is a hop, not a step (quick turn clips are full of
+            # them: CMU/83_56's 180 deg turn flies 0.5 s). A held A/D turn must
+            # read as stepping, so pin the *lower* foot back to the floor and let
+            # the higher one carry the swing.
+            lower = min(bottoms, key=lambda side: bottoms[side])
+            grounded_this_frame = lower
+            if bottoms[lower] > 0.01:
+                q = _move_foot(
+                    plan,
+                    q,
+                    lower,
+                    target_bottom=0.0,
+                    root_height=height,
+                    root_tilt=tilt,
+                    max_correction_rad=max_correction_rad,
+                    iterations=iterations,
+                )
+                flight_grounded += 1
+                bottoms[lower] = 0.0
+        else:
+            grounded_this_frame = ""
         for side, column in SIDE_COLUMNS:
             if mask[index, column]:
+                bottom = _foot_bottom(plan, names, q, height, tilt, side)
+                plant_x = planted_x[index, column]
+                if np.isfinite(plant_x):
+                    # Stance planting: hold the foot's fore-aft position at the
+                    # world-static trajectory and on the floor. Without this the
+                    # source's own stance slide is transmitted as drag the moment
+                    # the feet are pressed onto the floor (support A/B).
+                    current_x = _foot_fore_aft(plan, names, q, height, tilt, side)
+                    if abs(current_x - float(plant_x)) > 1e-3 or bottom < 0.0:
+                        q = _move_foot(
+                            plan,
+                            q,
+                            side,
+                            target_bottom=min(0.0, bottom),
+                            root_height=height,
+                            root_tilt=tilt,
+                            max_correction_rad=max_correction_rad,
+                            iterations=iterations,
+                            target_fore_aft=float(plant_x),
+                        )
+                        planted += 1
+                    continue
                 # Stance frames may reference *below* the floor (retargeting roots
                 # the whole body off one point; the other leg's geometry then dips
                 # a foot tens of millimetres under). The floor will refuse that
                 # anyway, and the PD spending its error budget against the floor is
                 # what shakes the whole body -- remove the penetration here.
-                bottom = _foot_bottom(plan, names, q, height, tilt, side)
-                if bottom < 0.0:
+                if abs(bottom) > 1e-3:
+                    # Plant the stance foot on the floor: pull DOWN the frames the
+                    # reference holds above it (+8 to +41 mm -- the source's own
+                    # foot rolling never reaches the ground after grounding, which
+                    # anchored the whole body off frame 0 only) as well as pushing
+                    # up the frames below it. Without this the foot floats at its
+                    # tracking error and the visible foot never touches.
                     q = _move_foot(
                         plan,
                         q,
@@ -388,32 +567,41 @@ def bake_swing_clearance(
                     )
                     un_penetrated += 1
                 continue
+            if side == grounded_this_frame:
+                # Just pinned by the no-flight rule; the swing lift must not undo it.
+                continue
             f = fraction[index, column]
             target = clearance_m * _swing_lift_profile(f)
-            # NOTE (measured, rejected): freezing the foot's fore-aft position over
-            # the descent so it lands with zero world velocity was tested in
-            # artifacts/humans/slip_lift_ab/ and *doubled* the forward session's
-            # joint error (3.91 -> 8.21 deg) while buying almost no slip p95
-            # improvement (0.457 -> 0.478 m/s). The height lift and stance
-            # de-penetration stay; the landing-velocity reshape does not.
+            # NOTE (measured, rejected): *abruptly* freezing the foot's fore-aft
+            # position over the descent doubled the forward session's joint error
+            # (3.91 -> 8.21 deg). What the steady-slip tail needed instead is the
+            # smooth minimum-jerk return (swing_x below): the foot still reaches
+            # zero world velocity at touchdown, but through a smooth lag instead
+            # of a per-step fight with the reference.
+            target_x = None
+            if np.isfinite(swing_x[index, column]):
+                target_x = float(swing_x[index, column])
             bottom = _foot_bottom(plan, names, q, height, tilt, side)
-            if bottom >= target - 1e-4:
+            if bottom >= target - 1e-4 and target_x is None:
                 continue
-            q_lifted = _move_foot(
+            q = _move_foot(
                 plan,
                 q,
                 side,
-                target_bottom=max(target, bottom),
+                target_bottom=max(target, bottom) if target_x is None else target,
                 root_height=height,
                 root_tilt=tilt,
                 max_correction_rad=max_correction_rad,
                 iterations=iterations,
+                target_fore_aft=target_x,
             )
             lifted += 1
-            # Add the correction *delta* to the stored row: writing the sampled pose
-            # back would bake the endpoint ramp into the array on top of the ramp
-            # Gait.sample applies again at run time.
-            joints[index] = gait.joints[index] + (q_lifted - q)
+        # One write-back per frame covering BOTH feet' corrections: add the total
+        # correction delta to the stored row. Writing the sampled pose back would
+        # bake the endpoint ramp into the array on top of the ramp Gait.sample
+        # applies again at run time; writing per-side dropped the other foot's
+        # correction and double-support frames lost every stance fix.
+        joints[index] = gait.joints[index] + (q - q_reference)
     if lifted:
         # Frames 0 and -1 are the same instant of the periodic reference. If the
         # window cut lands mid-swing, both ends of the same circular swing run get
@@ -436,6 +624,8 @@ def bake_swing_clearance(
     object.__setattr__(gait, "joints", joints)
     gait.provenance["swing_lift_m"] = float(clearance_m)
     gait.provenance["swing_lift_frames"] = int(lifted)
+    gait.provenance["flight_frames_grounded"] = int(flight_grounded)
+    gait.provenance["stance_plant_frames"] = int(planted)
     gait.provenance["stance_penetration_frames"] = int(un_penetrated)
     gait.provenance["endpoint_joint_difference_deg_after_lift"] = round(endpoints_after, 3)
     return gait
@@ -458,6 +648,23 @@ def _foot_bottom(
     return capsule_bottom(plan, poses, f"{side}_ankle")
 
 
+def _foot_fore_aft(
+    plan: HumanRigPlan,
+    names: list[str],
+    q: np.ndarray,
+    root_height: float,
+    root_tilt: np.ndarray,
+    side: str,
+) -> float:
+    poses = forward_kinematics(
+        plan,
+        dict(zip(names, q, strict=True)),
+        root_position=(0.0, 0.0, root_height),
+        root_rotation=root_tilt,
+    )
+    return float(poses[f"{side}_ankle"].translation[0])
+
+
 def _move_foot(
     plan: HumanRigPlan,
     joints: np.ndarray,
@@ -468,8 +675,14 @@ def _move_foot(
     root_tilt: np.ndarray,
     max_correction_rad: float,
     iterations: int,
+    target_fore_aft: float | None = None,
 ) -> np.ndarray:
-    """Bounded weighted joint-space least-norm IK raising one foot's bottom."""
+    """Bounded weighted joint-space least-norm IK moving one foot's pose.
+
+    Tasks: raise the capsule bottom to ``target_bottom`` and, when
+    ``target_fore_aft`` is given, hold the foot's body-frame fore-aft coordinate
+    there (the stance-planting task). Height alone uses the 1-row solve.
+    """
 
     indices = [
         i
@@ -489,13 +702,20 @@ def _move_foot(
             root_position=(0.0, 0.0, root_height),
             root_rotation=root_tilt,
         )
-        return np.array([capsule_bottom(plan, poses, f"{side}_ankle")])
+        bottom = capsule_bottom(plan, poses, f"{side}_ankle")
+        if target_fore_aft is None:
+            return np.array([bottom])
+        # Root sits at (0, 0, h) with no yaw, so the ankle's world x *is* the
+        # body-frame fore-aft coordinate.
+        return np.array([bottom, float(poses[f"{side}_ankle"].translation[0])])
 
     q = joints.copy()
     for _ in range(iterations):
         task = task_of(q)
         error = np.array([target_bottom - task[0]])
-        if abs(float(error[0])) <= 1e-4:
+        if target_fore_aft is not None:
+            error = np.array([target_bottom - task[0], target_fore_aft - task[1]])
+        if np.all(np.abs(error) <= 1e-4):
             break
         step = 0.02
         jacobian = np.zeros((len(error), len(indices)))
@@ -506,9 +726,8 @@ def _move_foot(
         # Least-norm with W = diag(weights): paying w times more per radian routes
         # the correction through flexion, not through the sideways splay that caused
         # the knee-abduction defect (docs/progress.md 2026-09-24).
-        delta = (jacobian[0] / weights) * float(error[0]) / max(
-            float(jacobian[0] @ (jacobian[0] / weights)), 1e-9
-        )
+        jw = jacobian / weights
+        delta = jw.T @ np.linalg.solve(jw @ jw.T + 1e-9 * np.eye(len(error)), error)
         q[indices] = np.clip(
             q[indices] + delta,
             np.maximum(lower[indices], original[indices] - max_correction_rad),
@@ -638,8 +857,20 @@ def load_gait(
     # claim as swing, so scrape-proof exactly that set: a swing foot that skims
     # the floor is dragged at ~0.8 m/s wherever it touches.
     lift = spec.get("swing_lift_m")
-    if lift:
-        gait = bake_swing_clearance(gait, plan, clearance_m=float(lift))
+    plant_speed = spec.get("stance_plant_speed_m_s")
+    if (lift or plant_speed) and not spec.get("contact_cycle"):
+        gait = bake_swing_clearance(
+            gait,
+            plan,
+            clearance_m=float(lift) if lift else 0.0,
+            stance_speed_m_s=float(plant_speed) if plant_speed else None,
+            stance_direction=float(gait.provenance.get("source_forward_sign", 1.0)),
+            geometry_mask=travel_support,
+        )
+    if spec.get("contact_cycle"):
+        from .contact_gait import ContactGaitConfig, bake_contact_cycle
+
+        gait = bake_contact_cycle(gait, plan, ContactGaitConfig(**spec["contact_cycle"]))
     scale = spec.get("turn_playback_scale")
     if scale is not None:
         if not np.isfinite(scale) or not 0 < scale <= 2.0:
@@ -669,19 +900,12 @@ class TeleopController:
         idle: Gait,
         plan: HumanRigPlan,
         heading_rad: float,
-        turn: Gait | None = None,
     ) -> None:
         self.config, self.gaits, self.idle, self.plan = config, gaits, idle, plan
         if set(gaits) != {"forward", "backward"} or any(g.speed_m_s <= 0 for g in gaits.values()):
             raise ValueError("moving gaits require nonzero measured speed")
         if any(g.joints.shape[1] != len(plan.joints) for g in (*gaits.values(), idle)):
             raise ValueError("gait DOF count must match rig")
-        if turn is not None and (
-            turn.joints.shape[1] != len(plan.joints) or turn.speed_m_s < 0
-        ):
-            raise ValueError("turn gait must match the rig DOFs and have nonnegative speed")
-        self.turn = turn
-        self.turning = False
         self.lower = np.deg2rad([j.lower_deg for j in plan.joints])
         self.upper = np.deg2rad([j.upper_deg for j in plan.joints])
         self.reset(np.asarray(plan.spawn_root_position), heading_rad)
@@ -694,7 +918,7 @@ class TeleopController:
         ):
             raise ValueError("reset requires finite position and heading")
         self.position = np.asarray(position, dtype=float).copy()
-        self.position[2] = self.idle.height_m[0]
+        self.position[2] = self.idle.height_m[0] + self.config.root_z_offset_m
         self.heading = float(heading_rad)
         self.phase = self.speed = self.turn_rate = self.weight = 0.0
         self.mode = "forward"
@@ -728,10 +952,14 @@ class TeleopController:
                 c.acceleration_m_s2 * dt_s,
             )
         )
+        # A/D turns only while walking (W/S held). At a standstill the turn command
+        # is ignored: the user explicitly disabled stationary turning after the
+        # pivoting and marching variants both failed acceptance.
+        turn_command = command[1] if abs(command[0]) > 0 else 0.0
         turn_accel = np.deg2rad(c.turn_acceleration_deg_s2) * dt_s
         self.turn_rate += float(
             np.clip(
-                command[1] * np.deg2rad(c.turn_speed_deg_s) - self.turn_rate,
+                turn_command * np.deg2rad(c.turn_speed_deg_s) - self.turn_rate,
                 -turn_accel,
                 turn_accel,
             )
@@ -754,58 +982,6 @@ class TeleopController:
         self.mode = (
             "backward" if self.speed < -1e-4 else "forward" if self.speed > 1e-4 else self.mode
         )
-        # Stepped turning: with the root stopped and the turn rate above threshold,
-        # play the stepping-turn reference so feet lift and re-plant while the body
-        # rotates, instead of pivoting both flat feet on the floor.
-        self.turning = bool(
-            self.turn is not None
-            and abs(self.speed) < 0.02
-            and abs(self.turn_rate) > np.deg2rad(c.turn_step_min_deg_s)
-        )
-        if self.turning:
-            clip_yaw_sign = float(
-                self.turn.provenance.get("source_yaw_sign", 1.0)
-            )
-            playback = 1.0 if np.sign(self.turn_rate) >= clip_yaw_sign else -1.0
-            scale = float(self.turn.provenance.get("turn_playback_scale", 1.0))
-            self.phase = (
-                self.phase + playback * scale * dt_s / self.turn.duration_s
-            ) % 1
-            self.weight += float(
-                np.clip(1.0 - self.weight, -dt_s / c.transition_s, dt_s / c.transition_s)
-            )
-            gait_q, gait_height = self.turn.sample(self.phase)
-            desired = np.clip(
-                (1 - self.weight) * self.idle.joints[0] + self.weight * gait_q,
-                self.lower,
-                self.upper,
-            )
-            delta = np.clip(
-                desired - self.joints,
-                -c.max_joint_speed_rad_s * dt_s,
-                c.max_joint_speed_rad_s * dt_s,
-            )
-            self.joints += delta
-            height = (1 - self.weight) * self.idle.height_m[0] + self.weight * gait_height
-            velocity[2] = (height - self.position[2]) / dt_s
-            self.position[2] = height
-            desired_tilt = (
-                (1 - self.weight) * self.idle.tilt(0) + self.weight * self.turn.tilt(self.phase)
-            )
-            self.tilt += min(1.0, dt_s / c.transition_s) * (desired_tilt - self.tilt)
-            rotation = rotation_about_axis("z", self.heading) @ axis_angle_to_matrix(self.tilt)
-            angular_velocity = matrix_to_axis_angle(rotation @ self.rotation.T) / dt_s
-            self.rotation = rotation
-            quaternion = axis_angle_to_quaternion(matrix_to_axis_angle(rotation))
-            return TeleopTarget(
-                self.joints.copy(),
-                delta / dt_s,
-                self.position.copy(),
-                quaternion,
-                velocity,
-                angular_velocity,
-                "turning" if self.weight > 0.01 else "stand",
-            )
         gait = self.gaits[self.mode]
         source_sign = gait.provenance.get(
             "source_forward_sign", 1 if self.mode == "forward" else -1
@@ -815,13 +991,15 @@ class TeleopController:
             self.phase
             + playback_sign * abs(self.speed) * dt_s / max(gait.speed_m_s * gait.duration_s, 1e-6)
         ) % 1
-        self.weight += float(
-            np.clip(
-                abs(self.speed) / c.speed_m_s - self.weight,
-                -dt_s / c.transition_s,
-                dt_s / c.transition_s,
-            )
-        )
+        # Exponential, not rate-clipped-linear, approach. A linear ramp ends by
+        # stepping its rate to zero in one frame; stopping from a walk then hands
+        # the body the blend's full upward velocity (~0.10 m/s) as momentum, which
+        # the standing leg column cannot absorb -- measured as a 66 ms support
+        # loss and a 16 deg hip error at the idle stand height. The exponential
+        # tail decays the blend velocity smoothly instead.
+        self.weight += (
+            abs(self.speed) / c.speed_m_s - self.weight
+        ) * min(1.0, dt_s / c.transition_s)
         gait_q, gait_height = gait.sample(self.phase)
         desired = np.clip(
             (1 - self.weight) * self.idle.joints[0] + self.weight * gait_q, self.lower, self.upper
@@ -831,6 +1009,7 @@ class TeleopController:
         )
         self.joints += delta
         height = (1 - self.weight) * self.idle.height_m[0] + self.weight * gait_height
+        height += self.config.root_z_offset_m
         velocity[2] = (height - self.position[2]) / dt_s
         self.position[2] = height
         desired_tilt = (1 - self.weight) * self.idle.tilt(0) + self.weight * gait.tilt(self.phase)

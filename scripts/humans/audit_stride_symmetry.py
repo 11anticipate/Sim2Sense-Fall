@@ -88,7 +88,7 @@ def build_plan(settings: dict[str, Any]) -> Any:
         from sim2sense_fall.humans.contact_control import fit_collision_capsules
 
         plan, _ = fit_collision_capsules(
-            plan, mesh, margin_m=settings["collision_fit"]["margin_m"]
+            plan, mesh, **{k: v for k, v in settings["collision_fit"].items() if k != "enabled"}
         )
     return plan
 
