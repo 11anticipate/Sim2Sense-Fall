@@ -56,6 +56,39 @@ provenance，兼容 ChannelSample）、`frame0000/frame0110.paths.png`（人体
 绘图已裁剪到人体周边；`--render-frames` 用 matplotlib 投影路径交互链而非
 Mitsuba 相机渲染——无线场景无光学发射器，照片式渲染全黑。
 
+## 第一批带标签对照样本（fall + ADL，2026-09-25）
+
+ADL 负例走键盘会话链路（`export_session_mesh.py` 分段标注 + importer 的
+`physics_keyboard_session` 入口）：
+
+```bash
+# 纯行走 demo 协议，原生 120 Hz 皮肤录制（--native-mesh 是准入前提：
+# complete_recording_window 需要逐物理帧采样）
+~/isaacsim/python.sh scripts/humans/keyboard.py --headless --demo \
+  --native-mesh --out artifacts/stage8_smoke/session_walk
+# 分段标注（label 由模式时间线与摔倒事件导出，准入需全会话质量门通过）
+python3 scripts/humans/export_session_mesh.py \
+  --run artifacts/stage8_smoke/session_walk --out artifacts/stage8_smoke/session_walk_export
+# RT：walk 段 → ADL 样本（channel_activity 将 walk/stand/... 映射为 ADL）
+/home/gsh/.local/opt/sionna/bin/python scripts/sionna/import_fall_mesh.py \
+  --dir artifacts/stage8_smoke/session_walk_export --sample forward_00 \
+  --frames 12 --render-frames --out artifacts/stage8_smoke/sionna
+```
+
+会话 `session_walk` 全门通过（accepted=true，前后走滑速 0.022–0.03、
+误差 2.9–3.8°），导出 6 个准入分段（walk ×2 + stand ×4）。`forward_00`
+RT 后得到 `forward_00.cir.npz` + 签名图。**fall/ADL 对照可分性**：行走样本
+功率围绕空场景基线小幅波动（无台阶）、时延扩展平稳 ~40–47 ns；摔倒样本是
+与事件对齐的台阶跳变（−11.75→0 dB、28→45 ns）。
+
+当前最小数据包（`artifacts/stage8_smoke/sionna/`，均为 physics 保真、
+完整 provenance）：
+
+| 样本 | 活动 | 来源链路 |
+| --- | --- | --- |
+| `smpl_neutral_standing__stand_neutral__push_backward` | fall | simulate.py 物理试验 |
+| `forward_00` | adl | keyboard 会话 → exporter 分段 |
+
 ## 历史导入记录说明
 
 以下环境/API 和首次 `floor_wall` 试验保留历史语境。旧功率 dB 值因丢弃虚部已撤回，

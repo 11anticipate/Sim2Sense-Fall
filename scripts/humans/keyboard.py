@@ -186,6 +186,15 @@ def main() -> int:
     parser.add_argument(
         "--capture", action="store_true", help="save live viewport at demo boundaries"
     )
+    parser.add_argument(
+        "--native-mesh",
+        action="store_true",
+        help=(
+            "sample the display skin every physics step (overrides "
+            "record_mesh_at_physics_hz); needed for an admissible complete "
+            "120 Hz recording when exporting sessions for the Sionna importer"
+        ),
+    )
     args = parser.parse_args()
     if not np.isfinite(args.seconds) or args.seconds < 0:
         parser.error("seconds must be finite and nonnegative")
@@ -210,6 +219,11 @@ def main() -> int:
     native_mesh = settings.get("record_mesh_at_physics_hz", False)
     if not isinstance(native_mesh, bool):
         raise ValueError("record_mesh_at_physics_hz must be boolean")
+    if args.native_mesh:
+        # Data-capture override: skin sampled every physics step, which the
+        # mesh exporter and the Sionna importer need for a complete 120 Hz
+        # recording window. Heavier than the interactive render-rate default.
+        native_mesh = True
     scene = args.scene or settings["scene"]
     provenance = {
         "controller_sources_sha256": {

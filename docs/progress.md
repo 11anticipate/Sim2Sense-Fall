@@ -3,6 +3,22 @@
 本文件保留各轮原始记录；正文中的“当前”“下一步”“仍未做”只对应其日期和配置。
 当前状态与任务统一见 [计划](../task_plan.md)，全部指南与历史审计见 [文档索引](README.md)。
 
+## 2026-09-25 最小带标签数据包（fall + ADL 对照）
+
+- `keyboard.py` 新增 `--native-mesh`（逐物理帧皮肤采样覆盖，ADL 会话准入的
+  `complete_recording_window` 前提）。纯行走 demo 会话在 120 Hz 原生录制下
+  **全门通过**（滑速 0.022–0.03、误差 2.9–3.8°），`export_session_mesh.py`
+  分段导出 6 个准入样本（walk ×2 + stand ×4，标签由模式时间线导出）。
+- `forward_00` walk 段过 Sionna RT → 第一个 **ADL** CIR 样本。fall/ADL
+  对照可分性成立：行走 = 基线小幅波动无台阶；摔倒 = 事件对齐的台阶
+  （−11.75→0 dB、时延扩展 28→45 ns、路径 64→97）。
+- 最小数据包（`artifacts/stage8_smoke/sionna/`，physics 保真）：fall
+  （simulate 物理试验）+ adl（keyboard 会话 walk 段），各含 .cir.npz、
+  provenance JSON、路径 3D 图、签名图。命令与口径见
+  [sionna-import.md](sionna-import.md)。
+- 未做（阶段 8 扩展）：50 Hz 批量口径、动态家具真值同步、人体电磁校准、
+  蹲/坐等更多 ADL 类别。
+
 ## 2026-09-25 阶段 8 smoke 重建（物理跌倒 → 复数 CIR 验收包恢复）
 
 - 新分支 `stage8-smoke-rebuild`。历史 smoke 证据删除后，用达标的人体控制按
