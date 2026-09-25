@@ -20,6 +20,42 @@ python3 scripts/sionna/import_fall_mesh.py --dry-run \
 
 输入不存在时，先按独立复核报告生成试验；`keyboard.py` 的 `recording.npz` 不是此入口要求的 trial 格式。
 
+## 阶段 8 smoke 重建（2026-09-25，分支 stage8-smoke-rebuild）
+
+历史证据（`artifacts/review_20260923/`）删除后，用达标的人体控制重建了
+"物理跌倒 → 复数 CIR" 可复核验收包。试验与历史口径一致：
+`smpl_neutral_standing` rig × `stand_neutral:push_backward`（200 N、0.4 s 起、
+0.25 s 脉冲），固定公寓、配置内 seed，120 Hz。
+
+```bash
+# 1) 物理试验（Isaac，headless）
+~/isaacsim/python.sh scripts/humans/simulate.py \
+  --out artifacts/stage8_smoke/trials --trial stand_neutral:push_backward
+# 2) CPU dry-run + Sionna RT（12 帧采样 + 路径验证渲染）
+python3 scripts/sionna/import_fall_mesh.py --dry-run \
+  --trial-json artifacts/stage8_smoke/trials/smpl_neutral_standing__stand_neutral__push_backward.trial.json
+/home/gsh/.local/opt/sionna/bin/python scripts/sionna/import_fall_mesh.py --frames 12 \
+  --render-frames \
+  --trial-json artifacts/stage8_smoke/trials/smpl_neutral_standing__stand_neutral__push_backward.trial.json \
+  --out artifacts/stage8_smoke/sionna
+# 3) CIR 签名图（瀑布 + 统计时间线，Sionna venv 内有 matplotlib）
+/home/gsh/.local/opt/sionna/bin/python scripts/sionna/plot_cir.py \
+  artifacts/stage8_smoke/sionna/smpl_neutral_standing__stand_neutral__push_backward.cir.npz
+```
+
+结果（`artifacts/stage8_smoke/`）：跌倒标签成立（撞击 0.633 s），
+`import.json` 六项检查全过（静态重复、基线重复、人体改变复数信道、运动改变
+复数信道、有限复数 CIR）。**摔倒签名肉眼可见**：站立帧（0–0.33 s）接收功率
+较空场景 −11.75 dB、RMS 时延扩展 ~28 ns；失衡后（0.37 s 起，对准 label
+`imbalance_onset_s=0.35`）功率跳至 ~0 dB、时延扩展 40–50 ns，路径数
+64→97。产物：`.cir.npz`（11 帧 × 201 抽头复数）、`.import.json`（完整
+provenance，兼容 ChannelSample）、`frame0000/frame0110.paths.png`（人体
+网格 + TX/RX + 反射链 3D 图）、`..._cir_signature.png`。
+
+口径说明：路径 3D 图中走出公寓远端的地面反弹是真实的（RT 场景含大地面），
+绘图已裁剪到人体周边；`--render-frames` 用 matplotlib 投影路径交互链而非
+Mitsuba 相机渲染——无线场景无光学发射器，照片式渲染全黑。
+
 ## 历史导入记录说明
 
 以下环境/API 和首次 `floor_wall` 试验保留历史语境。旧功率 dB 值因丢弃虚部已撤回，

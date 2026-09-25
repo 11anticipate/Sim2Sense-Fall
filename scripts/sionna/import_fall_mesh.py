@@ -76,6 +76,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--rx", type=float, nargs=3)
     p.add_argument("--cylinder-segments", type=int, default=32)
     p.add_argument("--out", type=Path, default=REPO_ROOT / "artifacts/sionna/apartment_import")
+    p.add_argument(
+        "--render-frames",
+        action="store_true",
+        help=(
+            "save scene validation renders of the first and last imported frames: the "
+            "propagation scene with the human mesh in place, seen from a fixed viewpoint "
+            "derived from the tx/rx midpoint"
+        ),
+    )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     for key in ("frequency_hz", "bandwidth_hz", "max_delay_s", "standoff_m", "height_m"):
@@ -266,6 +275,56 @@ def main(argv: list[str] | None = None) -> int:
         place_mesh_in_scene(scene, vertices[frame], faces, name="human", material=material)
         if len(scene.objects) != object_count + 1:
             raise RuntimeError("scene does not contain exactly one additional human")
+        if args.render_frames and k in (0, len(frames) - 1):
+            # Validation render: the propagation paths with the human in place,
+            # drawn from the paths' own interaction chains. A Mitsuba camera
+            # render of the radio scene is useless here (no optical emitters,
+            # and the room geometry leaves no safe exterior viewpoint); the
+            # matplotlib projection shows the body, the devices and every
+            # reflection unambiguously.
+            import matplotlib.pyplot as plt
+
+            paths = rt.PathSolver()(
+                scene,
+                max_depth=args.max_depth,
+                samples_per_src=args.samples_per_src,
+                seed=args.seed,
+                diffuse_reflection=False,
+            )
+            chains = np.asarray(paths.vertices.numpy(), dtype=np.float64)[:, 0, 0, :, :]
+            valid = np.asarray(paths.valid.numpy()).astype(bool).ravel()
+            body = np.asarray(vertices[frame])
+            figure = plt.figure(figsize=(10, 7))
+            axis = figure.add_subplot(projection="3d")
+            axis.plot_trisurf(
+                body[:, 0], body[:, 1], body[:, 2],
+                triangles=faces, color="0.75", alpha=0.45, linewidth=0,
+            )
+            for path_index in np.flatnonzero(valid):
+                chain = chains[:, path_index, :]
+                chain = chain[np.linalg.norm(chain, axis=1) > 1e-6]
+                polyline = np.vstack([np.asarray(tx), chain, np.asarray(rx)])
+                axis.plot(
+                    polyline[:, 0], polyline[:, 1], polyline[:, 2],
+                    linewidth=0.4, alpha=0.55,
+                )
+            axis.scatter(*tx, color="green", s=45, label="tx")
+            axis.scatter(*rx, color="red", s=45, label="rx")
+            # Crop to the body neighbourhood: the scene carries a large ground
+            # plane whose far bounces are real but irrelevant at this zoom.
+            center = body.mean(axis=0)
+            axis.set_xlim(center[0] - 6.0, center[0] + 6.0)
+            axis.set_ylim(center[1] - 6.0, center[1] + 6.0)
+            axis.set_zlim(0.0, 2.8)
+            axis.set_xlabel("x (m)")
+            axis.set_ylabel("y (m)")
+            axis.set_zlabel("z (m)")
+            axis.legend(loc="upper left", fontsize=8)
+            axis.set_title(f"propagation paths, frame {frame} (t={times[frame]:.2f} s)")
+            render_path = args.out / f"{out_name}.frame{frame:04d}.paths.png"
+            figure.savefig(render_path, dpi=150)
+            plt.close(figure)
+            print(f"rendered {render_path.name}")
         cir, record = solve(scene, rt, args, grid)
         if k == 0:
             repeat, _ = solve(scene, rt, args, grid)

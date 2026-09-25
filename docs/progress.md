@@ -3,6 +3,24 @@
 本文件保留各轮原始记录；正文中的“当前”“下一步”“仍未做”只对应其日期和配置。
 当前状态与任务统一见 [计划](../task_plan.md)，全部指南与历史审计见 [文档索引](README.md)。
 
+## 2026-09-25 阶段 8 smoke 重建（物理跌倒 → 复数 CIR 验收包恢复）
+
+- 新分支 `stage8-smoke-rebuild`。历史 smoke 证据删除后，用达标的人体控制按
+  原口径重建：`simulate.py` 物理试验（stand_neutral × push_backward，200 N，
+  全门通过、撞击 0.633 s、基座场景未改动）→ `import_fall_mesh.py` Sionna RT
+  12 帧采样 → 复数 CIR + 完整 provenance JSON。
+- `import.json` 六项检查全过（静态/基线重复确定性好、人体改变复数信道、运动
+  改变复数信道、有限 CIR）。**摔倒签名可见**：站立期功率 −11.75 dB/时延扩展
+  28 ns，失衡起（对准 label onset 0.35 s）功率 +15 dB 跳变、时延扩展 40–50 ns、
+  路径 64→97。
+- 新增可视化：`scripts/sionna/plot_cir.py`（CIR 瀑布图 + 功率/时延扩展时间线，
+  自动从 trial JSON 对齐撞击时刻）；`import_fall_mesh.py --render-frames`
+  （路径交互链 3D 图，matplotlib 投影，规避无线场景无光学发射器的黑渲染与
+  房间相机定位问题）。
+- 命令与口径详见 [sionna-import.md](sionna-import.md) 2026-09-25 节。
+  这仍是单场景单类跌倒 smoke：ADL 负例、recording.npz → RT 转换、50 Hz 批量、
+  动态家具同步、人体电磁校准仍是阶段 8 扩展项。
+
 ## 2026-09-25 姿态过渡接触一致化（蹲/坐/弯共用机制）
 
 - **根因分离（两个独立缺陷）**：①过渡/保持的根高与关节构型独立线性混合——参考
