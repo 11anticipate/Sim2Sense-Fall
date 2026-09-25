@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Paired before/after montage for the P0-A arm-swing fix (same camera, same instant).
+
+``task_plan.md`` P0-A item 4 asks for a "same-camera before/after comparison".
+The fix is a source-window change, so the before and after runs are two separate
+Isaac sessions; what makes them comparable is that both use
+``scripts/humans/arm_capture.py`` with:
+
+* the identical camera (azimuth, distance, elevation) and identical scene,
+* the identical capture schedule (the same simulated instants of the demo),
+* the identical controller, rig and root assist,
+
+and differ *only* in ``configs/humans/keyboard.yaml``'s ``gaits`` entries.
+
+Layout: one row per camera azimuth; within a row, each simulated instant is a
+pair of cells, left = before (shipped window), right = after (re-selected
+window). A numeric summary of both reports is written next to the montage so the
+verdict does not rest on the picture alone.
+
+Usage::
+
+    python3 artifacts/humans/arm_capture_before_after/make_before_after.py \
+        --before artifacts/humans/arm_capture_azimuths \
+        --after  artifacts/humans/arm_capture_fixed_azimuths
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+LABELS = {
+    0.0: "az 0  front",
+    90.0: "az 90  subject's left (fore-aft swing horizontal, left arm nearest)",
+    180.0: "az 180  back",
+    270.0: "az 270  subject's right (fore-aft swing horizontal, right arm nearest)",
+}
+
+FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
+
+
+def _font(name: str, size: int) -> Any:
+    path = FONT_DIR / name
+    if not path.exists():
+        raise FileNotFoundError(f"montage needs the DejaVu font at {path}")
+    return ImageFont.truetype(str(path), size)
+
+
+def _index(run: Path) -> tuple[dict[str, Any], dict[tuple[float, float], dict[str, Any]]]:
+    report = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    period = float(report["cycle_period_s"])
+    keyed = {
+        (
+            float(row["azimuth_deg"]),
+            round(float(row["request_time_s"]) - row["cycle"] * period, 3),
+        ): row
+        for row in report["captures"]
+    }
+    return report, keyed
+
+
+def _primary_span(span: dict[str, Any], joint: str) -> dict[str, float]:
+    """Rank-and-file span of ``joint``'s primary (last) chain DOF, in degrees.
+
+    The chain DOF names carry a ``__dofN`` suffix that is a *slot index, not the
+    rotation axis*: ``primary_axis`` in the report is the authoritative marker and
+    the primary axis is always the last chain DOF. So we select by that flag
+    rather than by guessing the suffix, and we refuse to silently return 0.0 when
+    the joint or the flag is absent -- a missing entry must fail loudly, otherwise
+    a renamed joint would read as "no swing" and invert the conclusion.
+    """
+
+    def is_member(name: str) -> bool:
+        return name == joint or name.split("__")[0] == joint
+
+    members = {name: entry for name, entry in span.items() if is_member(name)}
+    if not members:
+        raise KeyError(f"no joint_span_deg entry for joint {joint!r}")
+    primaries = [name for name, entry in members.items() if entry.get("primary_axis")]
+    if len(primaries) != 1:
+        raise ValueError(f"joint {joint!r} has {len(primaries)} primary-axis DOFs, expected 1")
+    entry = members[primaries[0]]
+    return {
+        "dof": primaries[0],
+        "ptp_target_deg": float(entry["ptp_target_deg"]),
+        "ptp_actual_deg": float(entry["ptp_actual_deg"]),
+        "tracking_error_deg": abs(float(entry["ptp_actual_deg"]) - float(entry["ptp_target_deg"])),
+    }
+
+
+def _summary(report: dict[str, Any], label: str) -> dict[str, Any]:
+    span = report.get("joint_span_deg", {})
+    shoulder = {side: _primary_span(span, f"{side}_shoulder") for side in ("left", "right")}
+    elbow = {side: _primary_span(span, f"{side}_elbow") for side in ("left", "right")}
+    # A frozen limb shows up as a tiny rank-and-file span, so report the absolute
+    # fore-aft swing per limb as well as the ratio -- the ratio alone can look
+    # healthy if *both* arms are equally stuck.
+    return {
+        "label": label,
+        "report": str(report.get("out_dir", "")),
+        "joint_error_max_deg": report.get("joint_error_max_deg"),
+        "joint_error_worst_dof": report.get("joint_error_worst_dof"),
+        "force_peak_n": report.get("force_peak_n"),
+        "skin_min_z_m": report.get("skin_min_z_m"),
+        "floor_contact_slip": report.get("floor_contact_slip"),
+        "right_shoulder_primary": shoulder["right"],
+        "left_shoulder_primary": shoulder["left"],
+        "right_elbow_primary": elbow["right"],
+        "left_elbow_primary": elbow["left"],
+        "right_over_left_shoulder_primary": (
+            shoulder["right"]["ptp_actual_deg"] / shoulder["left"]["ptp_actual_deg"]
+        ),
+        "right_over_left_elbow_primary": (
+            elbow["right"]["ptp_actual_deg"] / elbow["left"]["ptp_actual_deg"]
+        ),
+        "quality_gates": report.get("quality_gates"),
+        "errors": report.get("errors"),
+    }
+
+
+def _same_run_checks(before_report: dict[str, Any], after_report: dict[str, Any]) -> dict[str, Any]:
+    """Prove the two runs differ *only* in the clip window, which is the premise
+    that makes a side-by-side montage a valid before/after comparison.
+
+    ``camera`` on its own is not evidence of identical framing: the camera is
+    placed from the same literal config in both runs, so the field is
+    constant-by-construction. We therefore compare the inputs that the fix does
+    not touch and that would silently invalidate the montage if they drifted --
+    the scene and rig hashes, the seed, the capture schedule, the physics timestep
+    and the azimuth plan -- and separately assert that the *keyboard config hash
+    did change*, since a fix that did not change the config would be a no-op.
+    """
+
+    def differs(field: str) -> bool:
+        return before_report.get(field) != after_report.get(field)
+
+    must_match = (
+        "scene_sha256",
+        "rig_sha256",
+        "root_assist_sha256",
+        "seed",
+        "cycle_period_s",
+        "capture_windows_s",
+        "capture_rate_hz",
+        "physics_dt_s",
+        "view_azimuth_plan_deg",
+        "view_azimuths_deg",
+        "mode",
+        "camera",
+    )
+    return {
+        "must_match": {field: not differs(field) for field in must_match},
+        "keyboard_sha256_changed": differs("keyboard_sha256"),
+        "keyboard_sha256_before": before_report.get("keyboard_sha256"),
+        "keyboard_sha256_after": after_report.get("keyboard_sha256"),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--before", type=Path, required=True)
+    parser.add_argument("--after", type=Path, required=True)
+    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--thumb-w", type=int, default=320)
+    parser.add_argument("--thumb-h", type=int, default=240)
+    args = parser.parse_args(argv)
+    out = args.out or args.after
+
+    before_report, before = _index(args.before)
+    after_report, after = _index(args.after)
+    common_keys = sorted(set(before) & set(after))
+    if not common_keys:
+        raise SystemExit("no shared (azimuth, instant) cell between the two runs")
+    dropped = sorted(set(before) ^ set(after))
+
+    azimuths = sorted({key[0] for key in common_keys})
+    instants = sorted({key[1] for key in common_keys})
+
+    tw, th = args.thumb_w, args.thumb_h
+    header_h = 34
+    row_label_h = 24
+    pair_gap = 6
+    column_w = tw * 2 + pair_gap
+    canvas = Image.new(
+        "RGB",
+        (column_w * len(instants), header_h + (row_label_h + th) * len(azimuths)),
+        "white",
+    )
+    draw = ImageDraw.Draw(canvas)
+    font = _font("DejaVuSans.ttf", 14)
+    font_bold = _font("DejaVuSans-Bold.ttf", 15)
+
+    for column_index, instant in enumerate(instants):
+        draw.text(
+            (column_index * column_w + 6, 9),
+            f"W-forward, cycle t={instant:.2f} s   (left: before | right: after)",
+            font=font_bold,
+            fill="black",
+        )
+
+    missing: list[str] = []
+    for row_index, azimuth in enumerate(azimuths):
+        y0 = header_h + row_index * (row_label_h + th)
+        draw.text((6, y0 + 4), LABELS.get(azimuth, f"az {azimuth}"), font=font, fill="black")
+        for column_index, instant in enumerate(instants):
+            x0 = column_index * column_w
+            for slot, (key, source) in enumerate(((before, "before"), (after, "after"))):
+                record = key.get((azimuth, instant))
+                x = x0 + slot * (tw + pair_gap)
+                y = y0 + row_label_h
+                if record is None:
+                    missing.append(f"az{azimuth}@{instant}:{source}")
+                    draw.rectangle([x, y, x + tw - 1, y + th - 1], outline="red")
+                    continue
+                with Image.open(record["path"]) as image:
+                    canvas.paste(image.convert("RGB").resize((tw, th)), (x, y))
+                draw.rectangle(
+                    [x, y, x + tw - 1, y + th - 1],
+                    outline="#2266cc" if slot == 0 else "#cc6622",
+                    width=2,
+                )
+        draw.line(
+            [0, y0 + row_label_h + th, canvas.size[0], y0 + row_label_h + th],
+            fill="#dddddd",
+        )
+
+    target = out / "arm_before_after_montage.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(target)
+
+    checks = _same_run_checks(before_report, after_report)
+    comparison = {
+        "before": _summary(before_report, "before(shipped_window)"),
+        "after": _summary(after_report, "after(reselected_window)"),
+        "same_run_checks": checks,
+        "shared_cells": len(common_keys),
+        "unshared_cells": [f"az{key[0]}@{key[1]}" for key in dropped],
+        "capture_windows_before_s": before_report.get("capture_windows_s"),
+        "capture_windows_after_s": after_report.get("capture_windows_s"),
+        "camera_before": before_report.get("camera"),
+        "camera_after": after_report.get("camera"),
+        "montage": str(target),
+    }
+    (out / "before_after_comparison.json").write_text(
+        json.dumps(comparison, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(f"wrote {target} ({canvas.size[0]}x{canvas.size[1]}), {len(common_keys)} shared cells")
+    for name, row in (("before", comparison["before"]), ("after", comparison["after"])):
+        print(
+            f"  {name:6s} shoulder R/L {row['right_over_left_shoulder_primary']:.3f}"
+            f" (R {row['right_shoulder_primary']['ptp_actual_deg']:.2f} deg,"
+            f" L {row['left_shoulder_primary']['ptp_actual_deg']:.2f} deg)"
+        )
+        print(
+            f"  {name:6s} elbow    R/L {row['right_over_left_elbow_primary']:.3f}"
+            f" (R {row['right_elbow_primary']['ptp_actual_deg']:.2f} deg,"
+            f" L {row['left_elbow_primary']['ptp_actual_deg']:.2f} deg)"
+        )
+    if dropped:
+        print("unshared cells:", ", ".join(comparison["unshared_cells"]))
+    if missing:
+        print("missing cells:", ", ".join(missing))
+    broken = [field for field, ok in checks["must_match"].items() if not ok]
+    if broken:
+        raise SystemExit(
+            "NOT a valid before/after pair: these inputs differ and should not: "
+            + ", ".join(broken)
+        )
+    if not checks["keyboard_sha256_changed"]:
+        raise SystemExit(
+            "NOT a valid before/after pair: keyboard config hash is identical, so the "
+            "runs used the same clip and the comparison is a no-op"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -3,37 +3,172 @@ rig: configs/humans/human_smpl_multiaxis.yaml
 assets: configs/humans/assets.yaml
 scene: artifacts/scenes/indoor_apartment.usda
 root_assist: configs/humans/root_assist.yaml
+root_assist_scale: 1.0
 spawn_xy: [10.255, 1.455]
 heading_deg: 90.0
 speed_m_s: 0.4
 acceleration_m_s2: 0.8
 turn_speed_deg_s: 30.0
 turn_acceleration_deg_s2: 90.0
+# Above this commanded turn rate (with the root stopped) the controller plays the
+# stepping-turn reference below: feet lift and re-plant while the body rotates,
+# instead of pivoting both flat feet on the floor like a skater.
+turn_step_min_deg_s: 8.0
 transition_s: 0.35
 max_joint_speed_rad_s: 4.0
 max_target_lead_m: 0.10
 max_heading_lead_deg: 15.0
 render_hz: 30.0
 record_frames: 14400
-camera_distance_m: 4.5
-camera_elevation_deg: 50.0
+camera_distance_m: 3.2
+camera_elevation_deg: 65.0
 camera_azimuth_deg: -55.0
 slip_min_impulse_ns: 0.01
 slip_speed_tolerance_m_s: 0.15
 skin_penetration_tolerance_m: 0.005
+# Whether the stance anchors are gated on the simulator's own contact report instead of on
+# the gait model's travel-derived support mask (StanceFootController.correct's support_feet).
+#
+# Why this exists: load_gait decides stance from horizontal ankle travel in forward
+# kinematics -- a guess about contact, made before the simulation runs. Measured against the
+# contact PhysX actually reported, on four archived sessions, the guess is wrong in both
+# directions: it misses 46-56% of the right foot's real floor contacts and 10-31% of the
+# left's, while 16-28% of the feet it calls support are not touching (the ones that are not
+# sit 1-5 mm off the floor, so those are threshold effects, not gross errors). The misses are
+# the expensive half: an anchor is never placed on the right foot's real stance.
+# Evidence: artifacts/humans/mask_vs_contact/all.json, tool scripts/humans/audit_mask_vs_contact.py,
+# measurements in docs/mask-vs-contact-audit.md.
+#
+# false is the shipped setting and preserves the existing behaviour. true is the accuracy-first
+# variant: a foot may be anchored only while the simulator reports it on the floor. An empty
+# measured set is honoured as "nothing is standing", never silently replaced by the model --
+# during standing the controller plants both feet anyway, independent of this gate.
+anchor_from_contact: false
+collision_fit:
+  enabled: true
+  margin_m: 0.003
+stance:
+  enabled: true
+  height_m: 0.025
+  iterations: 3
+  # 0.087 rad = 5 deg at the knee swings a 0.40 m shank about 35 mm, which matches
+  # release_residual_m below: the anchor is held inside that band or let go. Reverting
+  # this to the old 0.7 rad while keeping the prior still lets the solve spend 40 deg on
+  # the flexion axes, so budget and prior are both needed; the ablations are recorded in
+  # artifacts/humans/stance_ik_audit/ (variants revert_budget, revert_prior, before_config,
+  # before_all) from scripts/humans/audit_stance_ik.py.
+  max_correction_rad: 0.087
+  damping: 0.0001
+  orientation_weight: 0.12
+  swing_clearance_m: 0.06
+  measured_root_feedback: false
+  # Joint-space cost on the leg axes that are efficient lateral movers of the ankle,
+  # chosen by FK probe (>=0.10 m of lateral ankle travel per radian, lateral dominant),
+  # never by the axis letter: x is the frontal-plane axis of the leg chains today, but an
+  # axis letter carries no anatomical role and the arm chains already order it differently.
+  # 1000 is a measured choice, not a round number -- the value below it does nothing and
+  # the knee keeps taking the full budget: sideways injection 4.98 deg at 1 and 40, 4.41 at
+  # 100, 0.53 at 1000, 0.07 at 1e4 (artifacts/humans/stance_ik_prior_sweep, refresh with
+  # scripts/humans/audit_stance_ik.py --variant prior_1e3=abduction_weight=1000.0). Beyond
+  # 1e3 nothing improves and the anchor gives up more often, so this is a floor on the
+  # knee, not a cure: the correction is carried by 5 deg of flexion plus the release below.
+  abduction_weight: 1000.0
+  release_residual_m: 0.03
+# Anchors are only set on a foot the reference itself keeps still. The travel-based
+# support mask marked feet planted that were still sliding at a median 0.134 m/s (forward)
+# and 0.108 m/s (backward); this gate rejects 46.8% and 38.1% of those frames. Deliberately
+# equal to slip_speed_tolerance_m_s: the reference must not be asked to break the rule the
+# physics is graded on. Measured honesty note: this gate is hygiene, not the knee fix --
+# with it off the sideways injection is unchanged and the anchor churn doubles (213 vs
+# 102 releases). It also does not make the anchor reachable: the residual is still 96 mm
+# and 97.5% of steps sit on the budget, so neither shipped source holds a planted foot.
+# The remaining slip is a source/control finding, tracked in task_plan.md P0-B.
+max_stance_slip_m_s: 0.15
+actions:
+  transition_s: 1.8
+  stopped_speed_m_s: 0.025
+  fall_force_n: 350.0
+  fall_duration_s: 0.25
+  fall_control_scale: 0.0
+  fallen_height_fraction: 0.60
+  fallen_tilt_deg: 50.0
+crouch:
+  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/crouchwalk_stand_poses.npz
+  start_s: 3.25
+  duration_s: 0.1
 gaits:
+  # Windows re-fitted on 2026-09-24 to whole strides (user-reported limp: the left leg
+  # strode visibly wider than the right). The defect was in the window, not the source:
+  # Gait.sample builds the periodic reference by subtracting a linear ramp
+  # `phase * (joints[-1] - joints[0])`, which is harmless only when the window holds a whole
+  # number of strides. The old 1.2 s windows were not whole strides -- endpoint differences of
+  # 16.95 deg (forward) and 32.87 deg (backward) -- so the ramp cancelled real motion at a
+  # per-DOF rate. The legs sit half a stride apart, so the same ramp reached them at opposite
+  # phases and came out as a constant fore-aft stagger between the feet.
+  #
+  # Measured through the shipped pipeline by scripts/humans/fit_gait_windows.py, which fits the
+  # window and refuses half-strides (a candidate whose lag-2P periodicity beats its lag-P one is
+  # half a stride). Evidence artifacts/humans/gait_window_fit/fit.json.
+  #
+  #   forward (CMU/08/04)  window 0.0 s + 1.2 s   -> 1.9667 s + 1.3083 s (157 frames)
+  #     loop closure               16.95 deg -> 1.54 deg
+  #     fore-aft stagger 247.1 mm -> 0.1 mm      step length L/R 0.880 -> 1.020
+  #   backward (CMU/08/11) window 0.4 s + 1.2 s   -> 0.4 s + 1.4833 s (178 frames)
+  #     loop closure               32.87 deg -> 3.33 deg
+  #     fore-aft stagger  95.8 mm -> 5.2 mm      step length L/R 1.076 -> 0.997
+  #
+  # These windows also change the stride the root advances per cycle (forward 932 -> 1154 mm),
+  # so results produced before this change are not comparable with results after it.
+  #
+  # The forward/backward files were themselves re-selected earlier on 2026-09-24 to fix the
+  # P0-A right-arm complaint (previous windows Transitions_mocap/mazen_c3d/walkbackwards_stand
+  # @3.92 s and @0.80 s measured right/left fore-aft arm ratios of 0.373 shoulder and 0.274
+  # elbow -- the right arm was under-swung by the source clip itself). See docs/arm-swing-audit.md
+  # and scripts/humans/arm_source_screen.py. Idle stays on the original clip: it is a near-static
+  # pose, so arm swing does not apply to it.
   forward:
-    file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/walkbackwards_stand_poses.npz
-    start_s: 3.9166666666666665
-    duration_s: 1.0416666666666667
+    cadence_from_retargeted_feet: true
+    # Minimum swing clearance baked into the reference itself (bake_swing_clearance).
+    # Measured on this cycle: the retargeted swing foot lifts to a median 14.7 mm
+    # (right) / 32.1 mm (left) and spends 25/158 (right) phase frames below 10 mm
+    # while moving ~0.8 m/s over the world -- any contact there is a forced scrape,
+    # and it dominates the measured slip (target-side foot speed at contact frames
+    # p50 0.40 / p95 0.97 m/s, vs root fluctuation p50 0.02 and joint tracking
+    # p50 0.03; artifacts/humans/limp_ab/slip_attribution.json). The runtime stance
+    # IK cannot fix this: it re-derives from the fresh reference each step, so its
+    # 0.087 rad budget never accumulates into the ~20 deg a real 50 mm lift needs.
+    # Baking the lift keeps endpoints closed (1.54 -> 0.02 deg) and leaves the
+    # fore-aft stagger at 0.0 mm.
+    swing_lift_m: 0.05
+    file: data/humans/amass_raw/CMU/08/08_04_poses.npz
+    start_s: 1.9667
+    duration_s: 1.3083
   backward:
-    file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/walkbackwards_stand_poses.npz
-    start_s: 0.8
-    duration_s: 0.7916666666666666
+    cadence_from_retargeted_feet: true
+    swing_lift_m: 0.05
+    file: data/humans/amass_raw/CMU/08/08_11_poses.npz
+    start_s: 0.4
+    duration_s: 1.4833
 idle:
   file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/walkbackwards_stand_poses.npz
   start_s: 3.4
   duration_s: 0.1
+# Stepped turn-in-place reference (CMU/83/83_56): 177 deg in 4.17 s across six
+# alternating steps (3 left + 3 right, verified by scripts/humans/verify_turn_clips.py).
+# The window below cuts four step cycles (~0.417 s each) starting just before the
+# first recorded foot lift, so the cycle seam repeats the same step phase. The
+# support mask comes from foot height: this clip barely translates the root, so
+# the travel-based derivation used for walking has nothing to oppose.
+turn:
+  support_mask_from: foot_height
+  swing_lift_m: 0.05
+  # Play the stepping reference at 60% speed: at source cadence (2.4 steps/s) the
+  # PD lags the fast leg swings (22.8 deg joint error) and the body is airborne
+  # 52% of the pivot -- both improve with slower steps.
+  turn_playback_scale: 0.6
+  file: data/humans/amass_raw/CMU/83/83_56_poses.npz
+  start_s: 1.625
+  duration_s: 1.6667
 demo:
   - {duration_s: 1.0, keys: []}
   - {duration_s: 3.0, keys: [W]}

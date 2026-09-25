@@ -61,15 +61,66 @@
 - `load_amass_library` 用 rglob 收全部 npz，`--root` 指向只含 `*_poses.npz` 的目录。
 - 本机已有 2198 条（CMU 2088 + Transitions 110），去重切片 2146。
 
-## 当前状态与卡点（2026-09-23）
+## 当前状态与卡点（2026-09-24 更新）
 
 - 已跑通：固定公寓 + SMPL 有限 PD 静态站立/后推物理跌倒 → 完整公寓 Sionna 复数 CIR（阶段 8 smoke）。
 - 手臂 T-pose 已修（肩轴 y→x、肘 y→z；站立横向半跨度 91.3→22.3 cm）。
-- **核心卡点：clip→DOF 多轴分解**。planner 已支持多轴链，映射器（AMASS 逐关节旋转→当前
-  14 DOF 单轴关节）尚未分解；抽样 120 条得 28 条跌倒候选，0 条可被当前单轴 rig 表达，
-  卡点全在肘/肩。
+- **原「clip→DOF 多轴分解」卡点已解除**：现役 rig 是**多轴链** 57 DOF / 62 连杆 / 22 碰撞体，
+  每个记录关节展开成 3 个转动关节（主摆轴**最后**）。DOF 名后缀 `__dof1/__dof2` **不是**旋转轴，
+  轴必须从 `plan.joints[i].axis` 读；按 `name.split("__")[0] == joint` 归组链。
+  旧「14 DOF 单轴 / 0 条可表达」结论作废。
+- **P0-A 右臂摆动已复现、定位并实施修复（09-24）**：源 AMASS 窗口本身右臂摆幅小，
+  管线忠实传递（PhysX 实际与目标差 < 0.1°）。修复＝换源序列（`CMU/08/08_04`、
+  `CMU/08/08_11`）。**但第 4 项判定为「未通过」**：实跑分段后前进肩 R/L 0.516
+  （门槛 0.75）、肘 0.292（门槛 0.55）；后退 0.546 / 0.256。跳变与扭转已通过
+  （1.20×→1.00×、扭转 ≤0.478×）。新线索：CPU 层肩比 2.332/1.426 而实跑仅 0.516/0.546
+  → 差距在实跑时被 PD 跟踪/根辅助/接触吃掉，转 P0-B。见 `docs/arm-swing-audit.md`。
+- **聚合口径必须按「被控动作」分段**：整段 `np.ptp` 会把不同动作的极值相除
+  （曾得出肩比 0.828 / 肘比 0.731 的假通过）。工具
+  `artifacts/humans/arm_capture_motions/walk_strip.py` → `<run>/motion_analysis.json`，
+  回归 `tests/humans/test_motion_swing_analysis.py`。转向不推进步态相位，
+  摆动判定按 `SWING_COMMANDS={(1,0),(-1,0)}` 限定前进/后退。
+- **摆幅分数的分母不能用窗口自身极值**（递减窗口的收尾分数按构造恒为 0）：
+  参考幅度与参考**谷值**必须成对传入（`reference_span_deg` + `reference_trough_deg`）。
+- **步态周期两种时钟不要混**：源片段 **1.200 s**（145 帧）＝一个周期；
+  stride 1.286 m；**3.214 s 是 1.286 ÷ 0.4 m/s 的墙钟播放时间**。
+  `report["cycle_period_s"]` 是**一次 demo 演示**的长度，不是步态周期。
+- 新发现独立缺陷：`keyboard.yaml` 的 `speed_m_s: 0.4` vs 源片段自身 1.11 m/s → 播放 0.36×，
+  动作慢约 2.8×，直接抬高脚底滑速。不是右臂不对称的原因。
 - 其他剩余：视口姿态显示（逐帧写 stage 皮肤会作废 PhysX tensor 视图，已回滚）、自然行走/
   平衡恢复、多方向有效跌倒与网格穿地修复、动态家具同步、人体 EM 校准、50 Hz 数据集。
 - 人体出生点离墙 0.52 m（P2-1 未做）；`view_amass.py` 是 kinematic replay，physics replay
   mode（PD target 驱动 + 真实接触 + 实际 link pose 驱动蒙皮）待实现。
-- CPU 246 passed / 8 skipped；bundled USD 9 passed。
+- CPU 307 passed / 9 skipped；bundled USD 9 passed。当前 git HEAD `a79bef6`，
+  分支 `feature/fall-mesh-capture`。
+
+## 方向与判据约定（2026-09-24 用户明确）
+
+- **主方向**：SMPL+AMASS 控制人体在 **Isaac Sim** 里完成各种动作（行走/蹲下/起立/摔倒）。
+  这才是实际使用的内容；其余都是为它服务的。
+- **判据必须是模拟器实测，不能是几何代理。** 用户明确：**没必要为了可以 CPU 测试丢失准确性**。
+  同类问题一律优先读 PhysX 的接触报告、记录的实际关节/根状态、实际渲染，
+  把 CPU 侧的 dry-run / FK / 几何代理降级为**预筛**，不作为验收。
+  几何代理可以留作快速回归，但凡与实测冲突**以实测为准**，并在文档里标明代理的失效边界。
+- 反面教材（本轮）：`docs/support-mask-audit.md` 用「胶囊最低点相对该脚周期最低点」判「脚在地面上」，
+  先把**参考**当身体量，得出「44% 掩码帧离地、12% 明确悬空」；换成 PhysX 实际接触后
+  （`docs/mask-vs-contact-audit.md`）误报其实只有 1-5 mm（阈值级），
+  而真正的病是**漏报**：右脚真实地板接触 **46-56%** 不被掩码认作支撑。
+  代理没发现主症、还夸大了次症。
+- 现有 CPU 侧仍保留的价值：`--dry-run`、schema/配置校验、单元测试、`audit_stance_ik.py`
+  这类消融扫描。它们**不构成**对物理行为的结论。
+
+## 支撑掩码缺陷（2026-09-24 实测，待修）
+
+- `load_gait` 用**水平踝位移**推支撑相 + `|stance_speed − gait.speed_m_s| ≤ 0.15` 门。
+  实测（PhysX 接触为准，四条会话）：**右脚真实地板接触 46-56% 不被认作支撑**（左脚 10-31%）；
+  误报 16-28% 但脚只差 1-5 mm。→ 锚点从不下在右脚真实支撑上。
+- 参考侧同一方向的独立证据：前进片段右脚退行速度比左脚快 **25%**（0.966 vs 0.721 m/s），
+  而 `gait.speed_m_s` 合并中位 0.777 **由左脚定出**。
+- 已实施开关 `keyboard.yaml::anchor_from_contact`（**出厂 false**）：
+  true 时用 `contact_control.measured_support_feet()`（读 PhysX 接触）替换模型的
+  `supporting_feet`；空集不回落。A/B 见 `artifacts/humans/anchor_from_contact/{off,on}/`。
+- 另：`root_assist.yaml` 新增 `max_vertical_lift_fraction_of_weight`（**出厂 1.0**），
+  用来夹住执行器总向上力；0.7 实测是回退（地面 122→212 N 但滑动 22%→38%、关节误差 5.70→8.71°）。
+- 工具：`audit_friction_budget.py`（摩擦/载荷预算）、`audit_support_mask.py`（掩码几何）、
+  `audit_mask_vs_contact.py`（掩码对实测接触）。前两个是预筛，第三个是判据。

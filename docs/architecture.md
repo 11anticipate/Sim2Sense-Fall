@@ -68,7 +68,8 @@ Sionna RT
 - `humans/teleop.py` 处理键盘意图、周期步态、限速和平滑；`humans/root_control.py` 生成有界根辅助力/力矩。
 - `humans/usd_human.py` 连接 PhysX 驱动与接触报告，读取实际姿态；SMPL 显示消费实际姿态。
 - `scripts/humans/keyboard.py` 管理窗口、物理回调、实时蒙皮和记录。现有键盘模式为辅助物理控制。
-  新增蹲下/起立/摔倒状态机尚待实现；行走路线由用户选择，不包含主动避障或导航模块。
+  键盘已开放蹲下/起立/摔倒三个动作状态与支撑脚接触修正（2026-09-24）；
+  行走路线由用户选择，不包含主动避障或导航模块。
 - `sionna/apartment.py` 转换固定公寓几何，`sionna/mesh_import.py` 导入人体，`sionna/channel.py` 处理复数信道。
   公寓 + 物理后推跌倒的 CIR smoke 已完成；动态家具同步、数据集和训练仍待完成。
 

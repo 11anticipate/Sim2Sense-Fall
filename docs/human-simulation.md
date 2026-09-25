@@ -18,7 +18,8 @@ SMPL 提供骨架与显示网格；分段刚体承担碰撞，显示皮肤不直
 
 | 入口 | 用途 | 证据边界 |
 | --- | --- | --- |
-| `scripts/humans/keyboard.py` | 人工键盘及自动 demo，实时实际姿态蒙皮 | 辅助物理；支持移动、转向、停止、复位 |
+| `scripts/humans/keyboard.py` | 人工键盘及自动 demo，实时实际姿态蒙皮 | 辅助物理；移动、转向、停止、复位 + `C` 蹲下 / `V` 起立 / `F` 摔倒 |
+| `scripts/humans/audit_stance_ik.py` | CPU 重放实跑目标链路，审计支撑脚 IK 注入了什么 | 不跑 PhysX；只说明控制目标层，不能替代实跑接触验收 |
 | `scripts/humans/view_amass.py` | 原始/脚本参考预览 | 每帧设置根/关节位姿，不能用来验收碰撞响应 |
 | `scripts/humans/simulate.py` | 配置驱动的物理试验和真值导出 | 检查控制模式、根辅助和传送记录；GUI 可回放实际记录 |
 | `scripts/humans/render_recording.py` | 渲染已保存实际网格或参考网格 | 离线渲染，必须标注输入来源 |

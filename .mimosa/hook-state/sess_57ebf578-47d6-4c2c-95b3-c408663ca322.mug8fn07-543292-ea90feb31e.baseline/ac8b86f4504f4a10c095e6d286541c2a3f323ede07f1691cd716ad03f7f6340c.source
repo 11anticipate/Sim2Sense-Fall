@@ -1,0 +1,81 @@
+"""Side-by-side azimuth montage for the P0-A arm-swing evidence.
+
+Rows are camera azimuths, columns are simulated instants. Every cell in a
+column shows the same simulated moment of the same trial (each cycle is rewound
+to the spawn state), so a left/right arm difference seen across a row is one
+motion viewed from different directions -- not a different motion.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = Path(__file__).resolve().parent
+REPORT = json.loads((ROOT / "report.json").read_text(encoding="utf-8"))
+
+# Azimuth -> what it shows for a character facing +X.
+LABELS = {
+    0.0: "az 0  front (fore-aft swing goes toward/away from camera)",
+    90.0: "az 90  subject's left (fore-aft swing is horizontal, left arm nearest)",
+    180.0: "az 180  back",
+    270.0: "az 270  subject's right (fore-aft swing is horizontal, right arm nearest)",
+}
+
+captures = sorted(REPORT["captures"], key=lambda row: (row["azimuth_deg"], row["request_time_s"]))
+azimuths = sorted({row["azimuth_deg"] for row in captures})
+columns = sorted(
+    {
+        round(row["request_time_s"] - row["cycle"] * REPORT["cycle_period_s"], 3)
+        for row in captures
+    }
+)
+by_key = {
+    (
+        row["azimuth_deg"],
+        round(row["request_time_s"] - row["cycle"] * REPORT["cycle_period_s"], 3),
+    ): row
+    for row in captures
+}
+
+thumb = (400, 300)
+label_h = 26
+header_h = 34
+canvas = Image.new(
+    "RGB",
+    (thumb[0] * len(columns), header_h + (label_h + thumb[1]) * len(azimuths)),
+    "white",
+)
+draw = ImageDraw.Draw(canvas)
+font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15)
+font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+
+for column_index, instant in enumerate(columns):
+    draw.text(
+        (column_index * thumb[0] + 8, 9),
+        f"W-forward, cycle t={instant:.2f} s",
+        font=font_bold,
+        fill="black",
+    )
+
+missing: list[str] = []
+for row_index, azimuth in enumerate(azimuths):
+    y0 = header_h + row_index * (label_h + thumb[1])
+    draw.text((8, y0 + 4), LABELS.get(azimuth, f"az {azimuth}"), font=font, fill="black")
+    for column_index, instant in enumerate(columns):
+        record = by_key.get((azimuth, instant))
+        x, y = column_index * thumb[0], y0 + label_h
+        if record is None:
+            missing.append(f"az{azimuth}@{instant}")
+            draw.rectangle([x, y, x + thumb[0] - 1, y + thumb[1] - 1], outline="red")
+            continue
+        with Image.open(record["path"]) as image:
+            canvas.paste(image.convert("RGB").resize(thumb), (x, y))
+        draw.rectangle([x, y, x + thumb[0] - 1, y + thumb[1] - 1], outline="#bbbbbb")
+
+canvas.save(ROOT / "arm_azimuth_montage.png")
+print(f"wrote {ROOT / 'arm_azimuth_montage.png'} ({canvas.size[0]}x{canvas.size[1]})")
+if missing:
+    print("missing cells:", ", ".join(missing))

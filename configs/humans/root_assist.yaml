@@ -6,3 +6,32 @@ rotation_damping_nms_rad: 180.0
 max_force_n: 1500.0
 max_torque_nm: 400.0
 gravity_compensation_fraction: 0.7
+# Hard ceiling on the actuator's total upward force, as a fraction of body weight.
+#
+# Why the knob exists: the vertical position spring adds lift on top of
+# gravity_compensation_fraction, so the actuator carried more weight than the configuration
+# said. Over a 17 s cycle session (artifacts/keyboard_completion_20260924/cycles, re-run with
+# scripts/humans/audit_friction_budget.py): vertical assist p50 = 581 N against a configured
+# 494 N, i.e. 0.82 of body weight against a configured 0.70, decomposing as 494.4 N
+# (compensation) + 89.2 N (spring), correlation 0.784. Foot grip is mu * N, so every newton
+# the actuator lifts is a newton the feet do not carry: at 0.82 the ground carried 0.17 of
+# body weight, 64 N of shear capacity where a real person on the same floor has 353 N.
+# See docs/foot-friction-audit.md.
+#
+# Measured effect of the tight setting (cap = 0.70), same config, same seed, same 10.3 s
+# demo, artifacts/humans/assist_cap_ab/{before,after}:
+#
+#                       ground load   actuator   joint err   slip p95   frames over 0.15 m/s
+#   cap 1.0 (shipped)     122 N       0.83 W      5.703 deg   0.6573        14.0%
+#   cap 0.70              212 N       0.70 W      8.713 deg   0.6739        30.7%
+#
+# It did what it was designed to do on the load side -- exactly the predicted 212 N, actuator
+# pulled back to the configured 0.70, friction-limited slides down from 36.1% to 13.6% of
+# them -- and it still slid MORE, because the legs cannot carry the extra load without sagging
+# and the sag becomes foot motion. So 0.70 is a measured regression and does NOT ship; 1.0 is
+# the shipped value and is the loosest end of the same knob. One deterministic demo per arm,
+# not a sample. Raise/lower it only with a run of your own to match.
+#
+# Do NOT go below gravity_compensation_fraction: that would clip the compensation itself. To
+# lift less, lower gravity_compensation_fraction and set this to match it.
+max_vertical_lift_fraction_of_weight: 1.0
