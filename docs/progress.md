@@ -3,6 +3,25 @@
 本文件保留各轮原始记录；正文中的“当前”“下一步”“仍未做”只对应其日期和配置。
 当前状态与任务统一见 [计划](../task_plan.md)，全部指南与历史审计见 [文档索引](README.md)。
 
+## 2026-09-25 分段级准入与批量生成驱动（9 样本 0 失败）
+
+- **分段级准入**：exporter 的准入从"整会话聚合判定"改为"会话机械不变量 +
+  分段自身逐活动门"（fall 段=事件验证）；单一失败活动不再连坐健康分段。
+  manifest 增 `session_invariants_ok` 与逐样本 `admission`；importer 检查
+  同步。测试 3 条新增（隔离失败活动、自身门阻断、机械失败拒绝）。
+- **批量驱动** `scripts/sionna/batch_generate.py` + `configs/sionna/
+  batch_smoke.yaml`：计划校验（标识符白名单、路径限仓库内）→ 幂等展开
+  （只含待跑阶段，`set -euo pipefail` 脚本，驱动自身不执行命令）→
+  `--summarize` 汇总 batch_report.json。
+- **实测坑与修复**：①simulate.py 每次运行重写 trials_index.json（只含本次
+  试验）→ 计划内全部试验必须合并为一次调用，否则早期试验的可用行丢失、
+  幂等检查死循环；②RT static-repeat 检查偶发 GPU 瞬态（2/9 次，误差
+  5e-5 vs 正常 1e-10，复跑即过）→ RT 失败不中止批次、由重展开自动重试，
+  门限不放宽。
+- **smoke 批量结果：9 样本 0 失败**——fall ×3（推力 backward/forward/left，
+  标签均 fall、撞击事件成立）、adl ×6（walk ×2、stand ×4）。每样本含
+  复数 CIR、provenance、路径 3D 图、签名图。416 passed / 10 skipped。
+
 ## 2026-09-25 最小带标签数据包（fall + ADL 对照）
 
 - `keyboard.py` 新增 `--native-mesh`（逐物理帧皮肤采样覆盖，ADL 会话准入的

@@ -56,6 +56,28 @@ provenance，兼容 ChannelSample）、`frame0000/frame0110.paths.png`（人体
 绘图已裁剪到人体周边；`--render-frames` 用 matplotlib 投影路径交互链而非
 Mitsuba 相机渲染——无线场景无光学发射器，照片式渲染全黑。
 
+## 批量生成（分段级准入 + batch driver，2026-09-25）
+
+两条口径与工具变更解锁批量：
+
+1. **分段级准入**（`export_session_mesh.py`）：会话机械不变量（运行完成、无错误、
+   完整录制窗、schema v1）仍是硬前提；聚合运动判定不再连坐全部分段——每段按
+   自己的逐活动质量门准入（fall 段以事件验证为准：撞击 + 实测低姿倾斜）。单一
+   失败活动（如蹲姿皮肤口径）不再拉黑同会话的健康行走段。manifest 新增
+   `session_invariants_ok` 与逐样本 `admission` 字段；importer 检查同步更新。
+2. **批量驱动**（`scripts/sionna/batch_generate.py`）：计划 YAML（`configs/sionna/
+   batch_smoke.yaml`）声明类别矩阵；驱动校验计划、检查已有产物、生成幂等的
+   `run_batch.sh`（只含待跑阶段；多次展开直至无 pending），执行后 `--summarize`
+   汇总 `batch_report.json`。驱动本身不执行命令——生成 shell 脚本交给 bash，
+  规避了在 Python 里编排多解释器子进程的注入面。已知坑记录：`simulate.py`
+   每次运行会重写 `trials_index.json`，故计划内全部试验必须合并为一次调用；
+   RT 的 static-repeat 检查存在偶发 GPU 瞬态（观测 2/9），失败样本不写
+   import.json、由重展开自动重试，门限保持严格不放宽。
+
+smoke 批量结果（`batch_smoke.yaml`，9 样本 0 失败）：fall ×3（push
+backward/forward/left）、adl ×6（walk ×2、stand ×4），每样本含 .cir.npz、
+provenance JSON、路径 3D 图、签名图。
+
 ## 第一批带标签对照样本（fall + ADL，2026-09-25）
 
 ADL 负例走键盘会话链路（`export_session_mesh.py` 分段标注 + importer 的

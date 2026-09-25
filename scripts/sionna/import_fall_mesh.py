@@ -137,7 +137,8 @@ def load_geometry(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.
         if row is None:
             raise ValueError(f"unknown sample {args.sample}")
         if row.get("fidelity") == "physics_keyboard_session" and (
-            manifest.get("admitted_for_training") is not True
+            manifest.get("session_invariants_ok", manifest.get("admitted_for_training"))
+            is not True
             or row.get("admitted_for_training") is not True
         ):
             raise ValueError("keyboard source requires measured motion admission; rerun exporter")

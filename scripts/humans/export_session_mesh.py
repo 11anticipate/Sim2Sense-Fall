@@ -205,17 +205,52 @@ def topology_sha256(faces: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(faces).tobytes()).hexdigest()
 
 
+def _activity_gate(
+    mode: str, label_valid: bool, report: dict[str, Any], modes_quality: dict[str, Any]
+) -> bool:
+    """The segment's own activity gates, not the whole session's verdict.
+
+    A fall episode is released control: its gate is the event verification
+    (impact with measured low and tilted posture), already carried by
+    ``label_valid``. Every other segment is judged by its own controller
+    mode's measured-quality entry; reports without per-activity entries
+    fall back to the session flags (the pre-segment-admission semantics).
+    """
+
+    if mode in FALL_MODES:
+        return label_valid
+    entry = modes_quality.get(mode)
+    if entry is not None:
+        return bool(entry.get("accepted"))
+    return bool(report.get("motion_quality", {}).get("accepted")) and bool(
+        report.get("motion_accuracy_accepted")
+    )
+
+
 def export_session(
     run: Path, out: Path, *, diagnostic: bool = False, target_hz: float | None = None,
 ) -> dict[str, Any]:
     report = json.loads((run / "report.json").read_text(encoding="utf-8"))
-    admitted = (report.get("runtime_completed") is True and not report.get("errors")
-                and report.get("motion_accuracy_accepted") is True
-                and report.get("quality_gates", {}).get("complete_recording_window") is True
-                and report.get("motion_quality", {}).get("schema_version") == 1
-                and report.get("motion_quality", {}).get("accepted") is True)
-    if not diagnostic and not admitted:
-        raise ValueError("session did not pass runtime and measured motion quality admission")
+    # Session invariants: the measurement machinery itself must have worked.
+    # These gate every segment; they deliberately do NOT include the session's
+    # aggregate motion verdict, which one failed activity drags down and would
+    # otherwise blacklist that session's healthy walk/stand segments too.
+    invariants = {
+        "runtime_completed": report.get("runtime_completed") is True,
+        "no_errors": not report.get("errors"),
+        "complete_recording_window": report.get("quality_gates", {}).get(
+            "complete_recording_window"
+        ) is True,
+        "measurement_schema": report.get("motion_quality", {}).get("schema_version") == 1,
+    }
+    invariants_ok = all(invariants.values())
+    if not invariants_ok and not diagnostic:
+        raise ValueError(
+            "session measurement machinery failed; segments cannot be admitted: "
+            + ", ".join(name for name, ok in invariants.items() if not ok)
+        )
+    motion_quality = report.get("motion_quality", {})
+    modes_quality = motion_quality.get("modes") or {}
     recording = np.load(run / "recording.npz", allow_pickle=False)
     control = dict(np.load(run / "control.npz", allow_pickle=False))
     vertices = np.asarray(recording["mesh_vertices_xyz"], dtype=np.float64)
@@ -278,6 +313,10 @@ def export_session(
             raise ValueError("unverified motion episode cannot enter training data")
         if diagnostic:
             label["valid"] = False
+        activity_gates = _activity_gate(mode, bool(label.get("valid")), report, modes_quality)
+        segment_admitted = bool(
+            invariants_ok and not diagnostic and label.get("valid") and activity_gates
+        )
         raw_indices = np.clip(np.searchsorted(seg_time_raw, seg_time, side="right") - 1,
                               0, len(frame_indices)-1)
         frame_modes = control["mode"][frame_indices][raw_indices]
@@ -306,7 +345,13 @@ def export_session(
                 ).hexdigest(),
                 "session_keyboard_sha256": report.get("keyboard_sha256"),
                 "source_run": str(run.resolve()),
-                "admitted_for_training": bool(admitted and not diagnostic),
+                "admitted_for_training": segment_admitted,
+                "admission": {
+                    "session_invariants_ok": bool(invariants_ok and not diagnostic),
+                    "activity_gates_accepted": bool(activity_gates),
+                    "activity_mode": mode,
+                    "diagnostic": diagnostic,
+                },
                 "session_time_span_s": [float(segment["time_s"][0]),
                                         float(segment["time_s"][-1])],
             }
@@ -364,7 +409,11 @@ def export_session(
             "samples without relabelling."
         ),
         "schema_version": 2,
-        "admitted_for_training": bool(admitted and not diagnostic),
+        "session_invariants_ok": bool(invariants_ok and not diagnostic),
+        "admitted_for_training": bool(
+            invariants_ok and not diagnostic
+            and all(s["admitted_for_training"] for s in samples)
+        ),
         "sample_count": len(samples),
         "samples": samples,
         "session": {

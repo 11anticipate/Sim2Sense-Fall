@@ -71,7 +71,8 @@ def _session(tmp_path: Path, *, impact_time_s: float | None = 4.35, modes_overri
     report = {
         "runtime_completed": True, "motion_accuracy_accepted": True, "errors": [],
         "quality_gates": {"complete_recording_window": True},
-        "motion_quality": {"schema_version": 1, "accepted": True},
+        "motion_quality": {"schema_version": 1, "accepted": True,
+                           "modes": {"forward": {"accepted": True}}},
         "actions": {"fallen_tilt_deg": 50., "fallen_height_fraction": .6},
         "fall": {"events": fall_events},
         "keyboard_sha256": "abc",
@@ -161,16 +162,56 @@ def test_unverified_falling_mode_is_unknown():
     assert label["label"] == "unknown" and not label["valid"]
 
 
-def test_runtime_or_quality_failure_refused_before_output(tmp_path):
+def test_measurement_machinery_failure_refused_before_output(tmp_path):
+    run = _session(tmp_path)
+    path = run / "report.json"
+    report = json.loads(path.read_text())
+    report["runtime_completed"] = False
+    path.write_text(json.dumps(report))
+    out = tmp_path / "export"
+    with pytest.raises(ValueError, match="measurement machinery"):
+        export_session(run, out)
+    assert not out.exists()
+
+
+def test_segment_level_admission_isolates_failed_activities(tmp_path):
+    """A failed activity must not blacklist the session's healthy segments.
+
+    The pre-segment-admission semantics required the whole session to pass its
+    aggregate motion verdict, so one failing activity (crouch-hold skin gap,
+    a reversal transient) made every walk/stand segment inadmissible. The
+    per-segment gate judges each segment by its own activity's measured entry;
+    fall episodes stay gated by their event verification.
+    """
+
     run = _session(tmp_path)
     path = run / "report.json"
     report = json.loads(path.read_text())
     report["motion_accuracy_accepted"] = False
+    report["motion_quality"]["accepted"] = False
+    report["motion_quality"]["modes"] = {"forward": {"accepted": True}}
     path.write_text(json.dumps(report))
-    out = tmp_path / "export"
-    with pytest.raises(ValueError, match="admission"):
-        export_session(run, out)
-    assert not out.exists()
+    manifest = export_session(run, tmp_path / "export")
+    by_id = {s["sample_id"]: s for s in manifest["samples"]}
+    assert by_id["forward_00"]["admitted_for_training"] is True
+    assert by_id["falling_00"]["admitted_for_training"] is True
+    assert manifest["session_invariants_ok"] is True
+    assert manifest["admitted_for_training"] is True
+
+
+def test_failed_activity_gate_blocks_only_its_own_segment(tmp_path):
+    run = _session(tmp_path)
+    path = run / "report.json"
+    report = json.loads(path.read_text())
+    report["motion_quality"]["modes"] = {"forward": {"accepted": False}}
+    path.write_text(json.dumps(report))
+    manifest = export_session(run, tmp_path / "export")
+    by_id = {s["sample_id"]: s for s in manifest["samples"]}
+    assert by_id["forward_00"]["admitted_for_training"] is False
+    assert by_id["forward_00"]["admission"]["activity_gates_accepted"] is False
+    assert by_id["falling_00"]["admitted_for_training"] is True
+    assert manifest["admitted_for_training"] is False
+    assert manifest["session_invariants_ok"] is True
 
 
 def test_impact_without_fallen_posture_refused(tmp_path):
@@ -189,7 +230,7 @@ def test_truncated_recording_is_not_admitted(tmp_path):
     report = json.loads(path.read_text())
     report["quality_gates"]["complete_recording_window"] = False
     path.write_text(json.dumps(report))
-    with pytest.raises(ValueError, match="admission"):
+    with pytest.raises(ValueError, match="measurement machinery"):
         export_session(run, tmp_path / "export")
 
 
