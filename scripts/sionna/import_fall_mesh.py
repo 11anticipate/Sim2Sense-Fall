@@ -43,6 +43,17 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def channel_activity(label: str, fidelity: str) -> Activity:
+    """Map verified session activities without promoting unknown reference motions."""
+    if label == "fall":
+        return Activity.FALL
+    if fidelity == "physics_keyboard_session" and label in {
+        "walk", "stand", "crouch", "stand_up", "turn"
+    }:
+        return Activity.ADL
+    return Activity.UNKNOWN
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--dir", type=Path, default=REPO_ROOT / "artifacts/humans/fall_mesh")
@@ -116,6 +127,11 @@ def load_geometry(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.
         row = next((r for r in manifest["samples"] if r["sample_id"] == args.sample), None)
         if row is None:
             raise ValueError(f"unknown sample {args.sample}")
+        if row.get("fidelity") == "physics_keyboard_session" and (
+            manifest.get("admitted_for_training") is not True
+            or row.get("admitted_for_training") is not True
+        ):
+            raise ValueError("keyboard source requires measured motion admission; rerun exporter")
         npz = args.dir / f"{args.sample}.mesh.npz"
         with np.load(npz) as data:
             vertices, faces, times = data["mesh_vertices_xyz"], data["mesh_faces"], data["time_s"]
@@ -270,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     channel = np.stack(channels)
     label = info["label"]["label"]
-    activity = Activity.FALL if label == "fall" else Activity.UNKNOWN
+    activity = channel_activity(label, info["fidelity"])
     # The reference's intended action is not evidence that a lowering was intentional ADL.
     sample = ChannelSample(
         sample_id=f"{scene_info['scene_id']}__{out_name}",

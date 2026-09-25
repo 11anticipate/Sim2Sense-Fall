@@ -5,7 +5,7 @@ The fall-detection pipeline needs *physical* ground truth: real contact, real
 gravity and the control loop participating -- not the kinematic reference
 replays that ``collect_fall_mesh.py`` writes (its manifest honestly records
 ``fidelity: kinematic_replay`` and warns against mixing). A keyboard session
-already records everything needed, at 30 Hz, in world coordinates:
+records world coordinates at render rate or, when enabled, at physics rate:
 
 - ``recording.npz`` -- ``mesh_vertices_xyz`` (T, 6890, 3), ``mesh_faces``, ``time_s``;
 - ``control.npz``   -- per-step mode, root pose, command, contact impulse;
@@ -17,9 +17,11 @@ mode between reset teleports, writes each segment as
 exact arrays the Sionna importer consumes) plus a ``manifest.json`` whose
 ``label`` is derived from the *trajectory and session events*, never from
 filenames: a segment is a fall only when the session recorded a fall request
-with a body-floor impact inside that segment's time range, or when the trunk
-ends lying; everything else is labelled with its activity (walk, crouch,
-stand_up, turn, stand). ``fidelity`` is ``physics_keyboard_session``.
+with a body-floor impact inside that segment's time range and measured low,
+tilted posture; other verified modes are labelled with their activity (walk, crouch,
+stand_up, turn, stand). Falling and fallen form one event episode;
+per-frame controller states distinguish motion from the subsequent lying state.
+``fidelity`` is ``physics_keyboard_session``.
 
 Built-in verification (refuses to write a manifest on failure): topology
 constant, vertices finite, time uniform and strictly increasing, and every
@@ -49,7 +51,12 @@ SEGMENT_LABELS = {
     "stand": "stand",
     "crouching": "crouch",
     "crouch": "crouch",
+    "bending": "bend",
+    "bend": "bend",
+    "sitting": "sit",
+    "sit": "sit",
     "standing_up": "stand_up",
+    "getting_up": "get_up",
 }
 FALL_MODES = {"falling", "fallen"}
 MIN_SEGMENT_FRAMES = 5
@@ -83,29 +90,42 @@ def segments_from_control(
     mode = np.asarray(control["mode"]).astype(str)
     time_c = np.asarray(control["time_s"], dtype=np.float64)
     roots = np.asarray(control["root"], dtype=np.float64)
+    if (time_c.ndim != 1 or len(time_c) < 2 or len(time_c) != len(mode)
+            or roots.shape != (len(mode), 3) or not np.isfinite(roots).all()
+            or not np.isfinite(time_c).all() or np.any(np.diff(time_c) <= 0)
+            or not np.isfinite(recording_time).all() or np.any(np.diff(recording_time) <= 0)):
+        raise ValueError("invalid control/recording timeline")
+    # Boundaries persist as an episode ID, even if 30Hz never samples the reset step.
     jumps = np.zeros(len(mode), dtype=bool)
     jumps[1:] = np.linalg.norm(np.diff(roots[:, :2], axis=0), axis=1) > _RESET_STEP_M
-    segment_mode = mode.copy()
-    segment_mode[jumps] = "__reset__"
-
-    control_index = np.searchsorted(time_c, recording_time, side="right") - 1
-    control_index = np.clip(control_index, 0, len(mode) - 1)
-    frame_mode = segment_mode[control_index]
-
+    if "reset_id" in control:
+        reset_id = np.asarray(control["reset_id"])
+        if reset_id.shape != time_c.shape or np.any(np.diff(reset_id) < 0):
+            raise ValueError("invalid reset_id timeline")
+        jumps[1:] = np.diff(reset_id) != 0
+    episode_mode = np.where(np.isin(mode, list(FALL_MODES)), "falling", mode)
+    boundaries = jumps.copy()
+    boundaries[0] = True
+    boundaries[1:] |= episode_mode[1:] != episode_mode[:-1]
+    episode_id = np.cumsum(boundaries)
+    control_index = np.clip(np.searchsorted(time_c, recording_time, side="right") - 1,
+                            0, len(mode)-1)
+    frame_id = episode_id[control_index]
     segments: list[dict[str, Any]] = []
-    start = 0
-    for index in range(1, len(recording_time) + 1):
-        if index == len(recording_time) or frame_mode[index] != frame_mode[start]:
-            if index - start >= MIN_SEGMENT_FRAMES and frame_mode[start] != "__reset__":
-                segments.append(
-                    {
-                        "start": start,
-                        "stop": index,
-                        "mode": str(frame_mode[start]),
-                        "time_s": recording_time[start:index],
-                    }
-                )
-            start = index
+    for value in np.unique(frame_id):
+        frames = np.flatnonzero(frame_id == value)
+        if len(frames) < MIN_SEGMENT_FRAMES:
+            continue
+        controls = np.flatnonzero(episode_id == value)
+        end = controls[-1] + 1
+        segments.append({
+            "start": int(frames[0]), "stop": int(frames[-1] + 1),
+            "mode": str(episode_mode[controls[0]]),
+            "time_s": recording_time[frames],
+            "interval_start_s": float(time_c[controls[0]]),
+            "interval_end_s": float(time_c[end]) if end < len(time_c) else
+            float(max(time_c[-1], recording_time[-1]) + np.median(np.diff(time_c))),
+        })
     return segments
 
 
@@ -123,10 +143,11 @@ def label_segment(
         event
         for event in fall_events
         if event.get("impact_time_s") is not None
-        and time_s[0] - 0.02 <= float(event["impact_time_s"]) <= time_s[-1] + 0.02
+        and segment.get("interval_start_s", time_s[0]) <= float(event["impact_time_s"])
+        < segment.get("interval_end_s", time_s[-1] + np.median(np.diff(time_s)))
     ]
     mode = segment["mode"]
-    if mode in FALL_MODES or covers_event:
+    if covers_event:
         impact = covers_event[0]["impact_time_s"] if covers_event else None
         label = "fall"
     else:
@@ -148,7 +169,7 @@ def label_segment(
 
 
 def uniform_time(
-    time_s: np.ndarray, vertices: np.ndarray
+    time_s: np.ndarray, vertices: np.ndarray, *, target_hz: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, bool]:
     """Return (time, vertices) on a uniform grid; resample only when needed.
 
@@ -159,10 +180,18 @@ def uniform_time(
     """
 
     diffs = np.diff(time_s)
-    if len(diffs) and float(diffs.max() - diffs.min()) < 1e-3:
+    if (len(diffs) == 0 or not np.isfinite(time_s).all() or np.any(diffs <= 0)
+            or len(vertices) != len(time_s)):
+        raise ValueError("resampling requires finite increasing samples")
+    if target_hz is not None and (not np.isfinite(target_hz) or target_hz <= 0):
+        raise ValueError("target_hz must be finite and positive")
+    if target_hz is not None and diffs.max() > 1 / target_hz + 1e-6:
+        raise ValueError(
+            "capture cadence is too low for requested sample rate; record physics mesh")
+    if target_hz is None and float(diffs.max() - diffs.min()) < 1e-3:
         return time_s, vertices, False
-    dt = float(np.median(diffs))
-    uniform = np.arange(time_s[0], time_s[-1] + 0.5 * dt, dt)
+    dt = float(np.median(diffs)) if target_hz is None else 1 / target_hz
+    uniform = np.arange(time_s[0], time_s[-1] + 1e-9, dt)
     resampled = np.empty((len(uniform),) + vertices.shape[1:], dtype=np.float64)
     for vertex_index in range(vertices.shape[1]):
         resampled[:, vertex_index] = np.array(
@@ -176,19 +205,34 @@ def topology_sha256(faces: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(faces).tobytes()).hexdigest()
 
 
-def export_session(run: Path, out: Path) -> dict[str, Any]:
+def export_session(
+    run: Path, out: Path, *, diagnostic: bool = False, target_hz: float | None = None,
+) -> dict[str, Any]:
     report = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    admitted = (report.get("runtime_completed") is True and not report.get("errors")
+                and report.get("motion_accuracy_accepted") is True
+                and report.get("quality_gates", {}).get("complete_recording_window") is True
+                and report.get("motion_quality", {}).get("schema_version") == 1
+                and report.get("motion_quality", {}).get("accepted") is True)
+    if not diagnostic and not admitted:
+        raise ValueError("session did not pass runtime and measured motion quality admission")
     recording = np.load(run / "recording.npz", allow_pickle=False)
     control = dict(np.load(run / "control.npz", allow_pickle=False))
     vertices = np.asarray(recording["mesh_vertices_xyz"], dtype=np.float64)
     faces = np.asarray(recording["mesh_faces"], dtype=np.int64)
     time_s = np.asarray(recording["time_s"], dtype=np.float64)
-    if not np.isfinite(vertices).all():
-        raise ValueError("recording contains non-finite vertices")
+    if (vertices.ndim != 3 or vertices.shape[-1] != 3 or len(vertices) != len(time_s)
+            or len(time_s) < MIN_SEGMENT_FRAMES or not np.isfinite(vertices).all()
+            or faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0
+            or faces.min() < 0 or faces.max() >= vertices.shape[1]):
+        raise ValueError("recording contains invalid mesh topology or non-finite vertices")
 
     # Trunk evidence per recording frame for the fall check.
     quats = np.asarray(control["root_quaternion"], dtype=np.float64)
     control_time = np.asarray(control["time_s"], dtype=np.float64)
+    if (quats.shape != (len(control_time), 4) or not np.isfinite(quats).all()
+            or not np.allclose(np.linalg.norm(quats, axis=1), 1., atol=1e-4)):
+        raise ValueError("invalid measured root quaternions")
     control_index = np.clip(
         np.searchsorted(control_time, time_s, side="right") - 1, 0, len(quats) - 1
     )
@@ -200,28 +244,44 @@ def export_session(run: Path, out: Path) -> dict[str, Any]:
 
     samples: list[dict[str, Any]] = []
     counters: dict[str, int] = {}
+    pending: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
     for segment in segments:
         mode = segment["mode"]
         counters[mode] = counters.get(mode, -1) + 1
         name = f"{mode}_{counters[mode]:02d}"
         seg_vertices = vertices[segment["start"] : segment["stop"]]
         seg_time_raw = time_s[segment["start"] : segment["stop"]] - time_s[segment["start"]]
-        seg_time, seg_vertices, resampled = uniform_time(seg_time_raw, seg_vertices)
+        seg_time, seg_vertices, resampled = uniform_time(
+            seg_time_raw, seg_vertices, target_hz=target_hz)
+        if len(seg_time) < MIN_SEGMENT_FRAMES:
+            raise ValueError("requested rate leaves too few frames in an activity episode")
         label = label_segment(segment, vertices, fall_events)
-        if label["label"] == "fall" and label["first_impact_s"] is None:
-            # A fall segment without a session-recorded impact is still a fall
-            # request being executed; keep the label but flag the evidence gap.
-            label["impact_evidence"] = "session recorded no body-floor impact for this segment"
-        label["final_trunk_angle_deg"] = round(
-            trunk_angle_deg(quats[control_index[segment["stop"] - 1]]), 2
-        )
-        out.mkdir(parents=True, exist_ok=True)
-        np.savez(
-            out / f"{name}.mesh.npz",
-            time_s=seg_time,
-            mesh_vertices_xyz=seg_vertices,
-            mesh_faces=faces,
-        )
+        frame_indices = control_index[segment["start"]:segment["stop"]]
+        angles = np.array([trunk_angle_deg(q) for q in quats[frame_indices]])
+        label["final_trunk_angle_deg"] = round(float(angles[-1]), 2)
+        if label["label"] == "fall":
+            action = report.get("actions", {})
+            if not {"fallen_tilt_deg", "fallen_height_fraction"} <= action.keys():
+                raise ValueError("missing preregistered fall thresholds")
+            requested = [e for e in fall_events if e.get("impact_time_s") is not None
+                         and segment["interval_start_s"] <= e["impact_time_s"]
+                         < segment["interval_end_s"]]
+            request = min(e["requested_time_s"] for e in requested)
+            before = max(0, int(np.searchsorted(control_time, request, side="left")) - 1)
+            height = control["root"][frame_indices, 2]
+            low = height < control["root"][before, 2] * action["fallen_height_fraction"]
+            fallen = low & (angles >= action["fallen_tilt_deg"])
+            if not fallen.any():
+                label.update(label="unknown", valid=False,
+                             rejection="impact without measured low and tilted posture")
+        if label["label"] == "unknown" and not diagnostic:
+            raise ValueError("unverified motion episode cannot enter training data")
+        if diagnostic:
+            label["valid"] = False
+        raw_indices = np.clip(np.searchsorted(seg_time_raw, seg_time, side="right") - 1,
+                              0, len(frame_indices)-1)
+        frame_modes = control["mode"][frame_indices][raw_indices]
+        pending.append((name, seg_time, seg_vertices, frame_modes))
         diffs = np.diff(seg_time)
         samples.append(
             {
@@ -235,6 +295,8 @@ def export_session(run: Path, out: Path) -> dict[str, Any]:
                 "frame_count": int(len(seg_time)),
                 "uniform_dt_s": round(float(diffs[0]), 6) if len(diffs) else None,
                 "resampled_to_uniform": resampled,
+                "resample_method": "linear_world_vertices" if resampled else "none",
+                "source_mesh_sampling": report.get("mesh_sampling", "legacy_render_update"),
                 "label": label,
                 "vertex_count": int(seg_vertices.shape[1]),
                 "face_count": int(faces.shape[0]),
@@ -244,10 +306,13 @@ def export_session(run: Path, out: Path) -> dict[str, Any]:
                 ).hexdigest(),
                 "session_keyboard_sha256": report.get("keyboard_sha256"),
                 "source_run": str(run.resolve()),
+                "admitted_for_training": bool(admitted and not diagnostic),
+                "session_time_span_s": [float(segment["time_s"][0]),
+                                        float(segment["time_s"][-1])],
             }
         )
         LOGGER.info(
-            "wrote %s (%s): %d frames, label=%s%s",
+            "prepared %s (%s): %d frames, label=%s%s",
             name,
             mode,
             len(seg_time),
@@ -278,6 +343,12 @@ def export_session(run: Path, out: Path) -> dict[str, Any]:
             f"{covered} fall-labelled segments carry impact evidence"
         )
 
+    if not diagnostic and any(not sample["label"]["valid"] for sample in samples):
+        raise ValueError("invalid sample in training export")
+    out.mkdir(parents=True, exist_ok=True)
+    for name, seg_time, seg_vertices, frame_modes in pending:
+        np.savez(out / f"{name}.mesh.npz", time_s=seg_time,
+                 mesh_vertices_xyz=seg_vertices, mesh_faces=faces, activity_state=frame_modes)
     manifest = {
         "description": (
             "Physical keyboard-session segments as world-space mesh sequences "
@@ -292,6 +363,8 @@ def export_session(run: Path, out: Path) -> dict[str, Any]:
             "timeline, never from filenames. Not to be mixed with kinematic_replay "
             "samples without relabelling."
         ),
+        "schema_version": 2,
+        "admitted_for_training": bool(admitted and not diagnostic),
         "sample_count": len(samples),
         "samples": samples,
         "session": {
@@ -313,10 +386,14 @@ def main() -> int:
     parser.add_argument(
         "--out", type=Path, default=None, help="export dir (default <run>/mesh_export)"
     )
+    parser.add_argument("--diagnostic", action="store_true",
+                        help="export rejected diagnostic samples; never eligible for RT/training")
+    parser.add_argument("--sample-hz", type=float,
+                        help="downsample recorded physics mesh, e.g. 50; refuses upsampling")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     out = args.out or (args.run / "mesh_export")
-    manifest = export_session(args.run, out)
+    manifest = export_session(args.run, out, diagnostic=args.diagnostic, target_hz=args.sample_hz)
     for sample in manifest["samples"]:
         print(f"{sample['sample_id']}: {sample['label']['label']} ({sample['frame_count']} frames)")
     return 0

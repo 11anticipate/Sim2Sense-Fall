@@ -48,6 +48,8 @@ def _session(tmp_path: Path, *, impact_time_s: float | None = 4.35, modes_overri
     control_modes = np.repeat(modes, 4)
     control_roots = np.repeat(roots, 4, axis=0)
     control_roots[:, 0] += np.linspace(0, 0.01, 720)
+    quaternions = np.tile(np.array([1., 0., 0., 0.]), (720, 1))
+    quaternions[control_time > 4.0] = [np.cos(np.pi/4), 0., np.sin(np.pi/4), 0.]
     fall_events = [
         {"requested_time_s": 3.0, "impact_time_s": impact_time_s, "outcome": "fallen"}
     ]
@@ -64,9 +66,13 @@ def _session(tmp_path: Path, *, impact_time_s: float | None = 4.35, modes_overri
         time_s=control_time,
         mode=control_modes,
         root=control_roots,
-        root_quaternion=np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (720, 1)),
+        root_quaternion=quaternions,
     )
     report = {
+        "runtime_completed": True, "motion_accuracy_accepted": True, "errors": [],
+        "quality_gates": {"complete_recording_window": True},
+        "motion_quality": {"schema_version": 1, "accepted": True},
+        "actions": {"fallen_tilt_deg": 50., "fallen_height_fraction": .6},
         "fall": {"events": fall_events},
         "keyboard_sha256": "abc",
         "simulation_time_s": 6.0,
@@ -83,7 +89,7 @@ def test_segments_split_on_mode(tmp_path):
     control = dict(np.load(run / "control.npz", allow_pickle=False))
     recording = np.load(run / "recording.npz", allow_pickle=False)
     segments = segments_from_control(control, np.asarray(recording["time_s"]))
-    assert [s["mode"] for s in segments] == ["forward", "falling", "fallen"]
+    assert [s["mode"] for s in segments] == ["forward", "falling"]
 
 
 def test_export_labels_segments_from_trajectory(tmp_path):
@@ -147,3 +153,104 @@ def test_label_segment_requires_session_evidence():
     segment = {"time_s": np.arange(10) * 0.1, "mode": "stand"}
     label = label_segment(segment, vertices, [])
     assert label["label"] == "stand" and label["valid"]
+
+
+def test_unverified_falling_mode_is_unknown():
+    segment = {"time_s": np.arange(10)*.1, "mode": "falling"}
+    label = label_segment(segment, np.zeros((10, 2, 3)), [])
+    assert label["label"] == "unknown" and not label["valid"]
+
+
+def test_runtime_or_quality_failure_refused_before_output(tmp_path):
+    run = _session(tmp_path)
+    path = run / "report.json"
+    report = json.loads(path.read_text())
+    report["motion_accuracy_accepted"] = False
+    path.write_text(json.dumps(report))
+    out = tmp_path / "export"
+    with pytest.raises(ValueError, match="admission"):
+        export_session(run, out)
+    assert not out.exists()
+
+
+def test_impact_without_fallen_posture_refused(tmp_path):
+    run = _session(tmp_path)
+    control = dict(np.load(run / "control.npz"))
+    control["root_quaternion"][:] = [1., 0., 0., 0.]
+    np.savez(run / "control.npz", **control)
+    with pytest.raises(ValueError, match="unverified"):
+        export_session(run, tmp_path / "export")
+    assert not (tmp_path / "export").exists()
+
+
+def test_truncated_recording_is_not_admitted(tmp_path):
+    run = _session(tmp_path)
+    path = run / "report.json"
+    report = json.loads(path.read_text())
+    report["quality_gates"]["complete_recording_window"] = False
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="admission"):
+        export_session(run, tmp_path / "export")
+
+
+def test_reset_between_mesh_frames_splits_same_mode():
+    times = np.arange(120)/120
+    roots = np.zeros((120, 3))
+    roots[61:, 0] = 1.0  # 30Hz mesh samples indices 60 and 64, never reset frame 61.
+    control = {"time_s": times, "root": roots, "mode": np.full(120, "stand")}
+    segments = segments_from_control(control, times[::4])
+    assert len(segments) == 2
+    assert segments[0]["stop"] == segments[1]["start"]
+
+
+def test_in_place_reset_id_is_also_a_boundary():
+    times = np.arange(120)/120
+    reset = np.zeros(120, dtype=int)
+    reset[61:] = 1
+    control = {"time_s": times, "root": np.zeros((120, 3)),
+               "mode": np.full(120, "stand"), "reset_id": reset}
+    assert len(segments_from_control(control, times[::4])) == 2
+
+
+def test_physics_capture_downsamples_to_50hz_without_extrapolation():
+    time = np.arange(120) / 120
+    vertices = np.broadcast_to(time[:, None, None], (120, 2, 3)).copy()
+    sampled_time, sampled, changed = uniform_time(time, vertices, target_hz=50.)
+    assert changed and sampled_time[-1] <= time[-1]
+    np.testing.assert_allclose(np.diff(sampled_time), .02)
+    np.testing.assert_allclose(sampled[:, 0, 0], sampled_time)
+
+
+def test_render_capture_cannot_claim_50hz():
+    time = np.arange(30) / 30
+    with pytest.raises(ValueError, match="capture cadence"):
+        uniform_time(time, np.zeros((30, 2, 3)), target_hz=50.)
+
+
+def test_diagnostic_export_is_never_admitted(tmp_path):
+    run = _session(tmp_path)
+    manifest = export_session(run, tmp_path / "diagnostic", diagnostic=True)
+    assert not manifest["admitted_for_training"]
+    assert all(not s["admitted_for_training"] and not s["label"]["valid"]
+               for s in manifest["samples"])
+
+
+def test_rt_boundary_rejects_diagnostic_and_accepts_verified_adl(tmp_path):
+    import importlib.util
+    from argparse import Namespace
+
+    path = Path(__file__).resolve().parents[2] / "scripts/sionna/import_fall_mesh.py"
+    spec = importlib.util.spec_from_file_location("rt_import_boundary", path)
+    importer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(importer)
+    run = _session(tmp_path)
+    diagnostic = tmp_path / "diagnostic"
+    export_session(run, diagnostic, diagnostic=True)
+    with pytest.raises(ValueError, match="motion admission"):
+        importer.load_geometry(Namespace(trial_json=None, dir=diagnostic, sample="forward_00"))
+    admitted = tmp_path / "admitted"
+    export_session(run, admitted)
+    _, _, _, info = importer.load_geometry(
+        Namespace(trial_json=None, dir=admitted, sample="forward_00"))
+    assert importer.channel_activity(info["label"]["label"], info["fidelity"]).value == "adl"
+    assert importer.channel_activity("stand", "kinematic_replay").value == "unknown"

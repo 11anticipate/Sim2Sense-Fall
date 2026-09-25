@@ -3,6 +3,115 @@
 本文件保留各轮原始记录；正文中的“当前”“下一步”“仍未做”只对应其日期和配置。
 当前状态与任务统一见 [计划](../task_plan.md)，全部指南与历史审计见 [文档索引](README.md)。
 
+## 2026-09-25 前馈采纳为基线、失力摔倒重构与配置清理
+
+- **采纳**：`reference_feedforward_scale: 1.0` 与 `root_bob: true`（2 cm 深度钳，
+  见下）合入 `keyboard.yaml`、`locomotion_acceptance.yaml`、`acceptance_matrix.yaml`
+  作为新基线；删除被取代的 `keyboard_feedforward.yaml`、`keyboard_amass_direct.yaml`
+  与两份 `*_ff` 验收变体；`keyboard_amass_hybrid.yaml` 保留为 AMASS 摆动形状
+  （未过门待驱动决策）的唯一入口。
+- **失力摔倒重构**：旧 F = 350 N 后推脉冲 + 全阻尼 → 实测是「绕脚踝的刚体倾斜」，
+  膝/髋/踝总折叠仅 18°、关节速度中位 1°/s（用户反馈"像保持关节角度不变"）。
+  两项机制修改：①`set_control_scale(scale, damping_scale)`——摔倒时驱动阻尼按
+  `fall_damping_scale: 0.15` 缩放（全新阻尼是已测的求解器 NaN 域 2864°/s，全阻尼
+  终端折叠速度 ~19°/s 僵直；0.15 为有界黏性域，恢复路径 `set_control_scale(1.0)`
+  自动写回原始阻尼）；②`fall_force_n` 350→60 N——推力脉冲会让地面反力与腿轴对齐
+  卸掉膝矩，60 N 只作方向偏置，重力主导屈膝坍缩。实测（24.2 s 矩阵）：
+  膝/髋/踝折叠 18°→**39°**、坍缩耗时 0.74→**1.5 s**（瘫坐节奏）、末态根高
+  0.19→**0.27 m**（瘫坐堆高于平躺，物理自洽）、impact/fallen 事件照常成立、
+  errors=[] 无求解器 NaN。
+- **行走门**：动作矩阵行走/转向全活动通过（0.022–0.063 m/s，优于或等同基线）。
+- **未决回归（诚实记录）**：52.7 s 长时协议 backward 关节误差 24.0°（门 15°、
+  基线 5.8°）——单一 W→S 反向、单关节（right_collar）5 帧振荡（~7 Hz ±20°）。
+  消融已排除：前馈（关掉仍 23.9）、bob 深度（钳 2 cm 仍 24.0）、两者同关（24.0）；
+  该窗关节目标与基线**逐位相同**（max diff 0.00°）、基线同窗实测安静（3.45°），
+  而实测根水平速度振荡 6×——确定性代码合并产物，非混沌。三个配置变体结果
+  完全一致（24.0）证明其与 bob/ff 无关；源头在本轮与坐/起身并行会话合并后的
+  未提交改动中，需提交后 git 二分定位。稳态行走误差与基线等同。
+- 清理并删除的本轮中间 dry-run 产物：`artifacts/humans/verify_*`。
+- 验证：413 passed / 10 skipped（新增阻尼缩放测试 2 条、ActionConfig 边界 1 条）、
+  compileall、Ruff、三配置 CPU dry-run 通过。
+
+## 2026-09-25 弯腰/坐地/起身加入键盘控制（B/N/G 键）
+
+- 素材来源为本地库调研结论：弯腰 = CMU/115_01 @2.30 s（trunk 83.8°，限位内最深帧）；
+  坐地 = Transitions/mazen_c3d `sit_stand` @2.675 s（限位内坐地帧，五接触点固有
+  平面散布 ~48 mm）；起身 = CMU/140_01 全片段（6.91 s 躺→站，轴残差 0、限位超差 0）。
+- 实现：`ActionState` 泛化为多姿势注册表 + 快照式过渡（姿势切换连续，`V` 从任一姿势
+  回站）；`load_posture` 支持声明接触集的有界 IK 落地投影（弯腰双脚残差 0，
+  坐地骨盆锚定、肢体残差 ≤44 mm，全部入 provenance）；起身 = 摔倒后辅助回放
+  （实测位置/朝向锚定，0.5 s 混入，恢复位置驱动与辅助，fall 记录独立保留）。
+  键位映射/配置校验/导出器标签/键盘文档同步；`braking_for_crouch` 更名
+  `braking_for_action`。并行会话同时在改步态 swing（teleop/contact_gait/keyboard），
+  本轮改动与其区域不重叠。
+- 验证：单测 8 条新增（含 140 片段加载与坐地投影的实测口径），
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` 全套 405 passed / 10 skipped；compileall、
+  Ruff、CPU dry-run（`/tmp/kb_dry_new_actions`，含新姿势与片段装配）通过。
+- Isaac 实跑（34.5 s 演示协议 W→停→C/V→B/V→N/V→F→G→站，120 Hz，
+  `artifacts/humans/new_actions_20260925/`）：errors=[]，0 复位；摔倒 20.32 s 请求 →
+  21.09 s 撞击躺平 → 24.4 s 按 G 物理起身回放 7.4 s → 33.6 s 站立。
+  **摔倒后自主物理起身链路成立，R 传送不再是唯一出口。**
+- 分动作门（`quality_audit.json`，重算自实际蒙皮/接触）：弯腰保持**全门通过**
+  （皮肤 p95 −1.68 mm、滑速 p95 0.053 m/s、无支撑 0 s、关节 6.31°）；
+  弯腰过渡仅滑速 0.175 略超 0.15；坐地保持关节 2.92°、骨盆贴地承重，
+  但足底门不适用（坐地是骨盆+手的新支撑形态，验收门口径待预登记）；
+  坐下过渡关节 26.95°、起身段关节/滑速失败——与蹲过渡同源（关节空间混合路径
+  与地面不一致），为下一个接触一致化整改项。蹲本回合未动（保持 24.55°）。
+- 未宣称：坐地/起身的正式验收（门口径未预登记前不勾选）；正常动作矩阵整体
+  质量仍 false。
+
+## 2026-09-25 步态自然性混合方案与骨盆前馈控制器（对照专项）
+
+- 背景：接触重定向行走验收通过但观感僵硬（平顶摆脚、刚性平脚、根部零起伏）。
+  用户要求「AMASS 数据 + 逐步脚位置不滑 + 改控制器」。
+- **AMASS 脚轨迹实测**：源剪辑支撑相踝滑移 p50 0.16–0.25 m/s、触地水平冲击
+  0.9–1.2 m/s、踝抬 14.5 cm、支撑占比仅 ~42%（含双足离地窗口）；travel 掩码把右脚
+  支撑滚动误判为摆动（右脚掩码缺陷的又一实例）→ 摆动窗检测改用世界系脚速度阈值
+  （0.3×源速 + 最小 run 过滤），跨周期接缝 run 解缠（补一个步距 travel）。
+- **AmassSwingShape（contact_gait.py）**：从重定向周期提取各脚摆动弧（纵向位移/
+  侧向弓/矢状俯仰），按指令/源步幅比缩放，clearance 下限 + 4.5 cm 抬升上限 +
+  0.45 rad 俯仰 tanh 软钳 + 5 帧环形低通（摆动检测用原始运动学，平滑只作用于
+  轨迹）；端点重基到零高度/零俯仰、raised-cosine 时间弯曲保证触地/离地零世界
+  速度。`ContactFootPlanner` 按方向+脚别查表替代解析五次曲线；支撑锚点/刹车/
+  反向/可达性逻辑不动。CPU 测试 11 条（锚点闭合、端点零速、重定向、提取、规划器
+  契约）。
+- **骨盆前馈控制器（root_control/keyboard）**：AMASS 无发力数据（纯运动学），由
+  参考运动学 Newton-Euler 反推——`configuration_com`（rig.py，连杆质量加权）+
+  bake/`fit_contact_idle` 存逐帧 COM-根偏移表（接缝闭合）；`root_wrench` 增
+  `feedforward_accel_m_s2`：水平全额 m·a、垂直按同重力分数（匀速行走 a_com≈0，
+  弹簧不再按设计供给推进力）；`reference_feedforward_scale` 配置（默认 0 = 完全
+  旧行为），assist_blend 门控、模式切换清历史、±5 m/s² 钳制。
+- **GPU 消融（10.3 s demo，两份配置）**：
+  - `keyboard_feedforward.yaml`（解析摆动 + root bob + 前馈 1.0）：**全门通过**，
+    前/后滑速 p95 0.019、关节 2.9–3.8°、无支撑 17 ms、站立 0.013/6.1°——与已验收
+    基线逐项等同，前馈+bob **零回归**；complete_recording_window=false 为 30 Hz
+    交互记录已知末帧覆盖口径。
+  - `keyboard_amass_hybrid.yaml`（AMASS 形状 + bob + 前馈）：滑速 0.80/0.62、
+    关节 12.6–17.1° **未过门**。诊断链闭合：弧线激励超驱动带宽（目标速度 p99.9
+    仍触 8 rad/s 限幅、踝 p95 滞后 ~10°）→ 根滞后 → 辅助弹簧水平剪切 600–770 N
+    超摩擦预算（Fz≈350–480 N 时 ~500 N 上限）→ 支撑脚滑移；触地滞后冲击为次因。
+    历轮迭代：俯仰钳 34°→21°、抬升帽+平滑+前馈 1.22→0.80——需求侧可压但收敛到
+    解析路径，自然性增益同减。
+- **结论**：骨盆前馈为可交付改进（解析路径上零回归）；AMASS 摆动形状机制打通但
+  受限于现有关节驱动预算——过门需更强驱动（改动已验收资产）或真平衡控制器
+  （独立课题），列为待办而非本轮完成项。GUI 对照入口：两份 YAML 直接 GUI 运行。
+- 并行会话说明：本轮与坐/起身姿态会话同树并行（actions/keyboard.py 交叠），合并
+  后全套 **411 passed / 10 skipped**、compileall、Ruff 通过；期间观察到的姿态测试
+  失败为彼会话 WIP，合并后消失。
+
+## 2026-09-25 新增纯 AMASS 回放对比配置（GUI 自然性对照）
+
+- 用户反馈接触重定向方案行走观感僵硬，要求对照直连 AMASS 回放。新增
+  `configs/humans/keyboard_amass_direct.yaml`：与 keyboard.yaml 相同源剪辑/速度/摩擦，
+  但去掉 `contact_cycle`、`contact_planner`、`locomotion_root_assist` 与
+  `max_stance_slip_m_s`，`stance.enabled: false`——运行时无任何腿部 IK 修正，
+  关节目标即重定向后的 AMASS 周期（含源数据自身的根部起伏与支撑滑移）。
+  代码零改动：`contact_planner`/`stance` 均按配置键存在与否启用。
+- 预期该配置**不通过滑步门**（历史直连基线前/后滑速 p95 0.810/1.153 m/s，门 0.15），
+  仅用于视觉自然性对比与后续「从 mocap 提取脚轨迹再净化」候选的参照。
+  CPU dry-run 通过：`artifacts/humans/keyboard_amass_direct_dry/`，
+  modes=[backward, forward, stand]，1236 帧，contact_planner=None。
+
 ## 2026-09-25 滑步专项：限定行走验收完成
 
 - 根因与实现：修正禁飞误压摆动脚；世界足部完整位姿规划协调根平移/摆动，停车和反向另算落点；

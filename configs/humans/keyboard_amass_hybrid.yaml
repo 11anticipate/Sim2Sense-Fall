@@ -1,0 +1,117 @@
+# AMASS-naturalness hybrid: keep the proven contact-consistent control
+# (world-fixed stance anchors, 6-D leg IK, braking/reversal/reach protection)
+# but let the swing arcs and root height come from the sanitized AMASS
+# trajectories instead of the analytic quintic. swing_shape "amass" retargets
+# each foot's own mocap swing arc (vertical profile, lateral bow, sagittal foot
+# pitch) onto the commanded stride with zero world velocity at touchdown;
+# root_bob follows the clip's root height, clamped by leg reach. Stance feet
+# stay frozen as before, so heel-toe roll in stance is still not replayed.
+# Same source clips, speed, friction and gates as keyboard.yaml.
+rig: configs/humans/human_smpl_multiaxis.yaml
+assets: configs/humans/assets.yaml
+scene: artifacts/scenes/indoor_apartment.usda
+root_assist: configs/humans/root_assist.yaml
+locomotion_root_assist: configs/humans/root_assist_contact.yaml
+root_assist_scale: 1.0
+# Mocap-derived pelvis feedforward: the reference COM's own acceleration applied
+# as m*a before the assist caps (horizontal in full, vertical under the same
+# gravity fraction). Steady walking then needs ~zero horizontal assist force --
+# the spring stops supplying propulsion and only trims tracking error.
+reference_feedforward_scale: 1.0
+spawn_xy: [10.255, 1.455]
+heading_deg: 90.0
+speed_m_s: 0.4
+acceleration_m_s2: 0.8
+turn_speed_deg_s: 30.0
+turn_acceleration_deg_s2: 90.0
+transition_s: 0.35
+max_joint_speed_rad_s: 8.0
+max_target_lead_m: 0.10
+max_heading_lead_deg: 15.0
+root_z_offset_m: 0.0
+render_hz: 30.0
+record_frames: 14400
+camera_follow: false
+camera_distance_m: 3.2
+camera_elevation_deg: 65.0
+camera_azimuth_deg: -55.0
+human_friction: [1.45, 1.30]
+slip_min_impulse_ns: 0.01
+slip_speed_tolerance_m_s: 0.15
+skin_penetration_tolerance_m: 0.005
+collision_fit:
+  enabled: true
+  margin_m: 0.003
+  foot_shape: convex_hull
+stance:
+  enabled: false
+contact_planner:
+  cycle_distance_m: 0.6
+  stance_fraction: 0.62
+  clearance_m: 0.03
+  swing_shape: amass
+  root_bob: true
+idle_stand_height_fraction: 0.988
+max_stance_slip_m_s: 0.15
+actions:
+  transition_s: 1.8
+  stopped_speed_m_s: 0.025
+  # 60 N directional bias, not a shove: knees buckle under gravity instead
+  # of the 350 N pulse tipping a rigid plank (docs/progress.md 2026-09-25).
+  fall_force_n: 60.0
+  fall_duration_s: 0.25
+  fall_control_scale: 0.0
+  fallen_height_fraction: 0.60
+  fallen_tilt_deg: 50.0
+crouch:
+  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/crouchwalk_stand_poses.npz
+  start_s: 3.25
+  duration_s: 0.1
+# Bend/floor-sit/get-up posture sections kept identical to keyboard.yaml so the
+# B/N/G keys work; see keyboard.yaml for the source provenance comments.
+bend:
+  file: data/humans/amass_raw/CMU/115/115_01_poses.npz
+  start_s: 2.3
+  duration_s: 0.05
+  contacts: [left_ankle, right_ankle]
+sit:
+  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/sit_stand_poses.npz
+  start_s: 2.675
+  duration_s: 0.05
+  contacts: [left_ankle, right_ankle, pelvis, left_hand, right_hand]
+get_up:
+  file: data/humans/amass_raw/CMU/140/140_01_poses.npz
+gaits:
+  forward:
+    contact_cycle: {cycle_distance_m: 0.6, stance_fraction: 0.62, clearance_m: 0.03,
+                    swing_shape: amass, root_bob: true}
+    file: data/humans/amass_raw/CMU/08/08_04_poses.npz
+    start_s: 1.9667
+    duration_s: 1.3083
+  backward:
+    contact_cycle: {cycle_distance_m: 0.6, stance_fraction: 0.62, clearance_m: 0.03,
+                    swing_shape: amass, root_bob: true}
+    file: data/humans/amass_raw/CMU/08/08_11_poses.npz
+    start_s: 0.4
+    duration_s: 1.4833
+idle:
+  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/walkbackwards_stand_poses.npz
+  start_s: 3.4
+  duration_s: 0.1
+demo:
+  - {duration_s: 1.0, keys: []}
+  - {duration_s: 3.0, keys: [W]}
+  - {duration_s: 1.0, keys: [SPACE]}
+  - {duration_s: 1.5, keys: [A]}
+  - {duration_s: 1.2, keys: [S]}
+  - {duration_s: 1.5, keys: []}
+  - {duration_s: 0.1, keys: [R]}
+  - {duration_s: 1.0, keys: []}
+quality:
+  support_skin_gap_m: 0.005
+  max_no_support_s: 0.05
+  slip_speed_m_s: 0.15
+  skin_penetration_m: 0.005
+  joint_error_deg: 15.0
+  min_contact_impulse_ns: 0.01
+  floor_z_m: 0.0

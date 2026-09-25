@@ -1,17 +1,55 @@
-"""Validated AMASS posture targets and interruptible keyboard action states."""
+"""Validated AMASS posture targets, motion playback and keyboard action states."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 
-from .amass import crop_amass_clip, load_amass_clip, normalize_root_motion
-from .contact_control import capsule_bottom
-from .rig import HumanRigPlan, forward_kinematics, joint_values_from_clip
-from .rotations import axis_angle_to_matrix, matrix_to_axis_angle, rotation_about_axis
-from .teleop import TeleopTarget
+from .amass import (
+    crop_amass_clip,
+    ground_amass_clip,
+    load_amass_clip,
+    normalize_root_motion,
+)
+from .contact_control import capsule_bottom, sideways_leg_dofs
+from .rig import (
+    AXIS_PROJECTION_TOLERANCE_RAD,
+    HumanRigPlan,
+    forward_kinematics,
+    joint_values_from_clip,
+)
+from .rotations import (
+    axis_angle_to_matrix,
+    axis_angle_to_quaternion,
+    matrix_to_axis_angle,
+    rotation_about_axis,
+)
+from .teleop import TeleopTarget, _move_capsule
+
+# Controller modes owned by the action layer. keyboard.py consults this set to
+# decide when NOT to reset the stance/contact corrections; new posture actions
+# must be added here or the locomotion corrections will fight them.
+POSTURE_TRANSITION_MODES = frozenset(
+    {
+        "crouching",
+        "crouch",
+        "bending",
+        "bend",
+        "sitting",
+        "sit",
+        "standing_up",
+        "getting_up",
+    }
+)
+_POSTURE_ING_MODES = {"crouch": "crouching", "bend": "bending", "sit": "sitting"}
+_SMOOTHSTEP_EPS = 1e-10
+# Blend window from the captured (fallen) pose into the get-up clip. Shorter
+# than the posture transition: the fallen body is already on the floor near the
+# clip's first pose, so a long blend would just delay the recovery.
+_CLIP_BLEND_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -23,6 +61,13 @@ class ActionConfig:
     fall_control_scale: float
     fallen_height_fraction: float
     fallen_tilt_deg: float
+    # Fraction of the authored joint damping kept while falling. The position
+    # drives are released (fall_control_scale 0), but PhysX drive damping is a
+    # property the body keeps: at full damping the collapse is a slow rigid
+    # crumple, at zero it folds ballistically and the floor impact NaNs the
+    # solver (measured 2864 deg/s mid-fall; see HumanRuntime.set_control_scale).
+    # The scale keeps a bounded viscous term: limp on screen, solver-safe.
+    fall_damping_scale: float = 0.15
 
     def __post_init__(self) -> None:
         if not np.isfinite(list(vars(self).values())).all():
@@ -34,6 +79,11 @@ class ActionConfig:
             raise ValueError("action timings and force must be positive")
         if not 0 <= self.fall_control_scale <= 1:
             raise ValueError("fall control scale must be in [0,1]")
+        if not 0.05 <= self.fall_damping_scale <= 1:
+            raise ValueError(
+                "fall damping scale must be in [0.05, 1]: below 0.05 the collapse is the "
+                "measured solver-NaN regime, above 1 would amplify the damping"
+            )
         if not 0 < self.fallen_height_fraction < 1 or not 0 < self.fallen_tilt_deg < 90:
             raise ValueError("invalid fallen posture thresholds")
 
@@ -46,11 +96,125 @@ class Posture:
     provenance: dict[str, Any]
 
 
+def _smoothstep(x: float) -> float:
+    x = min(1.0, max(0.0, x))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _contact_chains(side: str, kind: str) -> set[str]:
+    return {f"{side}_{name}" for name in ("shoulder", "elbow", "wrist")} if kind == "arm" else {
+        f"{side}_{name}" for name in ("hip", "knee", "ankle")
+    }
+
+
+def _project_posture_contacts(
+    plan: HumanRigPlan,
+    q: np.ndarray,
+    tilt: np.ndarray,
+    contacts: list[str],
+    *,
+    max_correction_rad: float = 0.6,
+    iterations: int = 80,
+    tolerance_m: float = 0.002,
+    rounds: int = 4,
+) -> tuple[np.ndarray, float, dict[str, Any]]:
+    """Ground a posture by its declared contact set and pull floaters down.
+
+    The AMASS source pose is one frame of a motion performed in the subject's
+    own contact geometry; after retargeting, the contacts that should share the
+    floor plane can be tens of millimetres apart (measured on the shipped sit
+    source: 48 mm spread across feet/hands/pelvis). Shipping such a pose as a
+    hold target recreates the crouch-hold failure: the highest contact floats
+    with zero impulse while the lowest one, pressed through the floor, carries
+    the load alone.
+
+    The root link ("pelvis"), when declared, is the anchor: the root height is
+    set so its capsule bottom touches the floor, and every other declared
+    contact is pulled down to the floor with the same bounded weighted IK the
+    swing-lift bake uses. Limb IK cannot move the root, so the anchor cannot
+    float; a contact the limbs cannot reach is reported as a residual instead
+    of silently shipping a floating target.
+    """
+
+    for name in contacts:
+        plan.link(name)  # raises for an unknown link
+    anchor = "pelvis" if "pelvis" in contacts else None
+    movable = [name for name in contacts if name != anchor]
+
+    def bottoms(values: np.ndarray, height: float) -> dict[str, float]:
+        poses = forward_kinematics(
+            plan,
+            dict(zip(plan.dof_names, values, strict=True)),
+            root_position=(0.0, 0.0, height),
+            root_rotation=tilt,
+        )
+        return {name: capsule_bottom(plan, poses, name) for name in contacts}
+
+    height = 0.0
+    residual = {}
+    used_rounds = 0
+    for round_index in range(1, rounds + 1):
+        used_rounds = round_index
+        measured = bottoms(q, height)
+        if anchor is None:
+            # No root link declared: ground by the lowest declared contact.
+            anchor_name = min(measured, key=measured.get)
+            height -= measured[anchor_name]
+        else:
+            height -= measured[anchor]
+        measured = bottoms(q, height)
+        moved = False
+        for name in movable:
+            if measured[name] > tolerance_m:
+                side, _, kind = name.partition("_")
+                chain = _contact_chains(side, kind if kind in {"hand", "ankle"} else "leg")
+                penalised = (
+                    frozenset(sideways_leg_dofs(plan)) if name.endswith("ankle") else frozenset()
+                )
+                q = _move_capsule(
+                    plan,
+                    q,
+                    name,
+                    chain,
+                    target_bottom=0.0,
+                    root_height=height,
+                    root_tilt=tilt,
+                    max_correction_rad=max_correction_rad,
+                    iterations=iterations,
+                    penalised=penalised,
+                )
+                moved = True
+        residual = bottoms(q, height)
+        if not moved and all(abs(value) <= tolerance_m for value in residual.values()):
+            break
+    # Height was grounded against the pre-IK pose; re-ground once against the
+    # final pose so the anchor rests exactly on the floor.
+    residual = bottoms(q, height)
+    height -= min(residual.values())
+    residual = bottoms(q, height)
+    return (
+        q,
+        height,
+        {
+            "method": "bounded_ik_contact_projection",
+            "rounds": used_rounds,
+            "tolerance_m": tolerance_m,
+            "residual_m": {name: round(value, 5) for name, value in residual.items()},
+            "max_residual_m": round(max(abs(v) for v in residual.values()), 5),
+        },
+    )
+
+
 def load_posture(spec: dict[str, Any], plan: HumanRigPlan) -> Posture:
     """Use an explicitly named source pose, not a whole out-of-range crouch walk.
 
     This is a derived stationary posture with a separately generated transition.
     It must not be reported as faithful playback of the entire AMASS sequence.
+
+    With ``contacts`` declared, the pose is additionally projected onto the
+    floor through :func:`_project_posture_contacts` and the residuals are
+    recorded; without it, the height follows the historical rule (lowest ankle
+    capsule bottom grounded, no joint modification).
     """
     clip = normalize_root_motion(
         crop_amass_clip(
@@ -65,8 +229,19 @@ def load_posture(spec: dict[str, Any], plan: HumanRigPlan) -> Posture:
     rotation = axis_angle_to_matrix(clip.root_rotation[0])
     yaw = np.arctan2(rotation[1, 0], rotation[0, 0])
     tilt = matrix_to_axis_angle(rotation_about_axis("z", -yaw) @ rotation)
-    poses = forward_kinematics(plan, dict(zip(plan.dof_names, q, strict=True)), root_rotation=tilt)
-    height = -min(capsule_bottom(plan, poses, f"{s}_ankle") for s in ("left", "right"))
+    contacts = spec.get("contacts")
+    if contacts is None:
+        poses = forward_kinematics(
+            plan, dict(zip(plan.dof_names, q, strict=True)), root_rotation=tilt
+        )
+        height = -min(capsule_bottom(plan, poses, f"{s}_ankle") for s in ("left", "right"))
+        derivation = "first_pose_of_authorized_crop_stationary_target_with_smooth_transition"
+        projection: dict[str, Any] | None = None
+    else:
+        q, height, projection = _project_posture_contacts(plan, q, tilt, list(contacts))
+        if np.any(q < lower) or np.any(q > upper):
+            raise ValueError("contact projection drove the posture outside rig limits")
+        derivation = "first_pose_of_authorized_crop_projected_onto_declared_floor_contacts"
     return Posture(
         q,
         height,
@@ -74,25 +249,128 @@ def load_posture(spec: dict[str, Any], plan: HumanRigPlan) -> Posture:
         {
             "source": clip.provenance.as_dict(),
             "metadata": dict(clip.metadata),
-            "derivation": "first_pose_of_authorized_crop_stationary_target_with_smooth_transition",
-            "height_method": "minimum_foot_collision_support",
+            "derivation": derivation,
+            "height_method": (
+                "declared_contact_projection" if contacts else "minimum_foot_collision_support"
+            ),
             "height_m": height,
+            **({"contacts": list(contacts), "projection": projection} if contacts else {}),
+        },
+    )
+
+
+@dataclass(frozen=True)
+class ActionClip:
+    """A ground-anchored AMASS sequence replayed as one assisted action."""
+
+    joints: np.ndarray  # (T, D) retargeted joint targets
+    heights_m: np.ndarray  # (T,) absolute root height, first frame grounded
+    offsets_xy: np.ndarray  # (T, 2) horizontal offset from the first frame
+    tilts: np.ndarray  # (T, 3) yaw-stripped root tilt
+    frame_dt_s: float
+    provenance: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        count = len(self.joints)
+        if count < 2 or self.joints.ndim != 2:
+            raise ValueError("action clip must have at least two joint frames")
+        if self.heights_m.shape != (count,) or self.offsets_xy.shape != (count, 2):
+            raise ValueError("action clip height/offset arrays must align with joint frames")
+        if self.tilts.shape != (count, 3):
+            raise ValueError("action clip tilts must align with joint frames")
+        if not np.isfinite(self.joints).all() or not np.isfinite(self.heights_m).all():
+            raise ValueError("action clip samples must be finite")
+        if not np.isfinite(self.offsets_xy).all() or not np.isfinite(self.tilts).all():
+            raise ValueError("action clip samples must be finite")
+        if not np.isfinite(self.frame_dt_s) or self.frame_dt_s <= 0:
+            raise ValueError("action clip frame period must be finite and positive")
+
+    @property
+    def duration_s(self) -> float:
+        return (len(self.joints) - 1) * self.frame_dt_s
+
+
+def load_action_clip(spec: dict[str, Any], plan: HumanRigPlan, *, dt_s: float) -> ActionClip:
+    """Load and retarget a full AMASS sequence for assisted playback.
+
+    The clip is yaw-anchored by :func:`normalize_root_motion` (first frame at
+    the origin facing +X), grounded once on the first frame's collision
+    geometry, and resampled onto the physics grid. Root height is absolute;
+    horizontal offsets stay relative so the runtime can anchor the replay at
+    the measured fallen position and heading.
+    """
+    if not np.isfinite(dt_s) or dt_s <= 0:
+        raise ValueError("action clip physics step must be finite and positive")
+    clip = normalize_root_motion(load_amass_clip(spec["file"]))
+    clip = ground_amass_clip(clip, plan, support_z_m=0.0).resample(1.0 / dt_s, method="slerp")
+    joints = []
+    lower = np.deg2rad([j.lower_deg for j in plan.joints])
+    upper = np.deg2rad([j.upper_deg for j in plan.joints])
+    for frame in range(clip.frame_count):
+        values, worst = joint_values_from_clip(clip, frame, plan, axis_tolerance_rad=math.inf)
+        if worst > AXIS_PROJECTION_TOLERANCE_RAD:
+            raise ValueError(
+                f"action clip frame {frame} is not expressible by this rig "
+                f"(axis residual {worst:.2e} rad)"
+            )
+        joints.append(values)
+    joints = np.stack(joints)
+    if np.any(joints < lower - 1e-6) or np.any(joints > upper + 1e-6):
+        excess = float(np.maximum(lower - joints, joints - upper).max())
+        raise ValueError(f"action clip exceeds rig limits by {np.degrees(excess):.3f} deg")
+    heights = (
+        np.asarray(plan.spawn_root_position, dtype=np.float64)[2] + clip.root_translation[:, 2]
+    )
+    return ActionClip(
+        joints,
+        heights,
+        np.asarray(clip.root_translation, dtype=np.float64)[:, :2].copy(),
+        np.asarray(clip.root_rotation, dtype=np.float64).copy(),
+        1.0 / clip.fps,
+        {
+            "source": clip.provenance.as_dict(),
+            "metadata": dict(clip.metadata),
+            "derivation": "full_clip_retargeted_grounded_resampled_assisted_playback",
+            "duration_s": float(clip.times_s[-1]),
+            "frames": int(clip.frame_count),
+            "root_travel_m": round(float(np.linalg.norm(clip.root_translation[-1, :2])), 4),
         },
     )
 
 
 class ActionState:
-    """Edge-triggered crouch/stand and a latched, physically observed fall."""
+    """Edge-triggered posture actions, motion playback and a latched physical fall.
 
-    def __init__(self, config: ActionConfig, crouch: Posture) -> None:
-        self.config, self.crouch = config, crouch
+    Posture actions (crouch/bend/sit) blend from a captured snapshot of the
+    current pose to the target posture, so switching actions mid-transition is
+    continuous by construction. ``get_up`` replays a grounded AMASS
+    lying-to-standing clip anchored at the measured fallen position; it is only
+    accepted from the latched fallen state and restores assistance on entry.
+    """
+
+    def __init__(
+        self,
+        config: ActionConfig,
+        postures: dict[str, Posture] | Posture,
+        playback_clip: ActionClip | None = None,
+    ) -> None:
+        if isinstance(postures, Posture):
+            postures = {"crouch": postures}
+        unknown = set(postures) - set(_POSTURE_ING_MODES)
+        if unknown:
+            raise ValueError(f"unknown posture actions {sorted(unknown)}")
+        self.config, self.postures, self.playback_clip = config, postures, playback_clip
         self.history: list[dict[str, Any]] = []
         self.reset()
 
     def reset(self) -> None:
+        self.phase = "idle"  # idle | falling | fallen | getting_up
         self.mode = "locomotion"
-        self.requested = "stand"
+        self.requested: str | None = None
         self.blend = 0.0
+        self.source: tuple[np.ndarray, float, np.ndarray] | None = None
+        self.last_pose: tuple[np.ndarray, float, np.ndarray] | None = None
+        self.playback: dict[str, Any] | None = None
         self.fall_time_s: float | None = None
         self.fall_heading_rad = 0.0
         self.fall_pose: np.ndarray | None = None
@@ -101,21 +379,42 @@ class ActionState:
 
     @property
     def falling(self) -> bool:
-        return self.fall_time_s is not None
+        """True while a fall is latched (falling or lying fallen) until reset/get-up."""
+        return self.phase in ("falling", "fallen")
+
+    @property
+    def suppresses_stance(self) -> bool:
+        """Locomotion foot corrections must not run during fall or recovery."""
+        return self.phase != "idle"
 
     def request(
-        self, name: str, *, time_s: float, heading_rad: float, measured_joints: np.ndarray
-    ) -> None:
-        if name not in {"crouch", "stand", "fall"}:
+        self,
+        name: str,
+        *,
+        time_s: float,
+        heading_rad: float,
+        measured_joints: np.ndarray,
+        measured_position: np.ndarray | None = None,
+    ) -> bool:
+        if name not in {*_POSTURE_ING_MODES, "stand", "fall", "get_up"}:
             raise ValueError(f"unknown action {name}")
         if not np.isfinite([time_s, heading_rad]).all() or not np.isfinite(measured_joints).all():
             raise ValueError("action request requires finite measured state")
-        if self.falling:
-            return
+        if name == "get_up":
+            return self._request_get_up(time_s, heading_rad, measured_joints, measured_position)
+        if self.suppresses_stance:
+            # Falling/fallen: only R or get_up leave the state. Getting up:
+            # posture requests would fight the replay.
+            return False
         if name == "fall":
             self.fall_time_s, self.fall_heading_rad = time_s, heading_rad
             self.fall_pose = measured_joints.copy()
+            self.phase = "falling"
             self.mode = "falling"
+            self.requested = None
+            self.blend = 0.0
+            self.source = None
+            self.playback = None
             self.active_event = {
                 "requested_time_s": time_s,
                 "heading_rad": heading_rad,
@@ -125,13 +424,57 @@ class ActionState:
                 "control_scale": self.config.fall_control_scale,
             }
             self.history.append(self.active_event)
-        else:
-            self.requested = name
+            return True
+        if self.blend > 0 and self.last_pose is not None:
+            # Mid-transition retarget: continue from the pose currently commanded.
+            self.source = (
+                self.last_pose[0].copy(),
+                self.last_pose[1],
+                self.last_pose[2].copy(),
+            )
+            self.blend = 0.0
+        self.requested = None if name == "stand" else name
+        return True
+
+    def _request_get_up(
+        self,
+        time_s: float,
+        heading_rad: float,
+        measured_joints: np.ndarray,
+        measured_position: np.ndarray | None,
+    ) -> bool:
+        if self.playback_clip is None:
+            return False
+        if self.phase != "fallen":
+            return False
+        if measured_position is None or np.shape(measured_position) != (3,):
+            raise ValueError("get_up requires the measured root position")
+        if not np.isfinite(measured_position).all():
+            raise ValueError("get_up requires a finite measured root position")
+        tilt = np.zeros(3) if self.last_pose is None else self.last_pose[2]
+        self.playback = {
+            "requested_time_s": float(time_s),
+            "anchor_xy": np.asarray(measured_position, dtype=np.float64)[:2].copy(),
+            "heading_rad": float(heading_rad),
+            "elapsed_s": 0.0,
+            "source_joints": measured_joints.copy(),
+            "source_height_m": float(measured_position[2]),
+            "source_tilt": np.asarray(tilt, dtype=np.float64).copy(),
+        }
+        self.phase = "getting_up"
+        self.mode = "getting_up"
+        self.requested = None
+        self.blend = 0.0
+        self.source = None
+        return True
 
     def command(self, movement: tuple[float, float]) -> tuple[float, float]:
-        return (
-            (0.0, 0.0) if self.falling or self.requested == "crouch" or self.blend > 0 else movement
+        blocked = (
+            self.phase != "idle"
+            or self.requested is not None
+            or self.blend > 0
         )
+        return (0.0, 0.0) if blocked else movement
 
     def apply(
         self,
@@ -146,6 +489,8 @@ class ActionState:
     ) -> TeleopTarget:
         if not np.isfinite(dt_s) or dt_s <= 0:
             raise ValueError("action step must be positive and finite")
+        if self.phase == "getting_up":
+            return self._apply_playback(target, dt_s=dt_s)
         if self.falling:
             assert self.fall_pose is not None
             return replace(
@@ -154,35 +499,82 @@ class ActionState:
                 joint_velocities=np.zeros_like(target.joints),
                 mode=self.mode,
             )
-        desired = float(self.requested == "crouch")
-        if abs(speed_m_s) > self.config.stopped_speed_m_s and desired > self.blend:
-            self.mode = "braking_for_crouch"
-            return replace(target, mode=self.mode)
-        self.blend += float(
-            np.clip(
-                desired - self.blend,
-                -dt_s / self.config.transition_s,
-                dt_s / self.config.transition_s,
-            )
-        )
-        if self.blend < 1e-10:
+        if self.source is None and self.blend <= _SMOOTHSTEP_EPS and self.requested is None:
             self.blend = 0.0
             self.mode = "locomotion"
             return target
-        weight = self.blend**2 * (3 - 2 * self.blend)
-        q = (1 - weight) * idle_joints + weight * self.crouch.joints
-        height = (1 - weight) * idle_height_m + weight * self.crouch.height_m
-        tilt = (1 - weight) * idle_tilt + weight * self.crouch.tilt
-        from .rotations import axis_angle_to_quaternion
-
+        if self.requested is not None and self.blend < 1.0 and abs(speed_m_s) > (
+            self.config.stopped_speed_m_s
+        ):
+            self.mode = "braking_for_action"
+            return replace(target, mode=self.mode)
+        if self.source is None:
+            self.source = (idle_joints.copy(), idle_height_m, idle_tilt.copy())
+        self.blend = min(1.0, self.blend + dt_s / self.config.transition_s)
+        if self.requested is None and self.blend >= 1.0:
+            # The return blend reached the standing reference: hand control back
+            # to the locomotion path (target passed through unchanged, like the
+            # pre-refactor completion at blend == 0).
+            self.source = None
+            self.blend = 0.0
+            self.mode = "locomotion"
+            return target
+        weight = _smoothstep(self.blend)
+        assert self.source is not None
+        if self.requested is None:
+            dst_q, dst_h, dst_t = idle_joints, idle_height_m, idle_tilt
+            self.mode = "standing_up"
+        else:
+            posture = self.postures[self.requested]
+            dst_q, dst_h, dst_t = posture.joints, posture.height_m, posture.tilt
+            self.mode = self.requested if self.blend >= 1.0 else _POSTURE_ING_MODES[self.requested]
+        q = (1 - weight) * self.source[0] + weight * dst_q
+        height = (1 - weight) * self.source[1] + weight * dst_h
+        tilt = (1 - weight) * self.source[2] + weight * dst_t
+        self.last_pose = (q.copy(), float(height), tilt.copy())
         rotation = rotation_about_axis("z", heading_rad) @ axis_angle_to_matrix(tilt)
-        self.mode = (
-            "crouch"
-            if self.blend >= 1
-            else ("crouching" if self.requested == "crouch" else "standing_up")
-        )
         position = target.position.copy()
         position[2] = height
+        return replace(
+            target,
+            joints=q,
+            position=position,
+            quaternion=axis_angle_to_quaternion(matrix_to_axis_angle(rotation)),
+            mode=self.mode,
+        )
+
+    def _apply_playback(self, target: TeleopTarget, *, dt_s: float) -> TeleopTarget:
+        assert self.playback is not None and self.playback_clip is not None
+        clip = self.playback_clip
+        state = self.playback
+        state["elapsed_s"] += dt_s
+        elapsed = state["elapsed_s"]
+        index = min(int(elapsed / clip.frame_dt_s), len(clip.joints) - 1)
+        blend = _smoothstep(elapsed / _CLIP_BLEND_S)
+        q = (1 - blend) * state["source_joints"] + blend * clip.joints[index]
+        height = (1 - blend) * state["source_height_m"] + blend * clip.heights_m[index]
+        tilt = (1 - blend) * state["source_tilt"] + blend * clip.tilts[index]
+        offset = clip.offsets_xy[index]
+        c, s = math.cos(state["heading_rad"]), math.sin(state["heading_rad"])
+        anchor = state["anchor_xy"]
+        position = np.array(
+            [anchor[0] + c * offset[0] - s * offset[1],
+             anchor[1] + s * offset[0] + c * offset[1],
+             height]
+        )
+        self.last_pose = (q.copy(), float(height), tilt.copy())
+        if index >= len(clip.joints) - 1 and elapsed >= clip.duration_s + _CLIP_BLEND_S:
+            # Recovery complete: hand over to the standing blend from the final
+            # replay pose, which restores assistance and locomotion modes.
+            self.source = self.last_pose
+            self.blend = 0.0
+            self.requested = None
+            self.playback = None
+            self.phase = "idle"
+            self.mode = "standing_up"
+        else:
+            self.mode = "getting_up"
+        rotation = rotation_about_axis("z", state["heading_rad"]) @ axis_angle_to_matrix(tilt)
         return replace(
             target,
             joints=q,
@@ -249,6 +641,7 @@ class ActionState:
             and root_height_m < standing_height_m * self.config.fallen_height_fraction
             and tilt_deg > self.config.fallen_tilt_deg
         ):
+            self.phase = "fallen"
             self.mode = "fallen"
             assert self.active_event is not None
             if self.active_event["fallen_time_s"] is None:

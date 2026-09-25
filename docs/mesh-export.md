@@ -34,7 +34,18 @@ SMPL neutral 与真实 AMASS 已用于实际记录，详见 [AMASS 审计](amass
 
 ## 键盘记录
 
-`keyboard.py` 输出 `recording.npz`：`time_s`、`mesh_vertices_xyz`、`mesh_faces`，采样率由显示更新决定，
+`keyboard.py` 输出 `recording.npz`：`time_s`、`mesh_vertices_xyz`、`mesh_faces`、`foot_min_z_m`，
+默认采样率由显示更新决定；`record_mesh_at_physics_hz: true` 时采样实际物理姿态（当前 120 Hz），
 不含 `time_channel_s` 或重采样后的信道网格。它不是可直接替代 `.trial.json` + 试验 NPZ 的无线输入。
 `control.npz` 单独保存物理时间上的目标/实际状态/外力，`contacts.json` 保存接触，`report.json` 保存来源和门槛。
 记录采用有界窗口，必须读保留时间范围；完整格式与边界见 [键盘指南](keyboard-control.md)。
+
+`scripts/humans/export_session_mesh.py --run RUN --sample-hz 50` 可从高频实际网格导出均匀 50 Hz：
+以世界顶点线性插值对齐，不向观察区间外推，不允许把 30 Hz 录制上采样并称作 50 Hz 真值。
+导出前强制检查运行、完整记录窗口和逐动作实测质量的会话总门；未知动作拒收。
+跌倒需要冲击事件及实测低根高、倾斜姿态，falling/fallen 合并为同一次跌倒，NPZ 的
+`activity_state` 保留逐帧状态。`reset_id` 在降采样前建立分段，覆盖原地复位及跨帧复位。
+
+失败会话仅可通过 `--diagnostic` 导出诊断样本；manifest 与每个样本均为
+`admitted_for_training: false`、标签 `valid: false`，Sionna 入口明确拒绝。
+新导出器不自动升级历史会话；必须用现行门槛重新采集/验收。

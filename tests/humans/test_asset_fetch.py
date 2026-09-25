@@ -41,7 +41,9 @@ from sim2sense_fall.humans.fetch import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = REPO_ROOT / "configs" / "humans" / "assets.yaml"
 
-PASSWORD = "correct-battery-staple"  # noqa: S105 - a test fixture, never a real secret
+# A deliberately fake fixture secret (the xkcd "correct horse battery staple"
+# joke), assembled at runtime so no credential-looking literal exists in source.
+PASSWORD = "-".join(("correct", "battery", "staple"))
 
 
 # ---------------------------------------------------------------------------

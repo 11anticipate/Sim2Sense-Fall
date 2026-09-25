@@ -1204,6 +1204,28 @@ def validate_plan_geometry(
                 )
 
 
+def configuration_com(plan: HumanRigPlan, poses: Mapping[str, LinkTransform]) -> np.ndarray:
+    """Mass-weighted whole-body centre of mass in the same frame as ``poses``.
+
+    Uses each link's authored mass and centre of mass. This is the model's
+    estimate, not a measurement: link masses come from the rig's density model
+    and the collision-fit COMs. It is exact for the model, which is what
+    feedforward and diagnostics need.
+    """
+
+    total = 0.0
+    com = np.zeros(3)
+    for link in plan.links:
+        mass = float(link.mass_kg)
+        if mass <= 0:
+            continue
+        com += mass * poses[link.name].transform_point(link.center_of_mass)
+        total += mass
+    if total <= 0:
+        raise ValueError("plan has no positive link masses; COM is undefined")
+    return com / total
+
+
 def forward_kinematics(
     plan: HumanRigPlan,
     joint_angles_rad: Mapping[str, float] | None = None,

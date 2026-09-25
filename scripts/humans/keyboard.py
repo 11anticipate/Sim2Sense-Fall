@@ -25,7 +25,13 @@ from common import (
     write_json,
 )
 
-from sim2sense_fall.humans.actions import ActionConfig, ActionState, load_posture
+from sim2sense_fall.humans.actions import (
+    POSTURE_TRANSITION_MODES,
+    ActionConfig,
+    ActionState,
+    load_action_clip,
+    load_posture,
+)
 from sim2sense_fall.humans.assets import select_body
 from sim2sense_fall.humans.contact_control import (
     StanceFootController,
@@ -54,6 +60,24 @@ from sim2sense_fall.humans.usd_human import (
 from sim2sense_fall.scenes.view import apply_inspection_view
 
 LOGGER = logging.getLogger("human_keyboard")
+
+# Bound on the numerically differentiated reference COM acceleration. The
+# second difference is exact for the smooth baked tables, but its input changes
+# rate whenever the phase clock does (reversals), and the raw spikes there were
+# measured to kick the body hard enough to ring the collar drives ±20 deg. The
+# true signal (bob and load-profile accelerations) stays below ~1 m/s^2, so the
+# clip is tight and an EMA removes the remaining rate-change transients.
+REFERENCE_ACCEL_MAX_M_S2 = 2.5
+REFERENCE_ACCEL_EMA_TAU_S = 0.08
+
+
+def cycle_sample(table: np.ndarray, phase: float) -> np.ndarray:
+    """Circular linear interpolation into a seam-closed per-cycle table."""
+    count = len(table)
+    point = (phase % 1.0) * (count - 1)
+    index = min(int(point), count - 2)
+    fraction = point - index
+    return (1 - fraction) * table[index] + fraction * table[(index + 1) % count]
 
 
 def prepare(path: Path) -> tuple[dict[str, Any], Any, Any, Any, TeleopController]:
@@ -98,19 +122,44 @@ def prepare(path: Path) -> tuple[dict[str, Any], Any, Any, Any, TeleopController
         # TeleopController.advance blends idle->gait height.
         idle_height = float(plan.standing_root_height_m) * settings["idle_stand_height_fraction"]
         fit_contact_idle(idle, plan, idle_height, planner_config)
+        swing_shapes = {
+            name: gait.swing_shapes for name, gait in gaits.items() if gait.swing_shapes is not None
+        }
         settings["contact_foot_planner"] = ContactFootPlanner(
-            plan, planner_config, settings["speed_m_s"], settings["acceleration_m_s2"])
+            plan, planner_config, settings["speed_m_s"], settings["acceleration_m_s2"],
+            swing_shapes=swing_shapes or None)
     controller = TeleopController(
         settings["controller"], gaits, idle, plan, np.deg2rad(settings["heading_deg"])
     )
     if "actions" in settings:
-        posture = load_posture(settings["crouch"], plan)
-        settings["action_state"] = ActionState(ActionConfig(**settings["actions"]), posture)
-        settings["crouch_provenance"] = posture.provenance
+        postures = {"crouch": load_posture(settings["crouch"], plan)}
+        for key in ("bend", "sit"):
+            if key in settings:
+                postures[key] = load_posture(settings[key], plan)
+        playback_clip = (
+            load_action_clip(settings["get_up"], plan, dt_s=config.simulation.physics_dt_s)
+            if "get_up" in settings
+            else None
+        )
+        settings["action_state"] = ActionState(
+            ActionConfig(**settings["actions"]), postures, playback_clip
+        )
+        settings["posture_provenance"] = {name: p.provenance for name, p in postures.items()}
+        settings["get_up_provenance"] = None if playback_clip is None else playback_clip.provenance
+        settings["crouch_provenance"] = postures["crouch"].provenance
     if settings.get("stance", {}).get("enabled", False):
         settings["stance_controller"] = StanceFootController(
             plan, **{key: value for key, value in settings["stance"].items() if key != "enabled"}
         )
+    if settings["reference_feedforward_scale"] > 0:
+        tables = {name: gait.com_offset_m for name, gait in gaits.items()}
+        tables["idle"] = idle.com_offset_m
+        missing = sorted(name for name, table in tables.items() if table is None)
+        if missing:
+            raise ValueError(
+                f"reference_feedforward_scale needs COM offset tables on {missing}; "
+                "they are produced by the contact cycle bake and the contact idle fit"
+            )
     return settings, config, plan, mesh, controller
 
 
@@ -153,6 +202,10 @@ def main() -> int:
         settings.get("locomotion_root_assist", settings["root_assist"])
     )
     assist_blend = 1.0
+    feedforward_scale = settings["reference_feedforward_scale"]
+    ff_com_prev = ff_com_prev2 = None
+    ff_accel = None
+    ff_mode = None
     quality_config = MotionQualityConfig(**settings.get("quality", {}))
     native_mesh = settings.get("record_mesh_at_physics_hz", False)
     if not isinstance(native_mesh, bool):
@@ -167,6 +220,7 @@ def main() -> int:
         "mode": "keyboard_bounded_external_root_assistance",
         "unassisted": settings["root_assist_scale"] == 0,
         "root_assist_scale": settings["root_assist_scale"],
+        "reference_feedforward_scale": feedforward_scale,
         "seed": config.export.surface_point_seed,
         "scene_split": "single_fixed_apartment_no_train_test_split",
         "rig_sha256": hashlib.sha256(settings["rig"].read_bytes()).hexdigest(),
@@ -191,6 +245,8 @@ def main() -> int:
         "dof_names": list(plan.dof_names),
         "collision_fit": settings["collision_fit_audit"],
         "crouch": settings.get("crouch_provenance"),
+        "postures": settings.get("posture_provenance"),
+        "get_up": settings.get("get_up_provenance"),
         "actions": settings.get("actions"),
         "stance": settings.get("stance"),
         "contact_planner": settings.get("contact_planner"),
@@ -226,6 +282,7 @@ def main() -> int:
                     time_s=frame * config.simulation.physics_dt_s,
                     heading_rad=controller.heading,
                     measured_joints=controller.joints,
+                    measured_position=position,
                 )
                 intent.action_requested = None
             target = controller.advance(
@@ -329,8 +386,11 @@ def main() -> int:
             app.update()
 
         def reset() -> None:
-            nonlocal assist_blend
+            nonlocal assist_blend, ff_com_prev, ff_com_prev2, ff_accel, ff_mode
             assist_blend = 1.0
+            ff_com_prev = ff_com_prev2 = None
+            ff_accel = None
+            ff_mode = None
             if actions:
                 actions.reset()
             if stance:
@@ -368,7 +428,7 @@ def main() -> int:
                 state_label = ui.Label("State: stand")
                 speed_label = ui.Label("Speed: 0.00 m/s")
                 clock_label = ui.Label("Physics: 0.00 s")
-                ui.Label("C: crouch | V: stand | F: fall")
+                ui.Label("C: crouch | B: bend | N: sit | V: stand | F: fall | G: get up")
 
         def on_key(event: Any, *_args: Any) -> bool:
             key = event.input.name
@@ -389,6 +449,7 @@ def main() -> int:
 
         def before_step(dt: float, _context: Any) -> None:
             nonlocal clock_s, previous_target, previous_stance_mode, assist_blend
+            nonlocal ff_com_prev, ff_com_prev2, ff_accel, ff_mode
             if errors:
                 return
             try:
@@ -407,16 +468,27 @@ def main() -> int:
                     else None
                 )
                 if actions and intent.action_requested:
-                    actions.request(
+                    accepted = actions.request(
                         intent.action_requested,
                         time_s=clock_s,
                         heading_rad=controller.heading,
                         measured_joints=runtime.joint_positions_rad(),
+                        measured_position=position,
                     )
                     intent.action_requested = None
                     if actions.falling:
-                        if not runtime.set_control_scale(actions.config.fall_control_scale):
+                        if not runtime.set_control_scale(
+                            actions.config.fall_control_scale,
+                            actions.config.fall_damping_scale,
+                        ):
                             raise RuntimeError("could not release position drives for fall")
+                        if stance:
+                            stance.reset()
+                    elif accepted and actions.mode == "getting_up":
+                        # The fall released the position drives; recovery plays
+                        # under full drives plus the standard root assistance.
+                        if not runtime.set_control_scale(1.0):
+                            raise RuntimeError("could not restore position drives for get_up")
                         if stance:
                             stance.reset()
                 target = controller.advance(
@@ -435,17 +507,15 @@ def main() -> int:
                         idle_tilt=controller.idle.tilt(0),
                         heading_rad=controller.heading,
                     )
-                if stance and not (actions and actions.falling):
+                if stance and not (actions and actions.suppresses_stance):
                     stance_mode = (
                         "transition"
                         if target.mode in {"forward", "backward"} and controller.weight < 0.95
                         else target.mode
                     )
-                    if stance_mode != previous_stance_mode and target.mode not in {
-                        "crouching",
-                        "crouch",
-                        "standing_up",
-                    }:
+                    if stance_mode != previous_stance_mode and (
+                        target.mode not in POSTURE_TRANSITION_MODES
+                    ):
                         stance.reset()
                     previous_stance_mode = stance_mode
                     if stance_mode == "transition" or abs(controller.turn_rate) > 0.01:
@@ -511,6 +581,44 @@ def main() -> int:
                     / dt,
                 )
                 previous_target = target
+                # Reference-COM feedforward: Newton-Euler on the blended reference
+                # configuration, applied as m*a before the assist's caps. The
+                # history resets on any mode change so the second difference never
+                # differentiates across a table switch.
+                feedforward_accel = None
+                if feedforward_scale > 0 and assist_blend > 0 and target.mode in {
+                    "forward", "backward", "stand"
+                }:
+                    if ff_mode != target.mode:
+                        ff_mode = target.mode
+                        ff_com_prev = ff_com_prev2 = None
+                        ff_accel = None
+                    gait_table = controller.gaits[controller.mode]
+                    offset = (
+                        (1 - controller.weight) * controller.idle.com_offset_m[0]
+                        + controller.weight * cycle_sample(
+                            gait_table.com_offset_m, controller.phase
+                        )
+                    )
+                    cosine, sine = np.cos(controller.heading), np.sin(controller.heading)
+                    com_reference = target.position + np.array([
+                        cosine * offset[0] - sine * offset[1],
+                        sine * offset[0] + cosine * offset[1],
+                        offset[2],
+                    ])
+                    if ff_com_prev is not None and ff_com_prev2 is not None:
+                        accel = (com_reference - 2 * ff_com_prev + ff_com_prev2) / (dt * dt)
+                        alpha = dt / (dt + REFERENCE_ACCEL_EMA_TAU_S)
+                        ff_accel = (
+                            accel * alpha
+                            if ff_accel is None
+                            else ff_accel * (1 - alpha) + accel * alpha
+                        )
+                        feedforward_accel = feedforward_scale * assist_blend * np.clip(
+                            ff_accel, -REFERENCE_ACCEL_MAX_M_S2, REFERENCE_ACCEL_MAX_M_S2
+                        )
+                    ff_com_prev2 = ff_com_prev
+                    ff_com_prev = com_reference
                 linear, angular = runtime.root_velocities()
                 ordinary = target.mode in {"forward", "backward", "stand"}
                 assist_blend = float(np.clip(
@@ -539,6 +647,7 @@ def main() -> int:
                     target_angular_velocity=target.angular_velocity,
                     mass_kg=plan.total_mass_kg,
                     gravity_m_s2=config.simulation.gravity_m_s2,
+                    feedforward_accel_m_s2=feedforward_accel,
                 )
                 force *= settings["root_assist_scale"]
                 torque *= settings["root_assist_scale"]

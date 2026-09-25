@@ -95,7 +95,7 @@ def test_applying_a_view_selects_the_camera_it_authored() -> None:
     """
 
     pytest.importorskip("pxr.Usd", reason="requires the bundled OpenUSD runtime")
-    from pxr import Usd, UsdGeom
+    from pxr import UsdGeom
 
     stage = _closed_room()
     roof = stage.GetPrimAtPath("/World/ceiling")
@@ -104,7 +104,7 @@ def test_applying_a_view_selects_the_camera_it_authored() -> None:
     # the roof is still hidden, because that part does not need a viewport.
     assert apply_inspection_view(stage, mode="human") == "/InspectionCamera"
     assert UsdGeom.Imageable(roof).ComputeVisibility() == "invisible"
-    assert Usd.Stage.Get(stage, "/InspectionCamera")
+    assert stage.GetPrimAtPath("/InspectionCamera").IsValid()
 
     # A caller whose whole purpose is a person watching a window must hear about it
     # when there is no window, rather than silently keep the default camera. This is

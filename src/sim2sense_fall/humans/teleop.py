@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import yaml
@@ -24,6 +24,9 @@ from .rotations import (
     matrix_to_axis_angle,
     rotation_about_axis,
 )
+
+if TYPE_CHECKING:
+    from .contact_gait import AmassSwingShape
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,13 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
     payload.setdefault("root_assist_scale", 1.0)
     if not np.isfinite(payload["root_assist_scale"]) or not 0 <= payload["root_assist_scale"] <= 1:
         raise ValueError("root_assist_scale must be finite in [0, 1]")
+    # Feedforward from the reference COM's derived acceleration. 0 keeps the
+    # pelvis actuator purely reactive (spring + constant gravity fraction);
+    # 1 applies the reference motion's own inertial force in full.
+    payload.setdefault("reference_feedforward_scale", 0.0)
+    if not np.isfinite(payload["reference_feedforward_scale"]) or not (
+            0 <= payload["reference_feedforward_scale"] <= 1):
+        raise ValueError("reference_feedforward_scale must be finite in [0, 1]")
     # What decides whether a foot may be anchored:
     #   model             -- the gait's travel-derived support mask (shipped default)
     #   contact           -- the simulator's own contact report, replacing the mask
@@ -101,12 +111,25 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
     specs = [*payload["gaits"].values(), payload["idle"]]
     if "crouch" in payload:
         specs.append(payload["crouch"])
+    for key in ("bend", "sit"):
+        if key in payload:
+            specs.append(payload[key])
     for spec in specs:
         spec["file"] = (project_root / spec["file"]).resolve()
         if not np.isfinite([spec["start_s"], spec["duration_s"]]).all():
             raise ValueError("gait interval must be finite")
         if spec["start_s"] < 0 or spec["duration_s"] <= 0:
             raise ValueError("gait interval must have positive duration and nonnegative start")
+        contacts = spec.get("contacts")
+        if contacts is not None:
+            if (
+                not isinstance(contacts, list)
+                or not contacts
+                or not all(isinstance(name, str) and name for name in contacts)
+            ):
+                raise ValueError("posture contacts must be a nonempty list of link names")
+            if len(set(contacts)) != len(contacts):
+                raise ValueError("posture contacts must be unique link names")
         lift = spec.get("swing_lift_m")
         if lift is not None and (
             not np.isfinite(lift) or not 0 < lift <= SWING_LIFT_MAX_M
@@ -122,6 +145,11 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
             )
     if set(payload["gaits"]) != {"forward", "backward"}:
         raise ValueError("keyboard mode requires forward and backward gaits")
+    if "get_up" in payload:
+        get_up = payload["get_up"]
+        if not isinstance(get_up, dict) or not get_up.get("file"):
+            raise ValueError("get_up must be a mapping with a file")
+        get_up["file"] = (project_root / get_up["file"]).resolve()
     if "contact_planner" in payload:
         from .contact_gait import ContactGaitConfig
 
@@ -178,8 +206,19 @@ class KeyboardIntent:
     """Held-key state; repeat events never accumulate extra velocity."""
 
     KEYS = frozenset(
-        {"W", "S", "A", "D", "UP", "DOWN", "LEFT", "RIGHT", "SPACE", "R", "C", "V", "F", "ESCAPE"}
+        {
+            "W", "S", "A", "D", "UP", "DOWN", "LEFT", "RIGHT", "SPACE",
+            "R", "C", "V", "F", "B", "N", "G", "ESCAPE",
+        }
     )
+    ACTION_KEYS = {
+        "C": "crouch",
+        "V": "stand",
+        "F": "fall",
+        "B": "bend",
+        "N": "sit",
+        "G": "get_up",
+    }
 
     def __init__(self) -> None:
         self.held: set[str] = set()
@@ -194,8 +233,8 @@ class KeyboardIntent:
             if key not in self.held:
                 self.reset_requested |= key == "R"
                 self.quit_requested |= key == "ESCAPE"
-                if key in {"C", "V", "F"}:
-                    self.action_requested = {"C": "crouch", "V": "stand", "F": "fall"}[key]
+                if key in self.ACTION_KEYS:
+                    self.action_requested = self.ACTION_KEYS[key]
             self.held.add(key)
         else:
             self.held.discard(key)
@@ -221,6 +260,12 @@ class Gait:
     provenance: dict[str, Any]
     root_tilt: np.ndarray | None = None
     support_mask: np.ndarray | None = None
+    # Per-side sanitized mocap swing arcs, set when the gait's contact cycle
+    # requests swing_shape "amass"; consumed by the runtime contact planner.
+    swing_shapes: dict[str, AmassSwingShape] | None = None
+    # COM offset relative to the root origin per frame (contact-cycle gaits and
+    # contact-fitted idle only); feeds the reference-COM feedforward.
+    com_offset_m: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.joints.ndim != 2 or len(self.joints) < 2:
@@ -665,10 +710,11 @@ def _foot_fore_aft(
     return float(poses[f"{side}_ankle"].translation[0])
 
 
-def _move_foot(
+def _move_capsule(
     plan: HumanRigPlan,
     joints: np.ndarray,
-    side: str,
+    link: str,
+    chain_links: set[str],
     *,
     target_bottom: float,
     root_height: float,
@@ -676,24 +722,28 @@ def _move_foot(
     max_correction_rad: float,
     iterations: int,
     target_fore_aft: float | None = None,
+    penalised: frozenset[str] = frozenset(),
 ) -> np.ndarray:
-    """Bounded weighted joint-space least-norm IK moving one foot's pose.
+    """Bounded weighted joint-space least-norm IK moving one capsule's bottom.
 
-    Tasks: raise the capsule bottom to ``target_bottom`` and, when
-    ``target_fore_aft`` is given, hold the foot's body-frame fore-aft coordinate
-    there (the stance-planting task). Height alone uses the 1-row solve.
+    Tasks: bring the named link's capsule bottom to ``target_bottom`` and, when
+    ``target_fore_aft`` is given, hold the link's body-frame fore-aft coordinate
+    there. The solve runs on the DOFs whose ``chain_joint`` is in
+    ``chain_links`` (e.g. the hip/knee/ankle chain of one leg, or the
+    shoulder/elbow/wrist chain of one arm), clipped to the rig limits and the
+    per-call correction budget. ``penalised`` names DOFs that pay extra per
+    radian so the correction routes through flexion instead of splay.
     """
 
-    indices = [
-        i
-        for i, joint in enumerate(plan.joints)
-        if joint.chain_joint in {f"{side}_hip", f"{side}_knee", f"{side}_ankle"}
-    ]
+    indices = [i for i, joint in enumerate(plan.joints) if joint.chain_joint in chain_links]
+    if not indices:
+        raise ValueError(f"no DOFs found for chain {sorted(chain_links)}")
     original = joints.copy()
     lower = np.deg2rad([j.lower_deg for j in plan.joints])
     upper = np.deg2rad([j.upper_deg for j in plan.joints])
-    penalised = set(sideways_leg_dofs(plan))
-    weights = np.where([plan.joints[i].name in penalised for i in indices], 1000.0, 1.0)
+    weights = np.where(
+        [plan.joints[i].name in penalised for i in indices], 1000.0, 1.0
+    )
 
     def task_of(values: np.ndarray) -> np.ndarray:
         poses = forward_kinematics(
@@ -702,12 +752,12 @@ def _move_foot(
             root_position=(0.0, 0.0, root_height),
             root_rotation=root_tilt,
         )
-        bottom = capsule_bottom(plan, poses, f"{side}_ankle")
+        bottom = capsule_bottom(plan, poses, link)
         if target_fore_aft is None:
             return np.array([bottom])
-        # Root sits at (0, 0, h) with no yaw, so the ankle's world x *is* the
+        # Root sits at (0, 0, h) with no yaw, so the link's world x *is* the
         # body-frame fore-aft coordinate.
-        return np.array([bottom, float(poses[f"{side}_ankle"].translation[0])])
+        return np.array([bottom, float(poses[link].translation[0])])
 
     q = joints.copy()
     for _ in range(iterations):
@@ -734,6 +784,35 @@ def _move_foot(
             np.minimum(upper[indices], original[indices] + max_correction_rad),
         )
     return q
+
+
+def _move_foot(
+    plan: HumanRigPlan,
+    joints: np.ndarray,
+    side: str,
+    *,
+    target_bottom: float,
+    root_height: float,
+    root_tilt: np.ndarray,
+    max_correction_rad: float,
+    iterations: int,
+    target_fore_aft: float | None = None,
+) -> np.ndarray:
+    """Bounded weighted joint-space least-norm IK moving one foot's pose."""
+
+    return _move_capsule(
+        plan,
+        joints,
+        f"{side}_ankle",
+        {f"{side}_hip", f"{side}_knee", f"{side}_ankle"},
+        target_bottom=target_bottom,
+        root_height=root_height,
+        root_tilt=root_tilt,
+        max_correction_rad=max_correction_rad,
+        iterations=iterations,
+        target_fore_aft=target_fore_aft,
+        penalised=frozenset(sideways_leg_dofs(plan)),
+    )
 
 
 def load_gait(
@@ -870,7 +949,27 @@ def load_gait(
     if spec.get("contact_cycle"):
         from .contact_gait import ContactGaitConfig, bake_contact_cycle
 
-        gait = bake_contact_cycle(gait, plan, ContactGaitConfig(**spec["contact_cycle"]))
+        cycle_config = ContactGaitConfig(**spec["contact_cycle"])
+        if cycle_config.swing_shape == "amass":
+            from .contact_gait import extract_swing_shapes
+
+            # Extraction must see the raw pre-bake joints and derive the same
+            # cycle schedule bake_contact_cycle uses, hence the placement here.
+            object.__setattr__(
+                gait, "swing_shapes", extract_swing_shapes(clip, gait, plan, cycle_config)
+            )
+        source_height_m = None
+        source_height_scale = 1.0
+        if cycle_config.root_bob:
+            # Deviations from the reachable cap scale with the commanded/source
+            # stride ratio, the same proportionality the swing arcs follow.
+            source_travel = gait.speed_m_s * gait.duration_s
+            if not np.isfinite(source_travel) or source_travel < 1e-6:
+                raise ValueError("root bob needs a translating source clip")
+            source_height_m = plan.spawn_root_position[2] + clip.root_translation[:, 2]
+            source_height_scale = cycle_config.cycle_distance_m / source_travel
+        gait = bake_contact_cycle(gait, plan, cycle_config, source_height_m=source_height_m,
+                                  source_height_scale=source_height_scale)
     scale = spec.get("turn_playback_scale")
     if scale is not None:
         if not np.isfinite(scale) or not 0 < scale <= 2.0:

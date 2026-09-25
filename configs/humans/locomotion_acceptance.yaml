@@ -40,13 +40,20 @@ contact_planner:
   cycle_distance_m: 0.6
   stance_fraction: 0.62
   clearance_m: 0.03
+  swing_shape: quintic
+  root_bob: true
+# Mocap-derived pelvis feedforward; see keyboard.yaml 2026-09-25 对照专项.
+reference_feedforward_scale: 1.0
 max_stance_slip_m_s: 0.15
 actions:
   transition_s: 1.8
   stopped_speed_m_s: 0.025
-  fall_force_n: 350.0
+  # 60 N directional bias, not a shove: knees buckle under gravity instead
+  # of the 350 N pulse tipping a rigid plank (docs/progress.md 2026-09-25).
+  fall_force_n: 60.0
   fall_duration_s: 0.25
   fall_control_scale: 0.0
+  fall_damping_scale: 0.15
   fallen_height_fraction: 0.6
   fallen_tilt_deg: 50.0
 crouch:
@@ -59,6 +66,8 @@ gaits:
       cycle_distance_m: 0.6
       stance_fraction: 0.62
       clearance_m: 0.03
+      swing_shape: quintic
+      root_bob: true
     file: data/humans/amass_raw/CMU/08/08_04_poses.npz
     start_s: 1.9667
     duration_s: 1.3083
@@ -67,6 +76,8 @@ gaits:
       cycle_distance_m: 0.6
       stance_fraction: 0.62
       clearance_m: 0.03
+      swing_shape: quintic
+      root_bob: true
     file: data/humans/amass_raw/CMU/08/08_11_poses.npz
     start_s: 0.4
     duration_s: 1.4833

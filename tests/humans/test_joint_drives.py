@@ -191,6 +191,34 @@ def test_zero_scale_keeps_the_passive_damping() -> None:
     np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 50.0))
 
 
+def test_damping_scale_rescales_the_authored_damping_and_restores() -> None:
+    """The fall collapse keeps a bounded viscous term instead of the full one.
+
+    At the authored 60-150 Nm s/rad a drives-off body crumples at ~19 deg/s
+    under its own gravity torque -- a rigid-looking statue; at zero damping it
+    folds ballistically (2864 deg/s) and the floor impact NaNs the solver. The
+    action layer therefore falls with the damping rescaled to a fraction, and
+    the restore call rewrites the authored values.
+    """
+
+    runtime = _runtime(stiffness=250.0, damping=50.0)
+    assert HumanRuntime.set_control_scale(runtime, 0.0, damping_scale=0.15)
+    np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 7.5))
+    # Repeated calls are relative to the captured base, never the applied one.
+    for _ in range(10):
+        assert HumanRuntime.set_control_scale(runtime, 0.0, damping_scale=0.15)
+    np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 7.5))
+    assert HumanRuntime.set_control_scale(runtime, 1.0)
+    np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 50.0))
+
+
+def test_out_of_range_damping_scale_is_refused() -> None:
+    with pytest.raises(ValueError, match=r"within \(0, 1\]"):
+        HumanRuntime.set_control_scale(_runtime(), 0.0, damping_scale=0.0)
+    with pytest.raises(ValueError, match=r"within \(0, 1\]"):
+        HumanRuntime.set_control_scale(_runtime(), 0.0, damping_scale=1.5)
+
+
 @pytest.mark.parametrize("scale", [-0.1, 1.5])
 def test_out_of_range_scale_is_refused(scale: float) -> None:
     with pytest.raises(ValueError, match=r"within \[0, 1\]"):

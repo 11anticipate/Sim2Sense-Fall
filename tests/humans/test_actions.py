@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from sim2sense_fall.humans.actions import ActionConfig, ActionState, Posture
+from sim2sense_fall.humans.actions import ActionClip, ActionConfig, ActionState, Posture
 from sim2sense_fall.humans.teleop import KeyboardIntent, TeleopTarget
 
 
@@ -53,7 +53,7 @@ def test_crouch_waits_for_braking_then_can_reverse_without_pose_jump():
     state, target = fixture()
     state.request("crouch", time_s=0, heading_rad=0, measured_joints=target.joints)
     assert state.command((1, 0)) == (0, 0)
-    assert apply(state, target, speed=0.4).mode == "braking_for_crouch"
+    assert apply(state, target, speed=0.4).mode == "braking_for_action"
     assert state.blend == 0
     for _ in range(4):
         low = apply(state, target)
@@ -129,3 +129,116 @@ def test_invalid_action_settings_fail_before_physics():
         ActionConfig(float("nan"), 0.025, 350, 0.25, 0, 0.6, 50)
     with pytest.raises(ValueError):
         ActionConfig(1, 0.025, 350, 0.25, 2, 0.6, 50)
+    # The fall damping scale is bounded away from zero: zero damping is the
+    # measured solver-NaN regime (docs/progress.md 2026-09-25). NaN is caught
+    # by the generic finiteness check before the range check.
+    for bad_scale in (0.0, 0.01, 1.5):
+        with pytest.raises(ValueError, match="fall damping scale"):
+            ActionConfig(1, 0.025, 350, 0.25, 0, 0.6, 50, fall_damping_scale=bad_scale)
+    with pytest.raises(ValueError, match="must be finite"):
+        ActionConfig(1, 0.025, 350, 0.25, 0, 0.6, 50, fall_damping_scale=float("nan"))
+
+
+def test_new_action_keys_reach_the_state_machine():
+    intent = KeyboardIntent()
+    for key, name in {"B": "bend", "N": "sit", "G": "get_up", "C": "crouch", "V": "stand"}.items():
+        intent.event(key, True)
+        assert intent.action_requested == name
+        intent.action_requested = None
+        intent.event(key, False)
+
+
+def test_posture_switch_mid_transition_is_continuous():
+    state, target = fixture()
+    state.postures = {
+        "crouch": Posture(np.array([1.0, 0.5]), 0.5, np.zeros(3), {}),
+        "bend": Posture(np.array([0.2, 0.1]), 0.8, np.zeros(3), {}),
+    }
+    state.request("crouch", time_s=0, heading_rad=0, measured_joints=target.joints)
+    for _ in range(4):
+        crouching = apply(state, target)
+    state.request("bend", time_s=1, heading_rad=0, measured_joints=crouching.joints)
+    switched = apply(state, target)
+    # The new transition continues from the pose on the floor, not from standing.
+    assert np.linalg.norm(switched.joints - crouching.joints) < 0.2
+    assert switched.mode == "bending"
+    for _ in range(12):
+        settled = apply(state, target)
+    assert settled.mode == "bend"
+    assert np.allclose(settled.joints, [0.2, 0.1])
+
+
+def test_v_returns_from_any_posture_and_releases_movement():
+    state, target = fixture()
+    state.postures = {
+        "crouch": Posture(np.array([1.0, 0.5]), 0.5, np.zeros(3), {}),
+        "bend": Posture(np.array([0.2, 0.1]), 0.8, np.zeros(3), {}),
+    }
+    state.request("bend", time_s=0, heading_rad=0, measured_joints=target.joints)
+    for _ in range(12):
+        apply(state, target)
+    assert state.command((1, 0)) == (0, 0)
+    state.request("stand", time_s=2, heading_rad=0, measured_joints=target.joints)
+    for _ in range(12):
+        upright = apply(state, target)
+    assert upright.mode == "stand"
+    assert state.command((1, 0)) == (1, 0)
+
+
+def test_get_up_only_from_fallen_and_plays_out_to_standing():
+    clip = ActionClip(
+        joints=np.array([[0.0, 0.0], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0]]),
+        heights_m=np.array([0.2, 0.5, 0.95, 0.95]),
+        offsets_xy=np.array([[0.0, 0.0], [0.05, 0.0], [0.2, 0.0], [0.3, 0.0]]),
+        tilts=np.zeros((4, 3)),
+        frame_dt_s=0.1,
+        provenance={},
+    )
+    state, target = fixture()
+    state = ActionState(
+        ActionConfig(1, 0.025, 350, 0.25, 0, 0.6, 50),
+        {"crouch": Posture(np.array([1.0, 0.5]), 0.5, np.zeros(3), {})},
+        playback_clip=clip,
+    )
+    position = np.array([1.0, 2.0, 0.2])
+    # Without the fallen latch the request is a no-op, not an error.
+    assert state.request(
+        "get_up", time_s=0, heading_rad=0,
+        measured_joints=target.joints, measured_position=position,
+    ) is False
+    state.request("fall", time_s=1, heading_rad=0, measured_joints=target.joints)
+    state.observe(time_s=2, root_height_m=0.3, tilt_deg=80, standing_height_m=1, body_impact=True)
+    assert state.phase == "fallen"
+    assert state.request(
+        "get_up", time_s=3, heading_rad=0,
+        measured_joints=target.joints, measured_position=position,
+    ) is True
+    assert state.falling is False, "recovery must run with assistance restored"
+    assert state.command((1, 0)) == (0, 0)
+    assert state.suppresses_stance
+    # Replay runs ~0.3 s + 0.5 s blend; step past it, then the return blend runs.
+    seen_getting_up = False
+    for _ in range(20):
+        out = apply(state, target)
+        seen_getting_up |= out.mode == "getting_up"
+        if out.mode == "getting_up":
+            # The root follows the anchored clip path in world coordinates.
+            assert out.position[0] >= 1.0 - 1e-9 and out.position[2] <= 0.95 + 1e-9
+    assert seen_getting_up
+    assert state.phase == "idle"
+    for _ in range(12):
+        upright = apply(state, target)
+    assert upright.mode == "stand"
+    assert state.command((1, 0)) == (1, 0)
+    assert state.history[0]["fallen_time_s"] == 2, "fall record survives the recovery"
+
+
+def test_get_up_without_a_configured_clip_is_a_no_op():
+    state, target = fixture()
+    state.request("fall", time_s=1, heading_rad=0, measured_joints=target.joints)
+    state.observe(time_s=2, root_height_m=0.3, tilt_deg=80, standing_height_m=1, body_impact=True)
+    assert state.request(
+        "get_up", time_s=3, heading_rad=0,
+        measured_joints=target.joints, measured_position=np.zeros(3),
+    ) is False
+    assert state.phase == "fallen"

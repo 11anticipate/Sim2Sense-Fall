@@ -49,12 +49,21 @@ collision_fit:
   foot_shape: convex_hull
 # Contact planner replaces the old 5-degree reference correction. Feet remain
 # physical bodies: only joint targets are written; no fixed-foot constraint.
+# root_bob follows the clip's root height (reach-clamped); swing_shape stays
+# the analytic quintic -- the amass variant exceeded the joint drive budget
+# (docs/progress.md 2026-09-25 对照专项).
 stance:
   enabled: false
 contact_planner:
   cycle_distance_m: 0.6
   stance_fraction: 0.62
   clearance_m: 0.03
+  swing_shape: quintic
+  root_bob: true
+# Mocap-derived pelvis feedforward: the reference COM's own acceleration applied
+# as m*a before the assist caps. Steady walking needs ~zero horizontal assist
+# force, so the spring only trims tracking error instead of supplying propulsion.
+reference_feedforward_scale: 1.0
 # Standing pose height as a fraction of the rig's natural standing height.
 # 1.0 fits a 3 deg knee, an axially rigid column that bounces on its floor
 # contact and skids the feet (stand slip p95 0.797 m/s, artifacts/humans/
@@ -66,27 +75,61 @@ max_stance_slip_m_s: 0.15
 actions:
   transition_s: 1.8
   stopped_speed_m_s: 0.025
-  fall_force_n: 350.0
+  # Directional bias only, not a shove: at 350 N the backward pulse unloaded the
+  # knees and the collapse read as a rigid plank tipping about the ankles
+  # (measured joint activity ~1 deg/s median). A small bias keeps the fall
+  # direction consistent while gravity buckles the released knees.
+  fall_force_n: 60.0
   fall_duration_s: 0.25
   fall_control_scale: 0.0
+  # The collapse must look limp: full authored damping (60-150 Nm s/rad) makes
+  # the drives-off body crumple at ~19 deg/s. 0.15 keeps a viscous term that
+  # avoids the measured zero-damping solver NaN while folding visibly.
+  fall_damping_scale: 0.15
   fallen_height_fraction: 0.60
   fallen_tilt_deg: 50.0
 crouch:
   file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/crouchwalk_stand_poses.npz
   start_s: 3.25
   duration_s: 0.1
+# Bend over (key B). CMU/115 subject 1, deepest in-limit flexion frame
+# (trunk ~84 deg, feet planted). The contact projection grounds both feet;
+# hands stay in the air, so only the ankles are declared.
+bend:
+  file: data/humans/amass_raw/CMU/115/115_01_poses.npz
+  start_s: 2.3
+  duration_s: 0.05
+  contacts: [left_ankle, right_ankle]
+# Floor sit (key N). Transitions/mocap/mazen_c3d sit_stand @2.675 s: an
+# in-limit seated frame (upright trunk, legs forward, hands behind). Retargeted
+# contacts measure a ~48 mm plane spread, so the projection grounds pelvis
+# (anchor) and pulls feet and hands onto the floor; residuals land in
+# report.json::postures.sit.projection.
+sit:
+  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/sit_stand_poses.npz
+  start_s: 2.675
+  duration_s: 0.05
+  contacts: [left_ankle, right_ankle, pelvis, left_hand, right_hand]
+# Get up from the floor (key G, only accepted in the latched fallen state).
+# CMU/140 trial 1: 6.9 s lying -> standing, zero axis residual and zero joint
+# limit excess on the multiaxis rig, ~0.77 m horizontal root travel. Played as
+# assisted playback anchored at the measured fallen position/heading.
+get_up:
+  file: data/humans/amass_raw/CMU/140/140_01_poses.npz
 # AMASS supplies upper-body motion. Legs are contact-retargeted with a closed
 # 0.6 m cycle, overlapping support and zero world velocity at touchdown.
 # Full provenance, old attribution correction and Isaac results:
 # docs/slip-resolution-2026-09-25.md. This remains assisted physics.
 gaits:
   forward:
-    contact_cycle: {cycle_distance_m: 0.6, stance_fraction: 0.62, clearance_m: 0.03}
+    contact_cycle: {cycle_distance_m: 0.6, stance_fraction: 0.62, clearance_m: 0.03,
+                    swing_shape: quintic, root_bob: true}
     file: data/humans/amass_raw/CMU/08/08_04_poses.npz
     start_s: 1.9667
     duration_s: 1.3083
   backward:
-    contact_cycle: {cycle_distance_m: 0.6, stance_fraction: 0.62, clearance_m: 0.03}
+    contact_cycle: {cycle_distance_m: 0.6, stance_fraction: 0.62, clearance_m: 0.03,
+                    swing_shape: quintic, root_bob: true}
     file: data/humans/amass_raw/CMU/08/08_11_poses.npz
     start_s: 0.4
     duration_s: 1.4833

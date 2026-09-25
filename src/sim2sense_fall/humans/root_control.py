@@ -67,6 +67,7 @@ def root_wrench(
     target_angular_velocity: np.ndarray,
     mass_kg: float,
     gravity_m_s2: float,
+    feedforward_accel_m_s2: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return a norm-limited world-frame force and torque at the root COM.
 
@@ -83,6 +84,15 @@ def root_wrench(
     person on the same floor has 353 N. The cap makes the configuration mean what it says;
     the feedback term may still push the root *down* or sideways, and may still contribute
     lift, but not past the declared fraction.
+
+    ``feedforward_accel_m_s2`` is the reference motion's whole-body COM acceleration
+    (Newton-Euler on the reference kinematics), applied as ``m * a`` before the caps:
+    horizontally in full -- steady walking has ~zero COM acceleration, so this replaces
+    the spring as the *deliberate* source of propulsive force and the spring trims only
+    tracking error -- and vertically under the same ``gravity_compensation_fraction`` the
+    constant lift uses, so the actuator's declared weight-support fraction follows the
+    reference motion's own load profile instead of a flat average. The feedforward is
+    still external assistance, not balance: it is open-loop, and the springs remain.
     """
 
     for vector, size in ((position, 3), (quaternion, 4), (linear_velocity, 3),
@@ -96,6 +106,12 @@ def root_wrench(
     force = (config.position_stiffness_n_m * (target_position - position)
              + config.position_damping_ns_m * (target_linear_velocity - linear_velocity))
     force[2] += config.gravity_compensation_fraction * mass_kg * gravity_m_s2
+    if feedforward_accel_m_s2 is not None:
+        if (np.shape(feedforward_accel_m_s2) != (3,)
+                or not np.isfinite(feedforward_accel_m_s2).all()):
+            raise ValueError("feedforward acceleration must be a finite (3,) vector")
+        force[:2] += mass_kg * feedforward_accel_m_s2[:2]
+        force[2] += config.gravity_compensation_fraction * mass_kg * feedforward_accel_m_s2[2]
     lift_cap = config.max_vertical_lift_fraction_of_weight * mass_kg * gravity_m_s2
     force[2] = min(float(force[2]), float(lift_cap))
     rotation_error = matrix_to_axis_angle(

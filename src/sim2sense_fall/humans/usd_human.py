@@ -1698,7 +1698,7 @@ class HumanRuntime:
         self._check_length(velocities)
         self.articulation.set_dof_velocity_targets(self._to_runtime(self._row(velocities)))
 
-    def set_control_scale(self, scale: float) -> bool:
+    def set_control_scale(self, scale: float, damping_scale: float = 1.0) -> bool:
         """Scale the active control authority relative to the authored gains.
 
         The scale multiplies the drive **stiffness** (position feedback) only. The
@@ -1711,6 +1711,14 @@ class HumanRuntime:
         (``non-finite world position for link 'pelvis'``). Damping alone cannot
         track a position target, so the drives-off negative control stays valid,
         and it cannot hold a pose, so the gravity-drop positive control stays real.
+
+        ``damping_scale`` (fall collapse support) rescales that kept damping:
+        ``set_control_scale(0, 0.15)`` is a limp-but-viscous ragdoll -- the full
+        damping of 60-150 Nm s/rad makes the collapse a slow rigid crumple
+        (terminal knee speed ~19 deg/s under its own gravity torque), while zero
+        damping is the measured solver-NaN regime. Callers must restore with
+        ``set_control_scale(1.0)`` whose default damping_scale of 1 rewrites the
+        authored damping. The action config bounds the scale to [0.05, 1].
 
         Used by the ``control_failure`` perturbation and by the verification negative
         control. Returning ``False`` lets the caller mark the trial as not carrying the
@@ -1725,6 +1733,8 @@ class HumanRuntime:
 
         if not 0.0 <= scale <= 1.0:
             raise ValueError(f"control scale must be within [0, 1], got {scale!r}")
+        if not 0.0 < damping_scale <= 1.0:
+            raise ValueError(f"damping scale must be within (0, 1], got {damping_scale!r}")
         try:
             # This method is also exercised duck-typed against a bare namespace by
             # the CPU tests, so besides the articulation it may only rely on the
@@ -1758,12 +1768,15 @@ class HumanRuntime:
             base_stiffness, base_damping = self._base_gains
             self.articulation.set_dof_gains(
                 _gather_runtime_order(base_stiffness * float(scale), permutation),
-                # Passive damping is not scaled: see the docstring. It is rewritten
-                # unchanged so a partially-scaled state cannot linger after the
-                # reference gains were re-captured.
-                _gather_runtime_order(base_damping, permutation),
+                # Damping is always rewritten from the captured base times the
+                # requested scale -- never from the current gains, so repeated
+                # calls cannot compound. At the default scale 1 this restores the
+                # authored damping; at the fall scale it leaves a bounded viscous
+                # term (the zero-damping regime is the measured solver NaN).
+                _gather_runtime_order(base_damping * float(damping_scale), permutation),
             )
             self.control_scale = float(scale)
+            self._applied_damping_scale = float(damping_scale)
             return True
         except Exception as exc:  # noqa: BLE001 - reported, not hidden
             LOGGER.warning("could not scale joint drives: %s", exc)
