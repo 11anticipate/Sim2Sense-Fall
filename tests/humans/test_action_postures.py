@@ -19,7 +19,8 @@ import pytest
 from sim2sense_fall.humans.actions import load_action_clip, load_posture
 from sim2sense_fall.humans.contact_control import capsule_bottom, fit_collision_capsules
 from sim2sense_fall.humans.rig import fit_rest_skeleton, forward_kinematics, plan_human_rig
-from sim2sense_fall.humans.teleop import load_keyboard_config
+from sim2sense_fall.humans.rotations import matrix_to_axis_angle, quaternion_to_matrix
+from sim2sense_fall.humans.teleop import TeleopTarget, load_keyboard_config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 KEYBOARD_YAML = REPO_ROOT / "configs/humans/keyboard.yaml"
@@ -125,3 +126,76 @@ def test_get_up_clip_is_grounded_lie_to_stand(plan, settings, request):
         clip.provenance["derivation"]
         == "full_clip_retargeted_grounded_resampled_assisted_playback"
     )
+
+
+def test_posture_transition_height_is_contact_closure(plan, settings):
+    """The commanded root height must be derived from the blended configuration.
+
+    The crouch-hold failure was feet floating for 1.7 s: joints and height were
+    blended independently, so gravity-sagged legs lifted the feet off a root
+    the assist held at a kinematically unrelated height. With the rig available
+    the height IS the contact closure of the commanded pose -- the lowest
+    active contact rests exactly on the floor at every frame, the hold height
+    reproduces the projected posture height, and mid-hold retargets stay
+    continuous because the closure is a pure function of the commanded pose.
+    """
+
+    from sim2sense_fall.humans.actions import ActionConfig, ActionState
+
+    state = ActionState(
+        ActionConfig(1, 0.025, 350, 0.25, 0, 0.6, 50),
+        {"crouch": load_posture(settings["crouch"], plan),
+         "sit": load_posture(settings["sit"], plan)},
+        plan=plan,
+    )
+    joints0 = np.zeros(len(plan.joints))
+    target = TeleopTarget(
+        joints0.copy(), np.zeros_like(joints0), np.array([0.0, 0.0, plan.ground_offset_m]),
+        np.array([1.0, 0.0, 0.0, 0.0]), np.zeros(3), np.zeros(3), "stand",
+    )
+
+    def bottoms_at(applied, links):
+        tilt = matrix_to_axis_angle(quaternion_to_matrix(applied.quaternion))
+        poses = forward_kinematics(
+            plan, dict(zip(plan.dof_names, applied.joints, strict=True)),
+            root_position=(0.0, 0.0, applied.position[2]), root_rotation=tilt,
+        )
+        return {name: capsule_bottom(plan, poses, name) for name in links}
+
+    def step():
+        return state.apply(
+            target, dt_s=0.1, speed_m_s=0.0, idle_joints=joints0, idle_height_m=1.0,
+            idle_tilt=np.zeros(3), heading_rad=0,
+        )
+
+    state.request("crouch", time_s=0, heading_rad=0, measured_joints=joints0)
+    last = None
+    for _ in range(15):
+        last = step()
+    assert state.mode == "crouch"
+    crouch = load_posture(settings["crouch"], plan)
+    # Hold height reproduces the projected posture height (feet grounded).
+    assert last.position[2] == pytest.approx(crouch.height_m, abs=1e-9)
+    # The commanded geometry rests its lowest active contact exactly on the
+    # floor -- that is what closure means.
+    assert min(bottoms_at(last, state.active_contacts).values()) == pytest.approx(0.0, abs=1e-9)
+
+    hold = (last.joints.copy(), float(last.position[2]))
+    state.request("stand", time_s=2, heading_rad=0, measured_joints=last.joints)
+    first = step()
+    # Retarget continuity: the closure is a pure function of the pose, so the
+    # first retargeted frame continues from the held height without a jump.
+    assert first.position[2] == pytest.approx(hold[1], abs=0.02)
+    assert np.linalg.norm(first.joints - hold[0]) < 0.2
+
+    # Sit transition: the pelvis joins the contact set, so the descent ends
+    # with the sit posture's own projected height, pelvis as the lowest support.
+    state.request("sit", time_s=3, heading_rad=0, measured_joints=last.joints)
+    sat = None
+    for _ in range(25):
+        sat = step()
+    assert state.mode == "sit"
+    sit = load_posture(settings["sit"], plan)
+    assert sat.position[2] == pytest.approx(sit.height_m, abs=1e-9)
+    assert min(bottoms_at(sat, state.active_contacts).values()) == pytest.approx(0.0, abs=1e-9)
+    assert "pelvis" in state.active_contacts

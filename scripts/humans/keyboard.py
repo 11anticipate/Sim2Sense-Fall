@@ -142,7 +142,7 @@ def prepare(path: Path) -> tuple[dict[str, Any], Any, Any, Any, TeleopController
             else None
         )
         settings["action_state"] = ActionState(
-            ActionConfig(**settings["actions"]), postures, playback_clip
+            ActionConfig(**settings["actions"]), postures, playback_clip, plan=plan
         )
         settings["posture_provenance"] = {name: p.provenance for name, p in postures.items()}
         settings["get_up_provenance"] = None if playback_clip is None else playback_clip.provenance

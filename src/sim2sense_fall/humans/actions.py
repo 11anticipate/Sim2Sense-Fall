@@ -94,6 +94,10 @@ class Posture:
     height_m: float
     tilt: np.ndarray
     provenance: dict[str, Any]
+    # Links whose capsule bottoms define the grounded reference height. The
+    # default grounds the feet (the historical crouch rule); declared-contact
+    # postures (sit) include their anchor and support limbs.
+    contacts: tuple[str, ...] = ("left_ankle", "right_ankle")
 
 
 def _smoothstep(x: float) -> float:
@@ -237,11 +241,13 @@ def load_posture(spec: dict[str, Any], plan: HumanRigPlan) -> Posture:
         height = -min(capsule_bottom(plan, poses, f"{s}_ankle") for s in ("left", "right"))
         derivation = "first_pose_of_authorized_crop_stationary_target_with_smooth_transition"
         projection: dict[str, Any] | None = None
+        contact_links: tuple[str, ...] = ("left_ankle", "right_ankle")
     else:
         q, height, projection = _project_posture_contacts(plan, q, tilt, list(contacts))
         if np.any(q < lower) or np.any(q > upper):
             raise ValueError("contact projection drove the posture outside rig limits")
         derivation = "first_pose_of_authorized_crop_projected_onto_declared_floor_contacts"
+        contact_links = tuple(contacts)
     return Posture(
         q,
         height,
@@ -256,6 +262,7 @@ def load_posture(spec: dict[str, Any], plan: HumanRigPlan) -> Posture:
             "height_m": height,
             **({"contacts": list(contacts), "projection": projection} if contacts else {}),
         },
+        contact_links,
     )
 
 
@@ -343,9 +350,12 @@ class ActionState:
 
     Posture actions (crouch/bend/sit) blend from a captured snapshot of the
     current pose to the target posture, so switching actions mid-transition is
-    continuous by construction. ``get_up`` replays a grounded AMASS
-    lying-to-standing clip anchored at the measured fallen position; it is only
-    accepted from the latched fallen state and restores assistance on entry.
+    continuous by construction. With the rig available, the root height along
+    the blend is derived by contact closure from the blended configuration
+    itself, so the commanded geometry always has its support contacts exactly
+    on the floor. ``get_up`` replays a grounded AMASS lying-to-standing clip
+    anchored at the measured fallen position; it is only accepted from the
+    latched fallen state and restores assistance on entry.
     """
 
     def __init__(
@@ -353,6 +363,7 @@ class ActionState:
         config: ActionConfig,
         postures: dict[str, Posture] | Posture,
         playback_clip: ActionClip | None = None,
+        plan: HumanRigPlan | None = None,
     ) -> None:
         if isinstance(postures, Posture):
             postures = {"crouch": postures}
@@ -360,6 +371,16 @@ class ActionState:
         if unknown:
             raise ValueError(f"unknown posture actions {sorted(unknown)}")
         self.config, self.postures, self.playback_clip = config, postures, playback_clip
+        # With the rig, posture transition/hold heights are derived from the
+        # blended configuration by contact closure instead of blended linearly;
+        # without it (state-machine fixtures) the historical linear blend runs.
+        self.plan = plan
+        self.active_contacts: tuple[str, ...] = ("left_ankle", "right_ankle")
+        # Horizontal support compensation: the root xy shifts so the FEET stay
+        # planted while the blended configuration moves them in body frame.
+        self.source_root_xy: np.ndarray | None = None
+        self.source_foot_offsets: np.ndarray | None = None
+        self.last_root_xy: np.ndarray | None = None
         self.history: list[dict[str, Any]] = []
         self.reset()
 
@@ -371,6 +392,10 @@ class ActionState:
         self.source: tuple[np.ndarray, float, np.ndarray] | None = None
         self.last_pose: tuple[np.ndarray, float, np.ndarray] | None = None
         self.playback: dict[str, Any] | None = None
+        self.active_contacts: tuple[str, ...] = ("left_ankle", "right_ankle")
+        self.source_root_xy: np.ndarray | None = None
+        self.source_foot_offsets: np.ndarray | None = None
+        self.last_root_xy: np.ndarray | None = None
         self.fall_time_s: float | None = None
         self.fall_heading_rad = 0.0
         self.fall_pose: np.ndarray | None = None
@@ -386,6 +411,38 @@ class ActionState:
     def suppresses_stance(self) -> bool:
         """Locomotion foot corrections must not run during fall or recovery."""
         return self.phase != "idle"
+
+    def _begin_blend(self, target_name: str | None) -> None:
+        """Register the contact set for a starting blend.
+
+        The closure height grounds the lowest active contact, so the set must
+        cover everything the body may rest on now (previous hold) plus
+        everything the target rests on -- during a sit descent the pelvis takes
+        over as it becomes the lowest support, during the rise the feet do.
+        """
+
+        target_contacts = (
+            self.postures[target_name].contacts
+            if target_name is not None
+            else ("left_ankle", "right_ankle")
+        )
+        self.active_contacts = tuple(sorted(set(self.active_contacts) | set(target_contacts)))
+
+    def _capture_support_anchor(
+        self, q: np.ndarray, tilt: np.ndarray, root_xy: np.ndarray
+    ) -> None:
+        """Record where the feet stand (body-frame offsets + root xy) at blend start."""
+
+        poses0 = forward_kinematics(
+            self.plan,
+            dict(zip(self.plan.dof_names, q, strict=True)),
+            root_rotation=tilt,
+        )
+        self.source_foot_offsets = np.array([
+            poses0[name].translation[:2]
+            for name in self.active_contacts if name.endswith("_ankle")
+        ])
+        self.source_root_xy = np.asarray(root_xy, dtype=np.float64)[:2].copy()
 
     def request(
         self,
@@ -415,6 +472,7 @@ class ActionState:
             self.blend = 0.0
             self.source = None
             self.playback = None
+            self.active_contacts = ("left_ankle", "right_ankle")
             self.active_event = {
                 "requested_time_s": time_s,
                 "heading_rad": heading_rad,
@@ -433,7 +491,12 @@ class ActionState:
                 self.last_pose[2].copy(),
             )
             self.blend = 0.0
+            if self.plan is not None and self.last_root_xy is not None:
+                self._capture_support_anchor(
+                    self.last_pose[0], self.last_pose[2], self.last_root_xy
+                )
         self.requested = None if name == "stand" else name
+        self._begin_blend(self.requested)
         return True
 
     def _request_get_up(
@@ -466,6 +529,7 @@ class ActionState:
         self.requested = None
         self.blend = 0.0
         self.source = None
+        self.active_contacts = ("left_ankle", "right_ankle")
         return True
 
     def command(self, movement: tuple[float, float]) -> tuple[float, float]:
@@ -510,6 +574,9 @@ class ActionState:
             return replace(target, mode=self.mode)
         if self.source is None:
             self.source = (idle_joints.copy(), idle_height_m, idle_tilt.copy())
+            self._begin_blend(self.requested)
+            if self.plan is not None:
+                self._capture_support_anchor(self.source[0], self.source[2], target.position)
         self.blend = min(1.0, self.blend + dt_s / self.config.transition_s)
         if self.requested is None and self.blend >= 1.0:
             # The return blend reached the standing reference: hand control back
@@ -517,6 +584,7 @@ class ActionState:
             # pre-refactor completion at blend == 0).
             self.source = None
             self.blend = 0.0
+            self.active_contacts = ("left_ankle", "right_ankle")
             self.mode = "locomotion"
             return target
         weight = _smoothstep(self.blend)
@@ -529,12 +597,44 @@ class ActionState:
             dst_q, dst_h, dst_t = posture.joints, posture.height_m, posture.tilt
             self.mode = self.requested if self.blend >= 1.0 else _POSTURE_ING_MODES[self.requested]
         q = (1 - weight) * self.source[0] + weight * dst_q
-        height = (1 - weight) * self.source[1] + weight * dst_h
         tilt = (1 - weight) * self.source[2] + weight * dst_t
+        position = target.position.copy()
+        if self.plan is None:
+            # Rig-less state-machine fixtures: historical linear height blend.
+            height = (1 - weight) * self.source[1] + weight * dst_h
+        else:
+            # Contact-consistent height, derived from the blended configuration
+            # itself: ground the lowest active contact. The joints/height pair
+            # can no longer disagree about the floor -- feet neither float
+            # through a hold (the crouch-hold 1.7 s no-support failure) nor
+            # sink through a transition, and mid-transition retargets stay
+            # continuous because the closure is a pure function of the
+            # commanded pose (the previous height WAS its closure).
+            poses = forward_kinematics(
+                self.plan,
+                dict(zip(self.plan.dof_names, q, strict=True)),
+                root_rotation=tilt,
+            )
+            height = -min(
+                capsule_bottom(self.plan, poses, name) for name in self.active_contacts
+            )
+            # Horizontal support compensation: the blend moves the feet in body
+            # frame (the posture's feet are not where the previous stance's
+            # were), which dragged them across the floor at ~0.5 m/s. Shift the
+            # root target by the mean foot offset difference so the feet stay
+            # planted; the residual is the feet's relative drift only.
+            feet = [name for name in self.active_contacts if name.endswith("_ankle")]
+            current_offsets = np.array([poses[name].translation[:2] for name in feet])
+            shift_body = self.source_foot_offsets.mean(axis=0) - current_offsets.mean(axis=0)
+            cosine, sine = np.cos(heading_rad), np.sin(heading_rad)
+            position[:2] = self.source_root_xy + np.array([
+                cosine * shift_body[0] - sine * shift_body[1],
+                sine * shift_body[0] + cosine * shift_body[1],
+            ])
         self.last_pose = (q.copy(), float(height), tilt.copy())
         rotation = rotation_about_axis("z", heading_rad) @ axis_angle_to_matrix(tilt)
-        position = target.position.copy()
         position[2] = height
+        self.last_root_xy = position[:2].copy()
         return replace(
             target,
             joints=q,
@@ -572,6 +672,10 @@ class ActionState:
             self.playback = None
             self.phase = "idle"
             self.mode = "standing_up"
+            if self.plan is not None:
+                self._capture_support_anchor(
+                    self.last_pose[0], self.last_pose[2], target.position
+                )
         else:
             self.mode = "getting_up"
         rotation = rotation_about_axis("z", state["heading_rad"]) @ axis_angle_to_matrix(tilt)
