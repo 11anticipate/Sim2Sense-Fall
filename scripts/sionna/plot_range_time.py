@@ -86,7 +86,7 @@ def plot_sample(sample, config: RangeTimeConfig, out_path: Path, with_doppler: b
                 extent=[0.0, sample_rate, delay_ns[0], delay_ns[-1]],
                 vmin=0.0, vmax=1.0,
             )
-            axis.set_title("doppler magnitude (per tap, full-window FFT)")
+            axis.set_title("doppler-range map (per tap, full-window FFT)")
             axis.set_xlabel("frequency (Hz)")
             axis.set_ylabel("delay (ns)")
             note = "range-time+doppler"

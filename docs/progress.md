@@ -70,6 +70,58 @@
 - 未做（下一步）：速度头标签接入（需 50 Hz mesh 派生标签，随批量包）、
   方向性模板消融、以及 B 线（蹲/起整改解锁批量产数）。
 
+## 2026-09-26 检测训练侧准备（A 线：表示 / DTW 基线 / 训练骨架）
+
+- **距离-时间图表示** `src/sim2sense_fall/range_time.py`：逐抽头 dB 功率图，以
+  无人基线（或会话中位数）为参考，对称钳位 ±40 dB 后归一到 [0,1]；另提供
+  `doppler_map`（整窗 FFT 谱，要求均匀时间轴，否则明确报错）。9 样本 PNG 在
+  `artifacts/stage8_smoke/sionna/detection/range_time/`（fall 样本叠加 onset/impact），
+  图上可见站立段贴基线、失衡后全抽头抬升。
+- **DTW 模板基线** `src/sim2sense_fall/dtw_baseline.py`：通道变化速度特征
+  （功率/时延扩展变化率，鲁棒标准化）→ DBA 模板 → Sakoe-Chiba 带约束 DTW。
+  打分以模板自身**零变化距离**（mean|template|）标定：平坦流=0 分、完全匹配=1 分，
+  不需要手设距离尺度。脚本 `scripts/sionna/evaluate_dtw.py`（LOO 评测）。
+- **实测（9 样本，如实）**：LOO 下 fall 0/3 检出、ADL 0 误报。分数**排序正确**
+  （fall 峰值 0.086–0.109 vs 全部 ADL 0.000）但远低于 0.8 报警门——三个推力方向
+  的信道变化形态不同（push_left 主变化甚至反号），2 条样本的 DBA 平均无法代表
+  第 3 条；且 fall 样本仅 11 帧（0.917 s），匹配窗只有 2 个。这是"9 样本不能
+  排名检测器"的又一实证，不调参凑数；方向性模板/更多摔倒样本留给批量阶段。
+- **训练骨架** `src/sim2sense_fall/detection_train.py`（torch 惰性导入，仅
+  Sionna venv 可用）+ `scripts/sionna/train_baseline.py`：窗切分（0.8 s/0.1 s）、
+  标注规则（fall 样本 onset 前的窗**排除**而非标 ADL；无 onset 的 fall 全排除）、
+  小 conv+GRU 三头网络（<10k 参数：fall 二分类 / 活动多分类 / 质心速度回归——
+  当前批次无速度标签，速度头权重为 0，仅占位）、pos_weight 类不平衡处理、
+  显式 seed。CUDA smoke 实跑通过：train/eval 18/7 窗（train 含 4 个 fall 窗）、
+  loss 1.35、eval 窗准确率 1.0——**仅流程验证，不构成性能结论**。
+- 数据加载统一到 `src/sim2sense_fall/detection_data.py`（标签来自 import 载荷与
+  引用试验，绝不来自文件名；失败样本默认拒收）。
+- 验证：compileall 干净；系统 pytest 437 passed / 11 skipped（新增 17 条），
+  Sionna venv 下 torch 测试 22 条实跑全过；ruff 全过。
+- **本地仪表盘（A 线收官）**：`scripts/sionna/build_dashboard.py` →
+  `artifacts/stage8_smoke/sionna/detection/dashboard.html`（1.9 MB 自包含
+  HTML，双击即开）：批量汇总卡片（两份检测报告的检出率/延迟/误报）、
+  9 样本索引表（两类检测器判定与分数）、逐样本四联图（CIR 瀑布 /
+  距离-时间图 / 特征时间线+onset/impact 标记 / 双检测器分数曲线+阈值），
+  base64 内嵌、零 JS、系统 Python 仅需 numpy+matplotlib。测试 3 条
+  （判定契约、HTML 内嵌与诚实脚注、报告读取），全套 440 passed/11 skipped。
+- **多普勒-距离谱（DRM）与采样率预算（预登记）**：`doppler_range_map`
+  （零多普勒 bin 保留/剔除选项 + 频率轴，`radial_velocity_axis` 按几何
+  因子显式换算）与 `doppler.py`（双站公式 f_D=(v·(û_t+û_r))·f_c/c，
+  几何因子 |û_t+û_r|）；`scripts/sionna/doppler_budget.py` 用 mesh 真值
+  （逐帧 6890 顶点中心差分）实算预算，产物
+  `artifacts/stage8_smoke/detection/doppler_budget.json`。
+  **判定（预登记，先于任何批量决定）**：摔倒肢体峰值速度 4.5–5.0 m/s
+  （快于根部的 2.24——最快肢体定义混叠）→ 峰值 |f_D| 85–98 Hz →
+  **奈奎斯特 171–197 Hz：计划中的 50 Hz 严重不足**（差 ~4 倍），
+  120 Hz 也不满足无混叠条件；走路 Nyquist 41–61 Hz（50 Hz 勉强、
+  100 Hz 足够）；站立无压力。落地口径：训练包慢时间采样取 **120 Hz
+  固定前端**（与原生物理帧率一致，混叠为确定性映射、训练/部署同率
+  可学），或摔倒段 ≥200 Hz 无混叠分析；**训练与评测不得混采样率**。
+  单元测试 6 条（单站极限=2v/λ 精确解、双站几何因子、逐帧峰值追踪
+  最快点、预算判定、校验拒绝），全套 445 passed/11 skipped。
+- 未做（下一步）：速度头标签接入（需 mesh 派生标签，随批量包）、
+  方向性模板消融、以及 B 线（蹲/起整改解锁批量产数）。
+
 ## 2026-09-25 检测基线最小闭环（CIR → 特征 → 报警 → 指标）
 
 - 新增 `src/sim2sense_fall/detection.py`：逐帧信道特征（功率/平均时延/RMS 时延

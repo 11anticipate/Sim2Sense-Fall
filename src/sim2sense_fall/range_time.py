@@ -122,21 +122,27 @@ def range_time_map(
     )
 
 
-def doppler_map(
+def doppler_range_map(
     cir: np.ndarray,
     time_s: np.ndarray,
     baseline_cir: np.ndarray | None = None,
     config: RangeTimeConfig | None = None,
-) -> np.ndarray:
-    """Per-tap Doppler spectrum magnitude, bounded to ``[0, 1]``.
+    zero_doppler: str = "keep",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Doppler-range map: per-tap Doppler spectrum magnitude in ``[0, 1]``.
 
     Static paths are removed by subtracting the no-human baseline when
-    available, otherwise the time mean; an FFT along the time axis then
-    produces the spectrum per tap. Requires a *uniform* time grid — sparse
-    RT sub-sampling that violates this raises instead of silently smearing
-    the spectrum.
+    available, otherwise the time mean; an FFT along the (uniform) time axis
+    then produces the spectrum per tap — the delay axis doubles as the range
+    axis. ``zero_doppler="remove"`` blanks the DC bin, which after static
+    removal only says how much the static part itself changed and otherwise
+    dominates the dynamic range. Returns (map, doppler frequencies in Hz);
+    requires a *uniform* time grid — sparse RT sub-sampling that violates
+    this raises instead of silently smearing the spectrum.
     """
 
+    if zero_doppler not in ("keep", "remove"):
+        raise ValueError("zero_doppler must be 'keep' or 'remove'")
     cfg = config or RangeTimeConfig()
     values = _validate_cir(cir)
     time = np.asarray(time_s, dtype=np.float64)
@@ -155,4 +161,43 @@ def doppler_map(
     spectrum = np.fft.fft(signal, axis=0)
     magnitude_db = _power_db(spectrum.T)  # (taps, doppler bins)
     magnitude_db = magnitude_db - magnitude_db.max() + cfg.clip_db
-    return np.clip(magnitude_db / cfg.clip_db, 0.0, 1.0).astype(np.float32)
+    magnitude = np.clip(magnitude_db / cfg.clip_db, 0.0, 1.0).astype(np.float32)
+    if zero_doppler == "remove":
+        magnitude[:, 0] = 0.0
+    frequencies = np.fft.fftfreq(time.shape[0], d=median_dt)
+    return magnitude, frequencies
+
+
+def doppler_map(
+    cir: np.ndarray,
+    time_s: np.ndarray,
+    baseline_cir: np.ndarray | None = None,
+    config: RangeTimeConfig | None = None,
+) -> np.ndarray:
+    """Magnitude-only view of :func:`doppler_range_map` (kept for callers
+    that do not need the frequency axis)."""
+
+    magnitude, _ = doppler_range_map(cir, time_s, baseline_cir, config)
+    return magnitude
+
+
+def radial_velocity_axis(
+    frequencies_hz: np.ndarray, carrier_hz: float, geometry_factor: float = 2.0
+) -> np.ndarray:
+    """Convert a Doppler frequency axis to radial velocity in m/s.
+
+    ``geometry_factor`` is ``|û_tx + û_rx|`` of the link: 2.0 for monostatic
+    (v = f_D·λ/2), smaller for bistatic links where only the velocity
+    component along the bisector is observed. Keeping the axis in Hz and
+    converting only at display time stays honest about that geometry.
+    """
+
+    freqs = np.asarray(frequencies_hz, dtype=np.float64)
+    if not np.isfinite(freqs).all():
+        raise ValueError("frequencies must be finite")
+    if not np.isfinite(carrier_hz) or carrier_hz <= 0:
+        raise ValueError("carrier_hz must be a positive frequency")
+    if not np.isfinite(geometry_factor) or not 0 < geometry_factor <= 2.0:
+        raise ValueError("geometry_factor must lie in (0, 2]")
+    wavelength_m = 299792458.0 / carrier_hz
+    return freqs * wavelength_m / geometry_factor
