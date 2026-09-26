@@ -25,6 +25,8 @@ from .rotations import (
     axis_angle_to_matrix,
     axis_angle_to_quaternion,
     matrix_to_axis_angle,
+    quaternion_slerp,
+    quaternion_to_matrix,
     rotation_about_axis,
 )
 from .teleop import TeleopTarget, _move_capsule
@@ -533,6 +535,24 @@ class ActionState:
         if not np.isfinite(measured_position).all():
             raise ValueError("get_up requires a finite measured root position")
         tilt = np.zeros(3) if self.last_pose is None else self.last_pose[2]
+        # 锚定朝向 = 前向轴对齐: 侧躺身体的四元数 yaw 与"面朝"差 ~90°,
+        # 用 yaw 锚定会让片段的推地动作落在身体的侧面 = 推空气。对齐
+        # 实测前向轴与片段首帧前向轴的水平角, 推地方向才与地板一致。
+        measured_forward = axis_angle_to_matrix(
+            matrix_to_axis_angle(
+                quaternion_to_matrix(np.asarray(measured_quaternion))
+            )
+        ) if measured_quaternion is not None else None
+        clip_forward = axis_angle_to_matrix(self.playback_clip.tilts[0]) @ np.array([0.0, 0.0, 1.0])
+        if measured_forward is not None:
+            body_forward = measured_forward @ np.array([0.0, 0.0, 1.0])
+            horizontal_body = float(np.hypot(body_forward[0], body_forward[1]))
+            horizontal_clip = float(np.hypot(clip_forward[0], clip_forward[1]))
+            if horizontal_body > 0.2 and horizontal_clip > 0.2:
+                heading_rad = float(
+                    np.arctan2(body_forward[1], body_forward[0])
+                    - np.arctan2(clip_forward[1], clip_forward[0])
+                )
         self.playback = {
             "requested_time_s": float(time_s),
             "anchor_xy": np.asarray(measured_position, dtype=np.float64)[:2].copy(),
@@ -541,7 +561,13 @@ class ActionState:
             "source_joints": measured_joints.copy(),
             "source_height_m": float(measured_position[2]),
             "source_tilt": np.asarray(tilt, dtype=np.float64).copy(),
-            # 实测躺姿世界朝向: 混入段从它测地过渡到回放朝向
+            # 实测躺姿四元数: 混入段从身体实际姿态测地过渡到回放轨迹
+            "source_quaternion": (
+                np.asarray(measured_quaternion, dtype=np.float64)
+                / np.linalg.norm(measured_quaternion)
+                if measured_quaternion is not None
+                else axis_angle_to_quaternion(np.asarray(tilt, dtype=np.float64))
+            ),
         }
         self.phase = "getting_up"
         self.mode = "getting_up"
@@ -672,10 +698,18 @@ class ActionState:
         blend = _smoothstep(elapsed / _CLIP_BLEND_S)
         q = (1 - blend) * state["source_joints"] + blend * clip.joints[index]
         height = (1 - blend) * state["source_height_m"] + blend * clip.heights_m[index]
-        # 起身时人自然转身(片段自带 ~80° yaw): 目标朝向跟随片段, 交回控制时
-        # keyboard 采纳身体实际朝向——不在朝向上与关节回放对抗(实测对抗会
-        # 摆出 350° 级的自旋)。
-        tilt = (1 - blend) * state["source_tilt"] + blend * clip.tilts[index]
+        # 朝向 = 从实测躺姿测地过渡到 "锚定 yaw ⊕ 片段倾角"(片段前向已对齐
+        # 实测前向, 端点一致故测地线无自旋); 关节/高度仍线性混合。
+        # 注: 不用 axis-angle 线性混合倾角——大倾角混合会扫出几十度等效 yaw。
+        anchor_rotation = rotation_about_axis("z", state["heading_rad"]) @ axis_angle_to_matrix(
+            _without_yaw(clip.tilts[index])
+        )
+        target_quaternion = axis_angle_to_quaternion(matrix_to_axis_angle(anchor_rotation))
+        blend_in = _smoothstep(min(1.0, elapsed / _CLIP_BLEND_S))
+        world_quaternion = quaternion_slerp(
+            state["source_quaternion"], target_quaternion, blend_in
+        )
+        tilt = matrix_to_axis_angle(quaternion_to_matrix(world_quaternion))
         offset = clip.offsets_xy[index]
         c, s = math.cos(state["heading_rad"]), math.sin(state["heading_rad"])
         anchor = state["anchor_xy"]
@@ -685,8 +719,9 @@ class ActionState:
              height]
         )
         # 交回时把回放朝向拆成 "heading ⊕ 无 yaw tilt": tilt 里的 yaw 已并入
-        # 锚定 heading, 否则 standing blend 的 heading ⊕ tilt 会把这段 yaw
-        # 再计一次, 身体被拧一整圈去追重复计数的朝向。
+        # 锚定 heading(由 keyboard 的交回同步采纳), 否则 standing blend 的
+        # heading ⊕ tilt 会把这段 yaw 再计一次, 身体被拧一整圈去追重复计数
+        # 的朝向。
         tilt_clean = _without_yaw(tilt)
         self.last_pose = (q.copy(), float(height), tilt_clean.copy())
         if index >= len(clip.joints) - 1 and elapsed >= clip.duration_s + _CLIP_BLEND_S:
@@ -704,12 +739,11 @@ class ActionState:
                 )
         else:
             self.mode = "getting_up"
-        rotation = rotation_about_axis("z", state["heading_rad"]) @ axis_angle_to_matrix(tilt)
         return replace(
             target,
             joints=q,
             position=position,
-            quaternion=axis_angle_to_quaternion(matrix_to_axis_angle(rotation)),
+            quaternion=world_quaternion,
             mode=self.mode,
         )
 

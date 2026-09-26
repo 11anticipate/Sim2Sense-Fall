@@ -144,6 +144,34 @@ def axis_angle_to_quaternion(vector: object) -> np.ndarray:
     return np.array([math.cos(half), *(math.sin(half) * axis)])
 
 
+def quaternion_slerp(
+    first: np.ndarray, second: np.ndarray, fraction: float, *, tolerance: float = 1e-9
+) -> np.ndarray:
+    """Geodesic interpolation between two (w, x, y, z) unit quaternions."""
+
+    first_q = np.asarray(first, dtype=np.float64)
+    second_q = np.asarray(second, dtype=np.float64)
+    for quaternion in (first_q, second_q):
+        if quaternion.shape != (4,) or not np.isfinite(quaternion).all():
+            raise ValueError("quaternion slerp needs finite (w, x, y, z) quaternions")
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("slerp fraction must lie in [0, 1]")
+    first_q = first_q / np.linalg.norm(first_q)
+    second_q = second_q / np.linalg.norm(second_q)
+    dot = float(np.dot(first_q, second_q))
+    if dot < 0.0:
+        second_q, dot = -second_q, -dot
+    if dot > 1.0 - tolerance:  # 近重合: nlerp 足够
+        blended = first_q + fraction * (second_q - first_q)
+        return blended / np.linalg.norm(blended)
+    theta = np.arccos(np.clip(dot, -1.0, 1.0))
+    sin_theta = np.sin(theta)
+    return (
+        np.sin((1.0 - fraction) * theta) / sin_theta * first_q
+        + np.sin(fraction * theta) / sin_theta * second_q
+    )
+
+
 def quaternion_to_matrix(quaternion: object) -> np.ndarray:
     """Convert a ``(w, x, y, z)`` quaternion into a rotation matrix."""
 
