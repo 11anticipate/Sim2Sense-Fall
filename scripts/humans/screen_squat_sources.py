@@ -30,6 +30,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "humans"))
 
 from common import DEFAULT_MOTIONS, REPO_ROOT, load_inputs  # noqa: E402
+
 from sim2sense_fall.humans.amass import (  # noqa: E402
     load_amass_clip_by_id,
     normalize_root_motion,
@@ -47,9 +48,10 @@ from sim2sense_fall.humans.teleop import load_keyboard_config  # noqa: E402
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--inventory", type=Path,
-                        default=REPO_ROOT / "artifacts/humans/fall_mesh/amass_rescreen_20260925.json",
-                        help="clip inventory JSON from the fall rescreen")
+    parser.add_argument(
+        "--inventory", type=Path,
+        default=REPO_ROOT / "artifacts/humans/fall_mesh/amass_rescreen_20260925.json",
+        help="clip inventory JSON from the fall rescreen")
     parser.add_argument("--sample-hz", type=float, default=10.0)
     parser.add_argument("--limit", type=int, default=None,
                         help="screen only the first N clips (debug)")
@@ -101,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if np.any(values < lower) or np.any(values > upper):
                 continue
-            poses = forward_kinematics(plan, dict(zip(dof_names, values)),
+            poses = forward_kinematics(plan, dict(zip(dof_names, values, strict=False)),
                                        root_position=(0.0, 0.0, 0.0),
                                        root_rotation=np.zeros(3))
             links = {name: np.asarray(t.translation) for name, t in poses.items()}

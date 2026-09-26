@@ -26,6 +26,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "humans"))
 
 from common import DEFAULT_MOTIONS, REPO_ROOT, load_inputs  # noqa: E402
+
 from sim2sense_fall.humans.amass import load_amass_clip_by_id, normalize_root_motion  # noqa: E402
 from sim2sense_fall.humans.assets import select_body  # noqa: E402
 from sim2sense_fall.humans.mesh_sequence import fit_mesh_to_rest_joints  # noqa: E402
@@ -40,8 +41,9 @@ from sim2sense_fall.humans.teleop import load_keyboard_config  # noqa: E402
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--inventory", type=Path,
-                        default=REPO_ROOT / "artifacts/humans/fall_mesh/amass_rescreen_20260925.json")
+    parser.add_argument(
+        "--inventory", type=Path,
+        default=REPO_ROOT / "artifacts/humans/fall_mesh/amass_rescreen_20260925.json")
     parser.add_argument("--sample-hz", type=float, default=10.0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--out", type=Path,
@@ -108,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if np.any(values < lower) or np.any(values > upper):
                 continue
-            poses = forward_kinematics(plan, dict(zip(dof_names, values)),
+            poses = forward_kinematics(plan, dict(zip(dof_names, values, strict=False)),
                                        root_position=(0.0, 0.0, 0.0),
                                        root_rotation=np.zeros(3))
             links = {name: np.asarray(t.translation) for name, t in poses.items()}
@@ -116,7 +118,6 @@ def main(argv: list[str] | None = None) -> int:
             depth = -min(left[2], right[2])
             trunk = links.get("neck") if "neck" in links else links.get("head")
             if trunk is None:
-                trunk_vec = None
                 trunk_pitch = float("nan")
             else:
                 vec = trunk - links["pelvis"]

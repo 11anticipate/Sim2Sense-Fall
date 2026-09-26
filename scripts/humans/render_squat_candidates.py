@@ -25,6 +25,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "humans"))
 
 from common import DEFAULT_MOTIONS, REPO_ROOT, load_inputs  # noqa: E402
+
 from sim2sense_fall.humans.amass import load_amass_clip_by_id, normalize_root_motion  # noqa: E402
 from sim2sense_fall.humans.assets import select_body  # noqa: E402
 from sim2sense_fall.humans.mesh_sequence import fit_mesh_to_rest_joints  # noqa: E402
@@ -73,12 +74,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         clip = cache[clip_id]
         values, _ = joint_values_from_clip(clip, frame, plan)
-        poses = forward_kinematics(plan, dict(zip(dof_names, values)),
+        poses = forward_kinematics(plan, dict(zip(dof_names, values, strict=False)),
                                    root_position=(0.0, 0.0, 0.0),
                                    root_rotation=np.zeros(3))
         links = {name: (t.rotation, t.translation) for name, t in poses.items()}
         verts = skin_with_link_poses(mesh, links)
-        depth = -min(verts[:, 2].min(), 0.0)
+        -min(verts[:, 2].min(), 0.0)
         fig = plt.figure(figsize=(4.6, 4.6))
         axis = fig.add_subplot(111, projection="3d")
         axis.plot_trisurf(verts[:, 0], verts[:, 1], verts[:, 2],

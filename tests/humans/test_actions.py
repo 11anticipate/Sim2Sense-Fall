@@ -3,7 +3,13 @@
 import numpy as np
 import pytest
 
-from sim2sense_fall.humans.actions import ActionClip, ActionConfig, ActionState, Posture
+from sim2sense_fall.humans.actions import (
+    ActionClip,
+    ActionConfig,
+    ActionState,
+    Posture,
+)
+from sim2sense_fall.humans.rotations import quaternion_to_matrix
 from sim2sense_fall.humans.teleop import KeyboardIntent, TeleopTarget
 
 
@@ -209,9 +215,11 @@ def test_get_up_only_from_fallen_and_plays_out_to_standing():
     state.request("fall", time_s=1, heading_rad=0, measured_joints=target.joints)
     state.observe(time_s=2, root_height_m=0.3, tilt_deg=80, standing_height_m=1, body_impact=True)
     assert state.phase == "fallen"
+    from sim2sense_fall.humans.rotations import axis_angle_to_quaternion
     assert state.request(
         "get_up", time_s=3, heading_rad=0,
         measured_joints=target.joints, measured_position=position,
+        measured_quaternion=axis_angle_to_quaternion(np.array([0.0, np.deg2rad(85.0), 0.0])),
     ) is True
     assert state.falling is False, "recovery must run with assistance restored"
     assert state.command((1, 0)) == (0, 0)
@@ -240,5 +248,64 @@ def test_get_up_without_a_configured_clip_is_a_no_op():
     assert state.request(
         "get_up", time_s=3, heading_rad=0,
         measured_joints=target.joints, measured_position=np.zeros(3),
+        measured_quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
     ) is False
     assert state.phase == "fallen"
+
+
+def test_without_yaw_strips_turn_and_keeps_pitch():
+    from sim2sense_fall.humans.actions import _without_yaw as strip
+    from sim2sense_fall.humans.rotations import axis_angle_to_matrix
+    tilt = np.array([0.0, 0.6, np.deg2rad(30.0)])  # 俯仰 + 30° 自转
+    stripped = strip(tilt)
+    rotation = axis_angle_to_matrix(stripped)
+    yaw = np.arctan2(rotation[1, 0], rotation[0, 0])
+    assert abs(np.degrees(yaw)) <= 1e-6
+    # 俯仰保留: 前向分量仍倾斜
+    assert rotation[2, 2] < 1.0
+
+
+def test_getup_replay_does_not_inherit_the_clip_turn():
+    """CMU/140 起身时自身转了 ~30°: 旧实现把片段 yaw 带进世界朝向,
+    混出瞬间传送 ~91°——观感"起立后转几圈"。片段 yaw 必须被剔除,
+    回放全程世界朝向锚定在倒地朝向上。"""
+    turn = np.deg2rad(30.0)
+    clip = ActionClip(
+        joints=np.array([[0.0, 0.0], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0]]),
+        heights_m=np.array([0.2, 0.5, 0.95, 0.95]),
+        offsets_xy=np.zeros((4, 2)),
+        tilts=np.array([[turn * f, 0.1, 0.0] for f in np.linspace(0, 1, 4)]),
+        frame_dt_s=0.1,
+        provenance={},
+    )
+    state, target = fixture()
+    state = ActionState(
+        ActionConfig(1, 0.025, 350, 0.25, 0, 0.6, 50),
+        {},
+        playback_clip=clip,
+    )
+    heading = np.deg2rad(40.0)
+    state.phase = "fallen"
+    from sim2sense_fall.humans.rotations import axis_angle_to_quaternion
+    lying_quaternion = axis_angle_to_quaternion(np.array([0.0, np.deg2rad(85.0), 0.0]))
+    assert state.request(
+        "get_up", time_s=1, heading_rad=heading,
+        measured_joints=target.joints,
+        measured_position=np.array([0.0, 0.0, 0.2]),
+        measured_quaternion=lying_quaternion,
+    ) is True
+    saw_replay = False
+    max_deviation = 0.0
+    for _ in range(24):
+        out = apply(state, target)  # dt 0.1 s
+        if state.phase == "getting_up" or out.mode == "getting_up":
+            saw_replay = True
+            rotation = quaternion_to_matrix(out.quaternion)
+            world_yaw = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+            # 片段自带 30° 自然转身: 目标朝向跟随, 但不得超出片段转身量级
+            deviation = abs(np.degrees(world_yaw - heading))
+            max_deviation = max(max_deviation, deviation)
+    assert saw_replay and state.phase == "idle"
+    assert max_deviation <= 45.0, (
+        f"replay orientation swung {max_deviation:.1f} deg beyond the clip turn"
+    )

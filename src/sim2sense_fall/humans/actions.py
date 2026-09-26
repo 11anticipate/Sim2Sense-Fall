@@ -100,6 +100,20 @@ class Posture:
     contacts: tuple[str, ...] = ("left_ankle", "right_ankle")
 
 
+def _without_yaw(tilt: np.ndarray) -> np.ndarray:
+    """Strip the world-yaw component from a tilt axis-angle.
+
+    The get-up clip turns on its own while rising; replayed against the
+    fallen heading that turn shows up as a slow spin followed by a snap
+    back to the teleop heading at blend-out. Removing the clip's yaw keeps
+    the replay on the fallen heading throughout, so recovery never spins.
+    """
+
+    rotation = axis_angle_to_matrix(tilt)
+    yaw = math.atan2(rotation[1, 0], rotation[0, 0])
+    return matrix_to_axis_angle(rotation_about_axis("z", -yaw) @ rotation)
+
+
 def _smoothstep(x: float) -> float:
     x = min(1.0, max(0.0, x))
     return x * x * (3.0 - 2.0 * x)
@@ -452,13 +466,16 @@ class ActionState:
         heading_rad: float,
         measured_joints: np.ndarray,
         measured_position: np.ndarray | None = None,
+        measured_quaternion: np.ndarray | None = None,
     ) -> bool:
         if name not in {*_POSTURE_ING_MODES, "stand", "fall", "get_up"}:
             raise ValueError(f"unknown action {name}")
         if not np.isfinite([time_s, heading_rad]).all() or not np.isfinite(measured_joints).all():
             raise ValueError("action request requires finite measured state")
         if name == "get_up":
-            return self._request_get_up(time_s, heading_rad, measured_joints, measured_position)
+            return self._request_get_up(
+                time_s, heading_rad, measured_joints, measured_position, measured_quaternion
+            )
         if self.suppresses_stance:
             # Falling/fallen: only R or get_up leave the state. Getting up:
             # posture requests would fight the replay.
@@ -505,6 +522,7 @@ class ActionState:
         heading_rad: float,
         measured_joints: np.ndarray,
         measured_position: np.ndarray | None,
+        measured_quaternion: np.ndarray | None,
     ) -> bool:
         if self.playback_clip is None:
             return False
@@ -523,6 +541,7 @@ class ActionState:
             "source_joints": measured_joints.copy(),
             "source_height_m": float(measured_position[2]),
             "source_tilt": np.asarray(tilt, dtype=np.float64).copy(),
+            # 实测躺姿世界朝向: 混入段从它测地过渡到回放朝向
         }
         self.phase = "getting_up"
         self.mode = "getting_up"
@@ -653,6 +672,9 @@ class ActionState:
         blend = _smoothstep(elapsed / _CLIP_BLEND_S)
         q = (1 - blend) * state["source_joints"] + blend * clip.joints[index]
         height = (1 - blend) * state["source_height_m"] + blend * clip.heights_m[index]
+        # 起身时人自然转身(片段自带 ~80° yaw): 目标朝向跟随片段, 交回控制时
+        # keyboard 采纳身体实际朝向——不在朝向上与关节回放对抗(实测对抗会
+        # 摆出 350° 级的自旋)。
         tilt = (1 - blend) * state["source_tilt"] + blend * clip.tilts[index]
         offset = clip.offsets_xy[index]
         c, s = math.cos(state["heading_rad"]), math.sin(state["heading_rad"])
@@ -662,7 +684,11 @@ class ActionState:
              anchor[1] + s * offset[0] + c * offset[1],
              height]
         )
-        self.last_pose = (q.copy(), float(height), tilt.copy())
+        # 交回时把回放朝向拆成 "heading ⊕ 无 yaw tilt": tilt 里的 yaw 已并入
+        # 锚定 heading, 否则 standing blend 的 heading ⊕ tilt 会把这段 yaw
+        # 再计一次, 身体被拧一整圈去追重复计数的朝向。
+        tilt_clean = _without_yaw(tilt)
+        self.last_pose = (q.copy(), float(height), tilt_clean.copy())
         if index >= len(clip.joints) - 1 and elapsed >= clip.duration_s + _CLIP_BLEND_S:
             # Recovery complete: hand over to the standing blend from the final
             # replay pose, which restores assistance and locomotion modes.

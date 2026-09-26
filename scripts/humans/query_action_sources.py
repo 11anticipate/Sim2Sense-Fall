@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -78,7 +77,6 @@ def main(argv: list[str] | None = None) -> int:
 
     report = {}
     for name in CATEGORIES:
-        subset = name if name != "walk_run" else "walk"
         if name == "walk_run":
             targets = ["walk", "run"]
         else:

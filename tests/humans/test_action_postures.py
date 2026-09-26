@@ -70,11 +70,17 @@ def test_keyboard_yaml_declares_the_surveyed_actions(settings):
     assert settings["get_up"]["file"].name == "140_01_poses.npz"
 
 
-def test_crouch_posture_keeps_historical_grounding(plan, settings):
+def test_crouch_posture_projects_both_feet_flat(plan, settings):
+    """2026-09-26 换源: 对称深蹲 CMU/01_06 f744，双踝声明接触投影落地。"""
+
     posture = load_posture(settings["crouch"], plan)
-    assert posture.provenance["height_method"] == "minimum_foot_collision_support"
+    assert posture.provenance["height_method"] == "declared_contact_projection"
+    assert posture.provenance["projection"]["max_residual_m"] == pytest.approx(0.0, abs=1e-4)
     bottoms = _bottoms(plan, posture, ("left_ankle", "right_ankle"))
-    assert min(bottoms.values()) == pytest.approx(0.0, abs=1e-6)
+    for name, value in bottoms.items():
+        assert value == pytest.approx(0.0, abs=1e-4), name
+    # 深蹲带: 骨盆约为站高的 40-48%（随胶囊拟合略有差异）
+    assert 0.35 <= posture.height_m <= 0.45
 
 
 def test_bend_posture_grounds_both_feet_and_flexes_the_trunk(plan, settings):
@@ -182,10 +188,18 @@ def test_posture_transition_height_is_contact_closure(plan, settings):
 
     hold = (last.joints.copy(), float(last.position[2]))
     state.request("stand", time_s=2, heading_rad=0, measured_joints=last.joints)
+    # Continuity is a pure-function property: at a vanishing blend step the
+    # closure of the (unchanged) source pose must equal the held height
+    # exactly. The deep-squat source moves ~2 cm within the first 10% of a
+    # 1 s return blend, so a coarse first step is transition motion, not a
+    # discontinuity.
+    tiny = state.apply(
+        target, dt_s=1e-4, speed_m_s=0.0, idle_joints=joints0, idle_height_m=1.0,
+        idle_tilt=np.zeros(3), heading_rad=0,
+    )
+    assert tiny.position[2] == pytest.approx(hold[1], abs=0.005)
     first = step()
-    # Retarget continuity: the closure is a pure function of the pose, so the
-    # first retargeted frame continues from the held height without a jump.
-    assert first.position[2] == pytest.approx(hold[1], abs=0.02)
+    assert first.position[2] == pytest.approx(hold[1], abs=0.04)
     assert np.linalg.norm(first.joints - hold[0]) < 0.2
 
     # Sit transition: the pelvis joins the contact set, so the descent ends

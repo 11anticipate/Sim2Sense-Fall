@@ -71,6 +71,12 @@ REFERENCE_ACCEL_MAX_M_S2 = 2.5
 REFERENCE_ACCEL_EMA_TAU_S = 0.08
 
 
+def _yaw_of(quaternion: np.ndarray) -> float:
+    """Yaw of a (w, x, y, z) quaternion — the runtime's storage order."""
+    w, x, y, z = quaternion
+    return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+
 def cycle_sample(table: np.ndarray, phase: float) -> np.ndarray:
     """Circular linear interpolation into a seam-closed per-cycle table."""
     count = len(table)
@@ -270,6 +276,7 @@ def main() -> int:
     if args.dry_run:
         intent = KeyboardIntent()
         position = controller.position.copy()
+        previous_quaternion = np.array([1.0, 0.0, 0.0, 0.0])
         duration_s = args.seconds or sum(s["duration_s"] for s in settings["demo"])
         frames = int(np.ceil(duration_s / config.simulation.physics_dt_s))
         modes: set[str] = set()
@@ -297,6 +304,7 @@ def main() -> int:
                     heading_rad=controller.heading,
                     measured_joints=controller.joints,
                     measured_position=position,
+                    measured_quaternion=previous_quaternion,
                 )
                 intent.action_requested = None
             target = controller.advance(
@@ -306,6 +314,7 @@ def main() -> int:
                 controller.heading,
             )
             if actions:
+                was_getting_up = actions.mode == "getting_up"
                 target = actions.apply(
                     target,
                     dt_s=config.simulation.physics_dt_s,
@@ -315,7 +324,14 @@ def main() -> int:
                     idle_tilt=controller.idle.tilt(0),
                     heading_rad=controller.heading,
                 )
+                if was_getting_up and actions.mode != "getting_up":
+                    # Recovery handed control back: adopt the orientation the
+                    # body actually got up facing instead of torquing it back
+                    # to the pre-fall heading (that tug was the post-get-up
+                    # spin).
+                    controller.heading = _yaw_of(target.quaternion)
             position = target.position
+            previous_quaternion = target.quaternion
             modes.add(target.mode)
             if not np.isfinite(target.joints).all():
                 raise RuntimeError("nonfinite dry-run target")
@@ -482,12 +498,22 @@ def main() -> int:
                     else None
                 )
                 if actions and intent.action_requested:
+                    # get_up anchors the replay at the *measured* fallen heading:
+                    # anchoring at the teleop heading left the recovery spinning
+                    # from the collapsed orientation back to the pre-fall one.
+                    measured_heading = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+                    request_heading = (
+                        measured_heading
+                        if intent.action_requested == "get_up"
+                        else controller.heading
+                    )
                     accepted = actions.request(
                         intent.action_requested,
                         time_s=clock_s,
-                        heading_rad=controller.heading,
+                        heading_rad=request_heading,
                         measured_joints=runtime.joint_positions_rad(),
                         measured_position=position,
+                        measured_quaternion=quaternion,
                     )
                     intent.action_requested = None
                     if actions.falling:
@@ -512,6 +538,7 @@ def main() -> int:
                     float(np.arctan2(rotation[1, 0], rotation[0, 0])),
                 )
                 if actions:
+                    was_getting_up = actions.mode == "getting_up"
                     target = actions.apply(
                         target,
                         dt_s=dt,
@@ -521,6 +548,12 @@ def main() -> int:
                         idle_tilt=controller.idle.tilt(0),
                         heading_rad=controller.heading,
                     )
+                    if was_getting_up and actions.mode != "getting_up":
+                        # Recovery handed control back: adopt the orientation
+                        # the body actually got up facing instead of torquing
+                        # it back to the pre-fall heading (that tug was the
+                        # post-get-up spin).
+                        controller.heading = _yaw_of(target.quaternion)
                 if stance and not (actions and actions.suppresses_stance):
                     stance_mode = (
                         "transition"
