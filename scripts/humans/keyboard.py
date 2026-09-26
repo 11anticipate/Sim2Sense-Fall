@@ -517,11 +517,9 @@ def main() -> int:
                     )
                     intent.action_requested = None
                     if actions.falling:
-                        if not runtime.set_control_scale(
-                            actions.config.fall_control_scale,
-                            actions.config.fall_damping_scale,
-                        ):
-                            raise RuntimeError("could not release position drives for fall")
+                        # 相位1(腿软)保持驱动开启, 膝盖被快速压弯; 相位2 才释放。
+                        if not runtime.set_control_scale(1.0):
+                            raise RuntimeError("could not enable drives for fall phase 1")
                         if stance:
                             stance.reset()
                     elif accepted and actions.mode == "getting_up":
@@ -700,6 +698,17 @@ def main() -> int:
                 torque *= settings["root_assist_scale"]
                 if actions and actions.falling:
                     force, torque = actions.fall_force(clock_s), np.zeros(3)
+                    buckle = actions.fall_buckle_force(clock_s)
+                    if np.any(buckle):
+                        runtime.apply_force("spine3", buckle)
+                    elif not getattr(actions, "buckle_released", True):
+                        # 相位1结束: 释放驱动进入瘫倒(一次性)
+                        if not runtime.set_control_scale(
+                            actions.config.fall_control_scale,
+                            actions.config.fall_damping_scale,
+                        ):
+                            raise RuntimeError("could not release position drives for fall")
+                        actions.buckle_released = True
                     target = replace(target, joint_velocities=np.zeros_like(target.joints))
                 runtime.set_joint_targets(target.joints, target.joint_velocities)
                 runtime.apply_root_wrench(force, torque)

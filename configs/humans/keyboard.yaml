@@ -86,6 +86,8 @@ actions:
   # the drives-off body crumple at ~19 deg/s. 0.15 keeps a viscous term that
   # avoids the measured zero-damping solver NaN while folding visibly.
   fall_damping_scale: 0.15
+  fall_buckle_force_n: 200.0
+  fall_buckle_duration_s: 0.15
   fallen_height_fraction: 0.60
   fallen_tilt_deg: 50.0
 crouch:
