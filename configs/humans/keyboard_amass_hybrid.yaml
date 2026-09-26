@@ -64,9 +64,10 @@ actions:
   fallen_height_fraction: 0.60
   fallen_tilt_deg: 50.0
 crouch:
-  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/crouchwalk_stand_poses.npz
-  start_s: 3.25
+  file: data/humans/amass_raw/CMU/01/01_06_poses.npz
+  start_s: 6.2
   duration_s: 0.1
+  contacts: [left_ankle, right_ankle]
 # Bend/floor-sit/get-up posture sections kept identical to keyboard.yaml so the
 # B/N/G keys work; see keyboard.yaml for the source provenance comments.
 bend:

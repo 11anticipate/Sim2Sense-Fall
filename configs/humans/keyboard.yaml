@@ -89,9 +89,14 @@ actions:
   fallen_height_fraction: 0.60
   fallen_tilt_deg: 50.0
 crouch:
-  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/crouchwalk_stand_poses.npz
-  start_s: 3.25
+  # 2026-09-26 换源: 全库筛对称深蹲(用户实测旧源=蹲走跨步帧, 像"跑步预备")。
+  # CMU/01_06 f744: 骨盆 0.386 m(站高 42%), 膝屈 130°, 双脚平贴间距 0.13 m,
+  # 双踝投影落地零残差; 筛选工具 scripts/humans/screen_squat_sources.py,
+  # 候选渲染 artifacts/humans/squat_candidates/。
+  file: data/humans/amass_raw/CMU/01/01_06_poses.npz
+  start_s: 6.2
   duration_s: 0.1
+  contacts: [left_ankle, right_ankle]
 # Bend over (key B). CMU/115 subject 1, deepest in-limit flexion frame
 # (trunk ~84 deg, feet planted). The contact projection grounds both feet;
 # hands stay in the air, so only the ankles are declared.
