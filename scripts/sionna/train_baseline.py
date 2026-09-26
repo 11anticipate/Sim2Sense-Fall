@@ -19,6 +19,8 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
@@ -57,6 +59,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--velocity-weight", type=float, default=0.0)
     parser.add_argument("--held-out", nargs="*", default=None,
                         help="sample ids to hold out; default: one per activity class")
+    parser.add_argument("--loo", action="store_true",
+                        help="leave-one-sample-out over all samples instead of one split")
     return parser.parse_args(argv)
 
 
@@ -70,6 +74,77 @@ def default_holdout(sample_ids: list[tuple[str, str]]) -> list[str]:
             held.append(sample_id)
             seen.add(activity)
     return held
+
+
+def train_one_fold(
+    examples: list,
+    held_out: set[str],
+    config: TrainConfig,
+    n_activities: int,
+) -> dict:
+    """Train on everything outside ``held_out`` and score the held sample."""
+
+    from sim2sense_fall.detection_train import _fall_probabilities
+
+    train, evaluation = _group_split(examples, held_out)
+    model, history = train_model(train, evaluation, config, n_activities)
+    probabilities = _fall_probabilities(model, evaluation, config.device)
+    predictions = [
+        {
+            "sample_id": item.sample_id,
+            "center_s": item.center_s,
+            "fall_label": item.fall_label,
+            "fall_probability": float(probability),
+            "velocity_label": item.velocity,
+        }
+        for item, probability in zip(evaluation, probabilities, strict=True)
+    ]
+    return {
+        "held_out": sorted(held_out),
+        "train_windows": len(train),
+        "train_fall_windows": sum(item.fall_label for item in train),
+        "eval_windows": len(evaluation),
+        "eval_fall_accuracy": history[-1]["eval_fall_accuracy"],
+        "eval_velocity_mae_hz": history[-1]["eval_velocity_mae_hz"],
+        "final_train_loss": history[-1]["train_loss"],
+        "predictions": predictions,
+    }
+
+
+def run_loo(examples: list, sample_ids: list[str], config: TrainConfig, n_activities: int) -> dict:
+    """Leave-one-sample-out over every sample with usable windows.
+
+    Each window is scored by a model that never saw its sample, so pooled
+    numbers are out-of-sample at the *sample* level — still a flow exercise
+    at nine samples, but the exact aggregation the batch stage will reuse.
+    """
+
+    folds = []
+    for sample_id in sample_ids:
+        print(f"  fold {sample_id}")
+        folds.append(train_one_fold(examples, {sample_id}, config, n_activities))
+    pooled = [row for fold in folds for row in fold["predictions"]]
+    accuracies = [fold["eval_fall_accuracy"] for fold in folds
+                  if fold["eval_fall_accuracy"] is not None]
+    maes = [fold["eval_velocity_mae_hz"] for fold in folds
+            if fold["eval_velocity_mae_hz"] is not None]
+    labels = np.asarray([row["fall_label"] for row in pooled])
+    probs = np.asarray([row["fall_probability"] for row in pooled])
+    pooled_accuracy = float(((probs >= 0.5) == labels).mean()) if len(pooled) else None
+    labelled = [(row["fall_probability"], row["velocity_label"]) for row in pooled
+                if row["velocity_label"] is not None]
+    pooled_velocity_mae = (
+        float(np.mean([abs(p - v) for p, v in labelled])) if labelled else None
+    )
+    return {
+        "mode": "leave_one_sample_out",
+        "folds": folds,
+        "pooled_windows": len(pooled),
+        "pooled_fall_accuracy": pooled_accuracy,
+        "pooled_velocity_mae_hz": pooled_velocity_mae,
+        "fold_accuracy_mean": float(np.mean(accuracies)) if accuracies else None,
+        "fold_velocity_mae_mean_hz": float(np.mean(maes)) if maes else None,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,12 +182,39 @@ def main(argv: list[str] | None = None) -> int:
             [(s.sample_id, s.activity) for s in sorted(samples, key=lambda s: s.sample_id)]
         )
     )
-    train, evaluation = _group_split(examples, held_out)
     config = TrainConfig(
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, seed=args.seed,
         hidden=args.hidden, activity_weight=args.activity_weight,
         velocity_weight=args.velocity_weight, device=args.device,
     )
+    if args.loo:
+        result = run_loo(
+            examples,
+            [sid for sid, count in sorted(per_sample_counts.items()) if count > 0],
+            config, len(activities),
+        )
+        out = args.out or (args.sionna_dir / "detection" / "train_smoke")
+        out.mkdir(parents=True, exist_ok=True)
+        report_path = out / "train_loo_report.json"
+        report_path.write_text(json.dumps(
+            {"flow_smoke_only": True,
+             "notes": ["leave-one-sample-out over nine samples is a protocol exercise, "
+                        "not a performance claim"],
+             "config": {"train": {"epochs": config.epochs, "batch_size": config.batch_size,
+                                   "lr": config.lr, "seed": config.seed,
+                                   "hidden": config.hidden,
+                                   "activity_weight": config.activity_weight,
+                                   "velocity_weight": config.velocity_weight,
+                                   "device": config.device},
+                         "activities": activities},
+             **result},
+            indent=2), encoding="utf-8")
+        print(f"loo report -> {report_path}")
+        print(f"  pooled windows {result['pooled_windows']}, "
+              f"pooled fall accuracy {result['pooled_fall_accuracy']}, "
+              f"pooled velocity MAE {result['pooled_velocity_mae_hz']} Hz")
+        return 0
+    train, evaluation = _group_split(examples, held_out)
     model, history = train_model(train, evaluation, config, len(activities))
     probabilities = _fall_probabilities(model, evaluation, config.device)
     predictions = [
