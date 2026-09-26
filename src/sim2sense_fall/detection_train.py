@@ -210,11 +210,16 @@ class FallNet(nn.Module):
         self.activity_head = nn.Linear(hidden, n_activities)
         self.velocity_head = nn.Linear(hidden, 1)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Shared conv feature map (B, 16, T, D/4) before the time head."""
+
         hidden = torch.relu(self.conv1(x))
         hidden = self.pool(hidden)
         hidden = torch.relu(self.conv2(hidden))
-        hidden = self.pool(hidden)
+        return self.pool(hidden)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden = self.encode(x)
         hidden = hidden.mean(dim=3).transpose(1, 2)  # (B, T, channels)
         sequence, _ = self.gru(hidden)
         last = sequence[:, -1]
@@ -223,6 +228,121 @@ class FallNet(nn.Module):
             self.activity_head(last),
             self.velocity_head(last)[:, 0],
         )
+
+
+class ReconstructionDecoder(nn.Module):
+    """Masked-reconstruction head over the shared conv encoder.
+
+    The stage-9 plan pretrains the encoder on abundant unlabelled ADL
+    windows (masked reconstruction) before fall supervision; this decoder
+    is the pretext machine and is discarded after pretraining. Bilinear
+    resize back to the input shape keeps variable window sizes supported
+    despite the floor in the pooling stages.
+    """
+
+    def __init__(self) -> None:
+        require_torch()
+        super().__init__()
+        self.conv = nn.Conv2d(16, 8, kernel_size=3, padding=1)
+        self.upsample = nn.ConvTranspose2d(8, 1, kernel_size=(1, 4), stride=(1, 4))
+
+    def forward(self, features: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        hidden = torch.relu(self.conv(features))
+        reconstructed = self.upsample(hidden)
+        return torch.nn.functional.interpolate(
+            reconstructed, size=target.shape[-2:], mode="bilinear",
+            align_corners=False,
+        )
+
+
+def mask_windows(
+    magnitudes: list[np.ndarray], ratio: float, generator: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray]:
+    """Zero one random rectangle per window; return (batch, mask).
+
+    The mask is 1 inside the rectangle and 0 elsewhere, so the pretext loss
+    scores only the hidden region. ``ratio`` bounds the *area* fraction.
+    """
+
+    if not 0 < ratio < 1:
+        raise ValueError("mask ratio must lie in (0, 1)")
+    batch = _pad_batch(magnitudes)
+    mask = np.zeros_like(batch.numpy())
+    for index in range(batch.shape[0]):
+        frames, taps = batch.shape[2], batch.shape[3]
+        height = max(1, int(round(taps * np.sqrt(ratio))))
+        width = max(1, int(round(frames * np.sqrt(ratio))))
+        top = int(generator.integers(0, max(taps - height, 1)))
+        left = int(generator.integers(0, max(frames - width, 1)))
+        mask[index, 0, left : left + width, top : top + height] = 1.0
+    return batch * torch.from_numpy(1.0 - mask).float(), mask
+
+
+def pretrain_reconstruction(
+    examples: list[WindowExample],
+    config: TrainConfig,
+    mask_ratio: float = 0.25,
+) -> dict[str, torch.Tensor]:
+    """Masked-reconstruction pretraining of the shared conv encoder.
+
+    Runs on *any* usable windows — labels are irrelevant here, which is the
+    point: ADL can be generated without the scarce fall labels. Returns the
+    trained encoder weights (conv1/conv2) for :func:`load_pretrained_encoder`.
+    """
+
+    require_torch()
+    if not examples:
+        raise ValueError("pretraining needs at least one usable window")
+    torch.manual_seed(config.seed)
+    generator = np.random.default_rng(config.seed)
+    device = torch.device(config.device)
+    encoder = FallNet(hidden=config.hidden, n_activities=2).to(device)
+    decoder = ReconstructionDecoder().to(device)
+    optimizer = torch.optim.Adam(
+        list(encoder.parameters()) + list(decoder.parameters()), lr=config.lr
+    )
+    first_loss = last_loss = None
+    for _ in range(config.epochs):
+        order = generator.permutation(len(examples))
+        epoch_loss = 0.0
+        batches = 0
+        for start in range(0, len(order), config.batch_size):
+            chunk = [examples[index] for index in order[start : start + config.batch_size]]
+            target = _pad_batch([item.magnitude for item in chunk]).to(device)
+            masked, mask = mask_windows(
+                [item.magnitude for item in chunk], mask_ratio, generator
+            )
+            masked = masked.to(device)
+            mask_t = torch.from_numpy(mask).float().to(device)
+            reconstructed = decoder(encoder.encode(masked), target)
+            loss = ((reconstructed - target) ** 2 * mask_t).sum() / mask_t.sum()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += float(loss.detach())
+            batches += 1
+        last_loss = epoch_loss / max(batches, 1)
+        if first_loss is None:
+            first_loss = last_loss
+    return {
+        "encoder_state": {key: value for key, value in encoder.state_dict().items()
+                          if key.startswith("conv")},
+        "first_masked_loss": first_loss,
+        "final_masked_loss": last_loss,
+    }
+
+
+def load_pretrained_encoder(model: FallNet, encoder_state: dict) -> None:
+    """Copy pretrained conv weights into a fresh detector."""
+
+    model.conv1.load_state_dict(
+        {key.removeprefix("conv1."): value for key, value in encoder_state.items()
+         if key.startswith("conv1.")}
+    )
+    model.conv2.load_state_dict(
+        {key.removeprefix("conv2."): value for key, value in encoder_state.items()
+         if key.startswith("conv2.")}
+    )
 
 
 def _group_split(
@@ -240,6 +360,7 @@ def train_model(
     eval_examples: list[WindowExample],
     config: TrainConfig,
     n_activities: int,
+    model: FallNet | None = None,
 ) -> tuple[FallNet, list[dict]]:
     """Train the three heads; returns the model and a per-epoch history.
 
@@ -254,7 +375,9 @@ def train_model(
     torch.manual_seed(config.seed)
     generator = np.random.default_rng(config.seed)
     device = torch.device(config.device)
-    model = FallNet(hidden=config.hidden, n_activities=max(1, n_activities)).to(device)
+    if model is None:
+        model = FallNet(hidden=config.hidden, n_activities=max(1, n_activities))
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
     positives = sum(item.fall_label for item in train_examples)

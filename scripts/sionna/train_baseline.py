@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,7 @@ from sim2sense_fall.detection_data import (  # noqa: E402
     load_mesh_motion,
 )
 from sim2sense_fall.detection_train import (  # noqa: E402
+    FallNet,
     TrainConfig,
     WindowSpec,
     _fall_probabilities,
@@ -61,6 +63,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="sample ids to hold out; default: one per activity class")
     parser.add_argument("--loo", action="store_true",
                         help="leave-one-sample-out over all samples instead of one split")
+    parser.add_argument("--pretrain-epochs", type=int, default=0,
+                        help="masked-reconstruction pretraining epochs on all usable "
+                             "windows before supervised training (0 = off)")
     return parser.parse_args(argv)
 
 
@@ -187,6 +192,23 @@ def main(argv: list[str] | None = None) -> int:
         hidden=args.hidden, activity_weight=args.activity_weight,
         velocity_weight=args.velocity_weight, device=args.device,
     )
+    pretrain_note = None
+    if args.pretrain_epochs > 0 and not args.loo:
+        from sim2sense_fall.detection_train import (
+            load_pretrained_encoder,
+            pretrain_reconstruction,
+        )
+        usable_all = [item for item in examples if item.usable]
+        pretrain_config = replace(config, epochs=args.pretrain_epochs)
+        pretrained = pretrain_reconstruction(usable_all, pretrain_config)
+        print(f"  pretrain masked loss {pretrained['first_masked_loss']:.4f} -> "
+              f"{pretrained['final_masked_loss']:.4f} on {len(usable_all)} windows")
+        pretrain_note = {
+            "epochs": args.pretrain_epochs,
+            "windows": len(usable_all),
+            "first_masked_loss": pretrained["first_masked_loss"],
+            "final_masked_loss": pretrained["final_masked_loss"],
+        }
     if args.loo:
         result = run_loo(
             examples,
@@ -215,7 +237,12 @@ def main(argv: list[str] | None = None) -> int:
               f"pooled velocity MAE {result['pooled_velocity_mae_hz']} Hz")
         return 0
     train, evaluation = _group_split(examples, held_out)
-    model, history = train_model(train, evaluation, config, len(activities))
+    model = FallNet(hidden=config.hidden, n_activities=len(activities))
+    if pretrain_note is not None:
+        from sim2sense_fall.detection_train import load_pretrained_encoder
+        load_pretrained_encoder(model, pretrained["encoder_state"])
+    model, history = train_model(train, evaluation, config, len(activities),
+                                 model=model)
     probabilities = _fall_probabilities(model, evaluation, config.device)
     predictions = [
         {
@@ -247,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
             "held_out": sorted(held_out),
         },
         "usable_windows_per_sample": per_sample_counts,
+        "pretrain": pretrain_note,
         "velocity_labelled_windows": velocity_labelled,
         "velocity_label_sources": label_sources,
         "train_windows": len(train),

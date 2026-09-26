@@ -14,11 +14,15 @@ torch = pytest.importorskip("torch")
 from sim2sense_fall.detection_data import ChannelSample, MeshMotion  # noqa: E402
 from sim2sense_fall.detection_train import (  # noqa: E402
     FallNet,
+    ReconstructionDecoder,
     TrainConfig,
     WindowSpec,
     _group_split,
     activity_index_map,
     build_window_examples,
+    load_pretrained_encoder,
+    mask_windows,
+    pretrain_reconstruction,
     train_model,
     window_slices,
 )
@@ -158,3 +162,42 @@ def test_velocity_head_trains_when_mesh_labels_exist():
     model, history = train_model(train, train, config, len(activities))
     assert history[-1]["eval_velocity_mae_hz"] is not None
     assert np.isfinite(history[-1]["eval_velocity_mae_hz"])
+
+
+def test_encoder_and_decoder_shapes_roundtrip():
+    model = FallNet(hidden=8, n_activities=3)
+    decoder = ReconstructionDecoder()
+    window = torch.rand(2, 1, 6, TAPS)
+    features = model.encode(window)
+    assert features.shape[0] == 2 and features.shape[1] == 16
+    assert features.shape[2] == 6  # pooling never touches the time axis
+    reconstructed = decoder(features, window)
+    assert reconstructed.shape == window.shape
+
+
+def test_mask_windows_zeroes_one_rectangle_and_reports_mask():
+    windows = [np.full((6, TAPS), 0.5, dtype=np.float32) for _ in range(3)]
+    generator = np.random.default_rng(0)
+    masked, mask = mask_windows(windows, ratio=0.25, generator=generator)
+    assert masked.shape == (3, 1, 6, TAPS)
+    area = mask.sum(axis=(2, 3))
+    assert np.all(area > 0) and np.all(area <= 0.25 * 6 * TAPS + TAPS)  # one rect
+    hidden = mask.astype(bool)
+    assert np.all(masked.numpy()[hidden] == 0.0)
+    outside = ~hidden
+    assert np.allclose(masked.numpy()[outside], 0.5)
+
+
+def test_pretraining_reduces_masked_loss_and_weights_transfer():
+    examples, activities = _tiny_training_set()
+    config = TrainConfig(epochs=12, batch_size=4, lr=5e-3, seed=0, hidden=8,
+                         device="cpu")
+    pretrained = pretrain_reconstruction(examples, config, mask_ratio=0.25)
+    assert pretrained["final_masked_loss"] < pretrained["first_masked_loss"]
+    fresh = FallNet(hidden=8, n_activities=len(activities))
+    conv1_before = fresh.conv1.weight.detach().clone()
+    load_pretrained_encoder(fresh, pretrained["encoder_state"])
+    assert not torch.allclose(fresh.conv1.weight, conv1_before)
+    assert torch.allclose(
+        fresh.conv1.weight, pretrained["encoder_state"]["conv1.weight"]
+    )
