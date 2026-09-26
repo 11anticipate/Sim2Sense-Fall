@@ -15,6 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .doppler import frame_peak_doppler
+
 
 @dataclass(frozen=True, slots=True)
 class ChannelSample:
@@ -31,6 +33,24 @@ class ChannelSample:
     event_label: str | None
     imbalance_onset_s: float | None
     first_impact_s: float | None
+    transmitter_xyz: tuple[float, ...] | None = None
+    receiver_xyz: tuple[float, ...] | None = None
+    carrier_hz: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MeshMotion:
+    """The mesh stream a CIR sample was rendered from, with its own time axis.
+
+    A CIR sample's ``frame_index`` indexes the *native* source — trial
+    physics frames (120 Hz) for push trials, the keyboard recording for
+    session exports — while the per-sample export mesh may be downsampled
+    (30 Hz). Velocity labels are therefore computed on whatever stream is
+    available and interpolated onto the CIR frame times.
+    """
+
+    vertices: np.ndarray
+    time_s: np.ndarray
 
 
 def _event_times(import_payload: dict, import_path: Path) -> tuple[float | None, float | None]:
@@ -71,6 +91,8 @@ def load_channel_sample(cir_path: Path, import_path: Path | None = None) -> Chan
         raise ValueError(f"{cir_path.name}: time axis must be per-frame and strictly increasing")
     baseline = archive["baseline_cir"] if "baseline_cir" in archive else None
     onset_s, impact_s = _event_times(payload, import_path)
+    transmitter = payload.get("transmitter")
+    receiver = payload.get("receiver")
     return ChannelSample(
         sample_id=str(payload.get("channel_sample_id") or cir_path.name.removesuffix(".cir.npz")),
         cir_path=cir_path,
@@ -85,6 +107,9 @@ def load_channel_sample(cir_path: Path, import_path: Path | None = None) -> Chan
         ),
         imbalance_onset_s=onset_s,
         first_impact_s=impact_s,
+        transmitter_xyz=tuple(float(v) for v in transmitter) if transmitter else None,
+        receiver_xyz=tuple(float(v) for v in receiver) if receiver else None,
+        carrier_hz=(float(payload["frequency_hz"]) if payload.get("frequency_hz") else None),
     )
 
 
@@ -106,3 +131,69 @@ def iter_channel_samples(sionna_dir: Path, include_failures: bool = False) -> li
             continue
         samples.append(load_channel_sample(cir_path, import_path))
     return samples
+
+
+def load_mesh_motion(sample: ChannelSample) -> MeshMotion | None:
+    """Resolve the mesh stream the sample was rendered from, or None.
+
+    Push trials reference a ``*.trial.json`` whose sibling ``*.npz`` holds
+    the native 120 Hz mesh; session exports reference a ``manifest.json``
+    next to the per-sample ``<sample_id>.mesh.npz``. Anything else (or a
+    missing file) returns None — the caller decides whether that is fatal.
+    """
+
+    source = json.loads(sample.import_path.read_text(encoding="utf-8"))
+    source_block = source.get("source") or {}
+    source_path = source_block.get("source")
+    if not source_path:
+        return None
+    path = Path(source_path)
+    if path.suffix == ".json" and path.stem.endswith(".trial"):
+        npz_path = path.with_suffix("").with_suffix(".npz")
+        time_key = "time_physics_s"
+    elif path.name == "manifest.json":
+        # the manifest dir names meshes by the *source* sample id, which may
+        # be shorter than the channel_sample_id (no scene prefix)
+        mesh_id = (source_block.get("source_metadata") or {}).get("sample_id") or sample.sample_id
+        npz_path = path.parent / f"{mesh_id}.mesh.npz"
+        time_key = "time_s"
+    else:
+        return None
+    if not npz_path.exists():
+        return None
+    archive = np.load(npz_path)
+    if "mesh_vertices_xyz" not in archive or time_key not in archive:
+        return None
+    return MeshMotion(
+        vertices=np.asarray(archive["mesh_vertices_xyz"], dtype=np.float64),
+        time_s=np.asarray(archive[time_key], dtype=np.float64),
+    )
+
+
+def velocity_labels(
+    sample: ChannelSample, motion: MeshMotion, component: str = "peak_doppler_hz"
+) -> np.ndarray:
+    """Per-CIR-frame motion truth interpolated from the mesh stream.
+
+    ``component="peak_doppler_hz"`` is the per-frame maximum Doppler shift
+    over all body points — the fastest limb, i.e. the quantity slow-time
+    sampling must capture and the closest mesh-side analogue of what the
+    channel actually sees. Values are computed on the motion stream's own
+    time axis (central differences) and linearly interpolated onto the CIR
+    frame times; CIR frames outside the motion span clamp to the ends.
+    """
+
+    if component != "peak_doppler_hz":
+        raise ValueError("only 'peak_doppler_hz' is implemented")
+    if sample.transmitter_xyz is None or sample.receiver_xyz is None or sample.carrier_hz is None:
+        raise ValueError(f"{sample.sample_id}: import payload lacks link geometry or carrier")
+    peaks, _ = frame_peak_doppler(
+        motion.vertices,
+        motion.time_s,
+        np.asarray(sample.transmitter_xyz, dtype=np.float64),
+        np.asarray(sample.receiver_xyz, dtype=np.float64),
+        float(sample.carrier_hz),
+    )
+    # np.gradient covers every frame (one-sided at the edges), so the peak
+    # series aligns 1:1 with the motion time axis
+    return np.interp(sample.time_s, motion.time_s, peaks)

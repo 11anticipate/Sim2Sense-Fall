@@ -4,12 +4,14 @@ Runs under the Sionna environment (the only place PyTorch exists here);
 system-python pytest skips the whole module.
 """
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from sim2sense_fall.detection_data import ChannelSample  # noqa: E402
+from sim2sense_fall.detection_data import ChannelSample, MeshMotion  # noqa: E402
 from sim2sense_fall.detection_train import (  # noqa: E402
     FallNet,
     TrainConfig,
@@ -131,3 +133,28 @@ def test_training_runs_reduces_loss_and_is_seed_deterministic():
     _, second_history = train_model(train, evaluation, config, len(activities))
     assert history[-1]["train_loss"] == pytest.approx(second_history[-1]["train_loss"])
     assert model.fall_head.out_features == 1
+
+
+def test_velocity_head_trains_when_mesh_labels_exist():
+    wavelength = 299792458.0 / 3.5e9
+    sample = replace(
+        _sample("fall_a", "fall", "push_backward", onset=0.5, onset_time=0.6),
+        transmitter_xyz=(0.0, 0.0, 0.0), receiver_xyz=(0.0, 0.0, 0.0),
+        carrier_hz=3.5e9,
+    )
+    time = sample.time_s
+    vertices = np.zeros((len(time), 1, 3))
+    vertices[:, 0, 0] = 5.0 - time  # 1 m/s radial approach throughout
+    motion = MeshMotion(vertices=vertices, time_s=time)
+    activities = activity_index_map([sample])
+    examples = build_window_examples(sample, SPEC, activities, motion=motion)
+    usable = [item for item in examples if item.usable]
+    assert usable and all(
+        item.velocity == pytest.approx(2.0 / wavelength, rel=1e-3) for item in usable
+    )
+    train, _ = _group_split(examples, set())
+    config = TrainConfig(epochs=4, batch_size=4, lr=5e-3, seed=0, hidden=8,
+                         device="cpu", velocity_weight=1.0)
+    model, history = train_model(train, train, config, len(activities))
+    assert history[-1]["eval_velocity_mae_hz"] is not None
+    assert np.isfinite(history[-1]["eval_velocity_mae_hz"])

@@ -4,9 +4,10 @@ The representation is the range-time map from :mod:`sim2sense_fall.range_time`;
 the backbone is deliberately small (two conv layers over the tap axis, a GRU
 over time, < 10k parameters) because fall labels stay scarce even when ADL
 does not. Three heads exist from day one — fall (binary), activity (multi
-class) and centroid speed (regression) — but a head only contributes to the
-loss when its labels exist: the current smoke packets carry no mesh-derived
-speed labels, so that head trains at weight zero until the 50 Hz packets do.
+class) and channel-visible radial speed (regression) — and a head only
+contributes to the loss when its labels exist. Speed labels come from the
+samples' mesh streams via :func:`sim2sense_fall.detection_data.velocity_labels`
+(peak Doppler over body points, Hz); windows without labels are masked out.
 
 This module is skeleton + flow validation. Nothing here may be reported as
 detection performance; the honest protocol lives in the plan (leave-one-out
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .detection_data import ChannelSample
+from .detection_data import ChannelSample, MeshMotion, velocity_labels
 from .range_time import RangeTimeConfig, range_time_map
 
 try:  # system python has no torch; the Sionna venv does
@@ -128,6 +129,7 @@ def build_window_examples(
     spec: WindowSpec,
     activities: dict[str, int],
     config: RangeTimeConfig | None = None,
+    motion: MeshMotion | None = None,
 ) -> list[WindowExample]:
     """Cut one channel sample into labelled range-time windows.
 
@@ -135,11 +137,15 @@ def build_window_examples(
     positive only from just before its recorded imbalance onset onward;
     everything before the onset is *excluded* rather than called ADL, and a
     fall sample without an onset contributes nothing at all. ADL windows are
-    negative with their activity class from the event label.
+    negative with their activity class from the event label. When the
+    sample's mesh stream is supplied, each window also carries the mean of
+    its per-frame peak-Doppler truth (Hz) as the velocity head's regression
+    target.
     """
 
     cfg = config or RangeTimeConfig(clip_db=spec.clip_db)
     map_ = range_time_map(sample.cir, sample.delay_s, sample.time_s, sample.baseline_cir, cfg)
+    frame_velocity = velocity_labels(sample, motion) if motion is not None else None
     examples: list[WindowExample] = []
     for start, stop, center in window_slices(sample.time_s, spec):
         fall_label = 0
@@ -155,6 +161,9 @@ def build_window_examples(
             activity_index = (
                 activities.get(sample.event_label) if sample.event_label else None
             )
+        velocity = (
+            float(np.mean(frame_velocity[start:stop])) if frame_velocity is not None else None
+        )
         examples.append(
             WindowExample(
                 sample_id=sample.sample_id,
@@ -163,7 +172,7 @@ def build_window_examples(
                 magnitude=map_.magnitude[start:stop],
                 fall_label=fall_label,
                 activity_index=activity_index,
-                velocity=None,
+                velocity=velocity,
                 usable=usable,
             )
         )
@@ -300,6 +309,7 @@ def train_model(
                 "epoch": epoch,
                 "train_loss": epoch_loss / max(batches, 1),
                 "eval_fall_accuracy": evaluate_fall_accuracy(model, eval_examples, config),
+                "eval_velocity_mae_hz": evaluate_velocity_mae(model, eval_examples, config),
             }
         )
     return model, history
@@ -327,3 +337,32 @@ def evaluate_fall_accuracy(
     probabilities = _fall_probabilities(model, examples, config.device)
     labels = np.asarray([item.fall_label for item in examples])
     return float(((probabilities >= 0.5) == labels).mean())
+
+
+@torch.no_grad()
+def _velocity_predictions(model: FallNet, examples: list[WindowExample], device: str) -> np.ndarray:
+    model.eval()
+    outputs: list[float] = []
+    for start in range(0, len(examples), 16):
+        chunk = examples[start : start + 16]
+        inputs = _pad_batch([item.magnitude for item in chunk]).to(device)
+        _, _, velocity = model(inputs)
+        outputs.extend(velocity.tolist())
+    return np.asarray(outputs, dtype=np.float64)
+
+
+def evaluate_velocity_mae(
+    model: FallNet, examples: list[WindowExample], config: TrainConfig
+) -> float | None:
+    """Mean absolute error (Hz) of the velocity head on labelled windows.
+
+    Only windows that actually carry a mesh-derived label participate; None
+    when the evaluation split has none.
+    """
+
+    labelled = [item for item in examples if item.velocity is not None]
+    if not labelled:
+        return None
+    predictions = _velocity_predictions(model, labelled, config.device)
+    targets = np.asarray([item.velocity for item in labelled])
+    return float(np.abs(predictions - targets).mean())

@@ -22,7 +22,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from sim2sense_fall.detection_data import iter_channel_samples  # noqa: E402
+from sim2sense_fall.detection_data import (  # noqa: E402
+    iter_channel_samples,
+    load_mesh_motion,
+)
 from sim2sense_fall.detection_train import (  # noqa: E402
     TrainConfig,
     WindowSpec,
@@ -80,12 +83,23 @@ def main(argv: list[str] | None = None) -> int:
         window_s=args.window_s, stride_s=args.stride_s,
         min_frames=args.min_frames, clip_db=args.clip_db,
     )
+    use_velocity = args.velocity_weight > 0
     examples = []
     per_sample_counts: dict[str, int] = {}
+    label_sources: dict[str, str] = {}
     for sample in sorted(samples, key=lambda item: item.sample_id):
-        built = build_window_examples(sample, spec, activities)
+        motion = None
+        if use_velocity:
+            motion = load_mesh_motion(sample)
+            if motion is None:
+                print(f"  note: no mesh stream resolved for {sample.sample_id}; "
+                      "its windows train without velocity labels")
+            else:
+                label_sources[sample.sample_id] = "mesh"
+        built = build_window_examples(sample, spec, activities, motion=motion)
         per_sample_counts[sample.sample_id] = sum(item.usable for item in built)
         examples.extend(built)
+    velocity_labelled = sum(item.velocity is not None for item in examples)
     held_out = set(
         args.held_out
         if args.held_out is not None
@@ -115,8 +129,9 @@ def main(argv: list[str] | None = None) -> int:
         "flow_smoke_only": True,
         "notes": [
             "nine samples cannot train or rank detectors",
-            "velocity head has no labels in this batch and trained at weight zero"
-            if config.velocity_weight == 0 else "velocity head active",
+            "velocity head trained at weight zero"
+            if config.velocity_weight == 0
+            else f"velocity head active on {velocity_labelled} labelled windows",
         ],
         "config": {
             "window": {"window_s": spec.window_s, "stride_s": spec.stride_s,
@@ -130,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
             "held_out": sorted(held_out),
         },
         "usable_windows_per_sample": per_sample_counts,
+        "velocity_labelled_windows": velocity_labelled,
+        "velocity_label_sources": label_sources,
         "train_windows": len(train),
         "train_fall_windows": positives,
         "eval_windows": len(evaluation),
@@ -144,7 +161,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  windows train/eval {len(train)}/{len(evaluation)} "
           f"(fall windows in train: {positives}), held out: {sorted(held_out)}")
     print(f"  final loss {history[-1]['train_loss']:.4f}, "
-          f"eval window accuracy {history[-1]['eval_fall_accuracy']}")
+          f"eval window accuracy {history[-1]['eval_fall_accuracy']}, "
+          f"velocity MAE {history[-1]['eval_velocity_mae_hz']} Hz")
     return 0
 
 
