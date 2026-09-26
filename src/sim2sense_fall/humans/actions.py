@@ -68,16 +68,6 @@ class ActionConfig:
     # solver (measured 2864 deg/s mid-fall; see HumanRuntime.set_control_scale).
     # The scale keeps a bounded viscous term: limp on screen, solver-safe.
     fall_damping_scale: float = 0.15
-    # 2026-09-26 "腿软"脉冲: 触发后短时间内对上躯干施加向下失力载荷——
-    # 人体重量瞬间压垮膝关节(真失稳的力学), 区别于被否证的水平推力
-    # (350 N 刚体倾倒)。0 = 关闭。
-    fall_buckle_force_n: float = 200.0
-    fall_buckle_duration_s: float = 0.25
-    # 相位1(腿软)的折叠目标: 膝正=屈、髋负=屈(符号与限位实测核对)。
-    # 驱动保持开启把膝盖快速压弯, 把身体推出直腿的准平衡点; 相位2 释放
-    # 驱动进入瘫倒——此时重力对膝的力矩已经很大, 坍缩自然变快。
-    fall_buckle_flexion_deg: float = 70.0
-    fall_buckle_hip_flexion_deg: float = 50.0
 
     def __post_init__(self) -> None:
         if not np.isfinite(list(vars(self).values())).all():
@@ -406,7 +396,6 @@ class ActionState:
         self.source_foot_offsets: np.ndarray | None = None
         self.last_root_xy: np.ndarray | None = None
         self.history: list[dict[str, Any]] = []
-        self.fall_elapsed_s = 0.0
         self.reset()
 
     def reset(self) -> None:
@@ -424,8 +413,6 @@ class ActionState:
         self.fall_time_s: float | None = None
         self.fall_heading_rad = 0.0
         self.fall_pose: np.ndarray | None = None
-        self.fall_elapsed_s = 0.0
-        self.buckle_released = False
         self.impact_time_s: float | None = None
         self.active_event: dict[str, Any] | None = None
 
@@ -496,8 +483,6 @@ class ActionState:
         if name == "fall":
             self.fall_time_s, self.fall_heading_rad = time_s, heading_rad
             self.fall_pose = measured_joints.copy()
-            self.fall_elapsed_s = 0.0
-            self.buckle_released = False
             self.phase = "falling"
             self.mode = "falling"
             self.requested = None
@@ -591,16 +576,6 @@ class ActionState:
             return self._apply_playback(target, dt_s=dt_s)
         if self.falling:
             assert self.fall_pose is not None
-            self.fall_elapsed_s += dt_s
-            buckle = self.fall_buckle_joints(self.fall_elapsed_s)
-            if buckle is not None:
-                targets, rates = buckle
-                return replace(
-                    target,
-                    joints=targets,
-                    joint_velocities=rates,
-                    mode=self.mode,
-                )
             return replace(
                 target,
                 joints=self.fall_pose.copy(),
@@ -764,56 +739,9 @@ class ActionState:
             "outcome": outcome,
             "state_at_exit": self.mode,
             "falls_requested": len(self.history),
-            "mechanism": "buckle_then_release: drives fold knees fast, then released to collapse",
+            "mechanism": "root_assist_off_position_drives_scaled_backward_force_pulse",
             "events": self.history,
         }
-
-    def fall_buckle_force(self, time_s: float) -> np.ndarray:
-        """Downward load on the upper torso for the first moments of the fall.
-
-        A standing body whose muscle tone vanishes does not tip — its knees
-        fold under its own weight. A short downward force on the chest
-        replicates that load spike; the horizontal bias in :meth:`fall_force`
-        only picks the direction.
-        """
-
-        if self.fall_time_s is None:
-            return np.zeros(3)
-        if not 0.0 <= time_s - self.fall_time_s < self.config.fall_buckle_duration_s:
-            return np.zeros(3)
-        return -self.config.fall_buckle_force_n * np.array([0.0, 0.0, 1.0])
-
-    def fall_buckle_joints(self, elapsed_s: float) -> tuple[np.ndarray, np.ndarray] | None:
-        """Phase-1 "legs giving way" joint targets, or None past the phase.
-
-        The measured pose plus a linear ramp of knee (+) and hip (−) flexion;
-        the drives stay ON for this phase, so the knees fold at the drive's
-        own speed limit instead of waiting for gravity to win against the
-        near-straight-leg equilibrium. ``None`` means phase 2 (drives off).
-        """
-
-        if self.fall_time_s is None:
-            return None
-        if not 0.0 <= elapsed_s < self.config.fall_buckle_duration_s:
-            return None
-        if self.fall_pose is None:
-            return None
-        progress = elapsed_s / self.config.fall_buckle_duration_s
-        targets = self.fall_pose.copy()
-        rates = np.zeros_like(targets)
-        for name, sign, degrees in (
-            ("left_knee", +1.0, self.config.fall_buckle_flexion_deg),
-            ("right_knee", +1.0, self.config.fall_buckle_flexion_deg),
-            ("left_hip", -1.0, self.config.fall_buckle_hip_flexion_deg),
-            ("right_hip", -1.0, self.config.fall_buckle_hip_flexion_deg),
-        ):
-            if self.plan is None or name not in self.plan.dof_names:
-                continue
-            index = list(self.plan.dof_names).index(name)
-            delta = sign * np.deg2rad(degrees)
-            targets[index] += delta * progress
-            rates[index] = delta / self.config.fall_buckle_duration_s
-        return targets, rates
 
     def fall_force(self, time_s: float) -> np.ndarray:
         if self.fall_time_s is None or time_s - self.fall_time_s >= self.config.fall_duration_s:
