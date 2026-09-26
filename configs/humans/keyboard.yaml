@@ -73,7 +73,7 @@ idle_stand_height_fraction: 0.988
 # Applies only to the legacy gait pathway when contact_cycle is absent.
 max_stance_slip_m_s: 0.15
 actions:
-  transition_s: 1.8
+  transition_s: 0.7
   stopped_speed_m_s: 0.025
   # Directional bias only, not a shove: at 350 N the backward pulse unloaded the
   # knees and the collapse read as a rigid plank tipping about the ankles
