@@ -651,10 +651,11 @@
 - [x] 阶段 5：固定公寓构建及基础场景物理验收。
 - [x] 阶段 6：上游核对；分支/推送信息按执行时 Git 查询，不沿用旧快照。
 - [ ] 阶段 7：SMPL/AMASS 人体动作与物理交互。基础链路及辅助键盘可用，以上任务未完成。
-- [ ] 阶段 8 smoke 当前可复核验收包：**2026-09-25 已在分支 `stage8-smoke-rebuild`
+- [x] 阶段 8 smoke 当前可复核验收包：**2026-09-25 在分支 `stage8-smoke-rebuild`
       重建**（`stand_neutral:push_backward` 物理试验全门通过 → Sionna RT 12 帧
       复数 CIR，六项检查全过，摔倒签名可见，含路径 3D 图与 CIR 瀑布图；
-      见 docs/sionna-import.md）。待主分支合并后在此勾选。
+      见 docs/sionna-import.md）。2026-09-26 检测训练侧（detection-training-prep，
+      6 提交）一并快进合入 main 后勾选。
 - [ ] 阶段 8 扩展：动态家具真值同步、无线样本质量、人体电磁校准与 50 Hz 数据生成。
 - [ ] 阶段 9：显式 seed、按人物/源序列/场景隔离；ADL负例与事件标签、检测训练、真实/跨域评测和报警延迟/每小时误报率。
 
