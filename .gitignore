@@ -15,6 +15,9 @@ __pycache__/
 data/raw/
 data/processed/
 data/generated/
+# Licence-gated human assets (SMPL models, AMASS sequences) and generated motion data.
+# Never redistributable, so they must never be committed even by accident.
+data/humans/
 artifacts/
 checkpoints/
 renders/

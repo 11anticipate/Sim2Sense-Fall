@@ -1,0 +1,194 @@
+# Keyboard mode is explicitly assisted physics, not autonomous balance.
+rig: configs/humans/human_smpl_multiaxis.yaml
+assets: configs/humans/assets.yaml
+scene: artifacts/scenes/indoor_apartment.usda
+root_assist: configs/humans/root_assist.yaml
+locomotion_root_assist: configs/humans/root_assist_contact.yaml
+root_assist_scale: 1.0
+# 恢复期（躺→站回放、姿势→站立交接）与地面坐姿时，骨盆外力改用低权威剖面
+# (configs/humans/root_assist_recovery.yaml: 0.45 重力补偿 / 0.55 垂直提升上限)，
+# 按 controller.transition_s 平滑混合，不切换。依据 2026-09-27 A/B
+# (artifacts/diag_getup_closure/{after2,after3})：起身段地面承重 0.23 -> 0.50 倍体重、
+# 外力 0.78 -> 0.55、最长无支撑 0.117 -> 0.033 s（过 0.05 门）。坐地实测地板只承担
+# 0.07 倍体重（几乎被绳子吊着），同属该剖面覆盖范围。脚类站立/行走剖面不变。
+recovery_root_assist: configs/humans/root_assist_recovery.yaml
+recovery_modes: [getting_up, standing_up, sitting, sit]
+spawn_xy: [10.255, 1.455]
+heading_deg: 90.0
+speed_m_s: 0.4
+acceleration_m_s2: 0.8
+turn_speed_deg_s: 30.0
+turn_acceleration_deg_s2: 90.0
+# A/D turns only while W/S is held. Stationary turning was disabled by user
+# decision after two rejected variants: pivoting both flat feet (skating) and
+# marching in place on the walk cycle (read as jumping because every measured
+# quick-turn AMASS clip is a hop-turn; see docs/slip-and-turn-audit.md).
+transition_s: 0.35
+# Retargeted backward ankle peaks above 6 rad/s; retain the trajectory without
+# changing the commanded root speed or slip acceptance threshold.
+max_joint_speed_rad_s: 8.0
+max_target_lead_m: 0.10
+max_heading_lead_deg: 15.0
+# Hull geometry and reachable contact poses set the standing height.
+# The former -15 mm force-target offset is no longer needed.
+root_z_offset_m: 0.0
+render_hz: 30.0
+record_frames: 14400
+# false leaves the viewport camera to the user (free orbit/fly in the GUI);
+# true restores the per-frame follow camera at the azimuth/elevation below.
+camera_follow: false
+camera_distance_m: 3.2
+camera_elevation_deg: 65.0
+camera_azimuth_deg: -55.0
+# Human collider friction, authored as one UsdPhysics.Material bound to all 22
+# colliders (average-combined with the floor's 0.55/0.65 -> effective shoe-floor
+# mu ~1.0). Measured mu sweep (artifacts/humans/mu_sweep/, long-walk protocol):
+# mu_eff 0.30/0.525/1.00 -> walk slip p95 0.334/0.292/0.208 m/s, over-tolerance
+# frames 12.4/10.4/6.8%. Friction helps monotonically but cannot close the 0.15
+# gate alone in those archived trials. The current contact planner addresses
+# trajectory consistency; friction remains at the measured 1.45/1.30 setting.
+human_friction: [1.45, 1.30]
+# Per-joint PhysX velocity clamp (rad/s), authored on every revolute joint.
+# Walking peaks at 5-9 rad/s; the clamp only bounds the ballistic speeds a
+# drives-off fall reaches, closing the measured zero-damping solver-NaN
+# regime so fall_damping_scale can be 0 (fully passive limbs, user decision
+# 2026-09-26: any drive torque during the collapse reads as a statue).
+joint_velocity_limit_rad_s: 20.0
+slip_min_impulse_ns: 0.01
+slip_speed_tolerance_m_s: 0.15
+skin_penetration_tolerance_m: 0.005
+collision_fit:
+  enabled: true
+  margin_m: 0.003
+  foot_shape: convex_hull
+# Contact planner replaces the old 5-degree reference correction. Feet remain
+# physical bodies: only joint targets are written; no fixed-foot constraint.
+# root_bob follows the clip's root height (reach-clamped); swing_shape stays
+# the analytic quintic -- the amass variant exceeded the joint drive budget
+# (docs/progress.md 2026-09-25 对照专项).
+stance:
+  enabled: false
+contact_planner:
+  cycle_distance_m: 0.6
+  stance_fraction: 0.62
+  clearance_m: 0.03
+  swing_shape: quintic
+  root_bob: true
+# Mocap-derived pelvis feedforward: the reference COM's own acceleration applied
+# as m*a before the assist caps. Steady walking needs ~zero horizontal assist
+# force, so the spring only trims tracking error instead of supplying propulsion.
+reference_feedforward_scale: 1.0
+# Standing pose height as a fraction of the rig's natural standing height.
+# 1.0 fits a 3 deg knee, an axially rigid column that bounces on its floor
+# contact and skids the feet (stand slip p95 0.797 m/s, artifacts/humans/
+# keyboard 2026-09-25); 0.988 keeps a relaxed-stand ~8-20 deg of knee flexion
+# for compliance. The old walk-height pinning bent the stand to 37-43 deg.
+idle_stand_height_fraction: 0.988
+# Applies only to the legacy gait pathway when contact_cycle is absent.
+max_stance_slip_m_s: 0.15
+actions:
+  transition_s: 0.7
+  stopped_speed_m_s: 0.025
+  # Directional bias only, not a shove: at 350 N the backward pulse unloaded the
+  # knees and the collapse read as a rigid plank tipping about the ankles
+  # (measured joint activity ~1 deg/s median). A small bias keeps the fall
+  # direction consistent while gravity buckles the released knees.
+  fall_force_n: 60.0
+  fall_duration_s: 0.25
+  fall_control_scale: 0.0
+  # Passive joint viscosity during the collapse (2026-09-27 two-round A/B/C +
+  # D-G sweep, user judgement final): 0 = "a puddle of water" (knees fold to
+  # the limit at free-fall speed, 0.36 s to impact), >=0.04 = statue/plank
+  # (1.5 s). 0.005 (~0.3-0.75 Nm s/rad, the low end of measured passive human
+  # joint viscosity) reads and times like a real fall: impact at 0.94 s,
+  # supine with knees drawn up (hip 11-21 deg, knee 112-115 deg), peak joint
+  # speed 866 deg/s never reaching the 20 rad/s clamp -- the clamp is a pure
+  # solver-NaN guard. Evidence: docs/fall-release-2026-09-27.md.
+  fall_damping_scale: 0.005
+  fallen_height_fraction: 0.60
+  fallen_tilt_deg: 50.0
+crouch:
+  # 2026-09-26 换源: 全库筛对称深蹲(用户实测旧源=蹲走跨步帧, 像"跑步预备")。
+  # CMU/01_06 f744: 骨盆 0.386 m(站高 42%), 膝屈 130°, 双脚平贴间距 0.13 m,
+  # 双踝投影落地零残差; 筛选工具 scripts/humans/screen_squat_sources.py,
+  # 候选渲染 artifacts/humans/squat_candidates/。
+  file: data/humans/amass_raw/CMU/01/01_06_poses.npz
+  start_s: 6.2
+  duration_s: 0.1
+  contacts: [left_ankle, right_ankle]
+# Bend over (key B). CMU/115 subject 1, deepest in-limit flexion frame
+# (trunk ~84 deg, feet planted). The contact projection grounds both feet;
+# hands stay in the air, so only the ankles are declared.
+bend:
+  file: data/humans/amass_raw/CMU/115/115_01_poses.npz
+  start_s: 2.3
+  duration_s: 0.05
+  contacts: [left_ankle, right_ankle]
+# Floor sit (key N). Transitions/mocap/mazen_c3d sit_stand @2.675 s: an
+# in-limit seated frame (upright trunk, legs forward, hands behind). Retargeted
+# contacts measure a ~48 mm plane spread, so the projection grounds pelvis
+# (anchor) and pulls feet and hands onto the floor; residuals land in
+# report.json::postures.sit.projection.
+sit:
+  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/sit_stand_poses.npz
+  start_s: 2.675
+  duration_s: 0.05
+  contacts: [left_ankle, right_ankle, pelvis, left_hand, right_hand]
+# Get up from the floor (key G, only accepted in the latched fallen state).
+# CMU/140 trial 1: 6.9 s lying -> standing, zero axis residual and zero joint
+# limit excess on the multiaxis rig, ~0.77 m horizontal root travel. Played as
+# assisted playback anchored at the measured fallen position/heading.
+get_up:
+  file: data/humans/amass_raw/CMU/140/140_01_poses.npz
+# AMASS supplies upper-body motion. Legs are contact-retargeted with a closed
+# 0.6 m cycle, overlapping support and zero world velocity at touchdown.
+# Full provenance, old attribution correction and Isaac results:
+# docs/slip-resolution-2026-09-25.md. This remains assisted physics.
+gaits:
+  forward:
+    contact_cycle: {cycle_distance_m: 0.6, stance_fraction: 0.62, clearance_m: 0.03,
+                    swing_shape: quintic, root_bob: true}
+    file: data/humans/amass_raw/CMU/08/08_04_poses.npz
+    start_s: 1.9667
+    duration_s: 1.3083
+  backward:
+    contact_cycle: {cycle_distance_m: 0.6, stance_fraction: 0.62, clearance_m: 0.03,
+                    swing_shape: quintic, root_bob: true}
+    file: data/humans/amass_raw/CMU/08/08_11_poses.npz
+    start_s: 0.4
+    duration_s: 1.4833
+idle:
+  file: data/humans/amass_raw/Transitions_mocap/mazen_c3d/walkbackwards_stand_poses.npz
+  start_s: 3.4
+  duration_s: 0.1
+demo:
+  - {duration_s: 1.0, keys: []}
+  - {duration_s: 3.0, keys: [W]}
+  - {duration_s: 1.0, keys: [SPACE]}
+  - {duration_s: 1.5, keys: [A]}
+  - {duration_s: 1.2, keys: [S]}
+  - {duration_s: 1.5, keys: []}
+  - {duration_s: 0.1, keys: [R]}
+  - {duration_s: 1.0, keys: []}
+
+# Same 5 mm geometry tolerance above/below the floor; no support >50ms fails.
+quality:
+  support_skin_gap_m: 0.005
+  max_no_support_s: 0.05
+  slip_speed_m_s: 0.15
+  skin_penetration_m: 0.005
+  joint_error_deg: 15.0
+  min_contact_impulse_ns: 0.01
+  floor_z_m: 0.0
+  # --- 低姿支撑口径（2026-09-27 预登记：在下一轮实测之前写死，不按结果放宽）---
+  # 依据 artifacts/diag_getup_slerp 的实测：出厂起身段左右脚接触仅 2.8%/0.1%、地面法向
+  # 力中位 0 N、骨盆外力 888 帧里有 637 帧顶在 1.0 倍体重上限上。只认踝/脚的旧口径会把
+  # "被外力吊起来"判成合格、把"跪地/手掌撑地"判成失败，所以按活动分类另立门（详见
+  # src/sim2sense_fall/humans/quality.py 模块文档与 docs/human-simulation.md）。
+  # 脚类活动的 0.005 m 间隙门、0.15 m/s 滑速门与 15° 跟踪门一律不变。
+  low_posture_modes: [getting_up, sitting, sit]
+  primary_support_links: [ankle, foot, knee, hip, hand, wrist, elbow, pelvis, spine]
+  low_posture_skin_gap_m: 0.02       # 全身蒙皮最低点 p95 包络（换手/抬掌瞬间）
+  low_posture_slip_speed_m_s: 0.25   # 裸手与膝没有鞋底摩擦预算；脚底门仍 0.15
+  low_posture_joint_error_deg: 30.0  # 接触受限肢体跟不住自由参考；站姿门仍 15
+  min_ground_load_fraction: 0.2      # 地板必须承担 >=20% 体重（"到底踩住东西没有"）

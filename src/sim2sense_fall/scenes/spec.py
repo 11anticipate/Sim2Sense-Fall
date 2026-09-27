@@ -277,6 +277,7 @@ class SceneSpec:
     foundation: bool = True
     foundation_margin_m: float = 0.5
     foundation_thickness_m: float = 0.30
+    layout_scale_xy: float = 1.0
     source_path: Path | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
 
@@ -284,8 +285,11 @@ class SceneSpec:
         finite_number(self.frequency_hz, "frequency_hz")
         finite_number(self.foundation_margin_m, "foundation_margin_m")
         finite_number(self.foundation_thickness_m, "foundation_thickness_m")
+        finite_number(self.layout_scale_xy, "layout_scale_xy")
         if self.foundation_margin_m < 0 or self.foundation_thickness_m <= 0:
             raise ValueError("foundation margin must be non-negative and thickness positive")
+        if self.layout_scale_xy <= 0:
+            raise ValueError("layout_scale_xy must be positive")
         strict_seed(self.seed)
         strict_bool(self.foundation, "foundation")
         if not self.scene_id.strip():
@@ -362,6 +366,7 @@ def scene_spec_from_mapping(
             "foundation",
             "foundation_margin_m",
             "foundation_thickness_m",
+            "layout_scale_xy",
             "materials",
             "rooms",
         },
@@ -372,6 +377,11 @@ def scene_spec_from_mapping(
     if not isinstance(rooms_payload, list) or not rooms_payload:
         raise ValueError("scene must define a non-empty 'rooms' list")
     rooms = tuple(_room_from_mapping(entry, materials) for entry in rooms_payload)
+    layout_scale_xy = _as_float(payload, "layout_scale_xy", default=1.0)
+    if layout_scale_xy <= 0:
+        raise ValueError("layout_scale_xy must be positive")
+    if layout_scale_xy != 1.0:
+        rooms = tuple(_scale_room_xy(room, layout_scale_xy) for room in rooms)
     scene_id = payload.get("scene_id")
     if not isinstance(scene_id, str) or not scene_id.strip():
         raise ValueError("scene_id must be a non-empty string")
@@ -385,7 +395,63 @@ def scene_spec_from_mapping(
         foundation=strict_bool(payload.get("foundation", True), "foundation"),
         foundation_margin_m=_as_float(payload, "foundation_margin_m", default=0.5),
         foundation_thickness_m=_as_float(payload, "foundation_thickness_m", default=0.30),
+        layout_scale_xy=layout_scale_xy,
         source_path=source_path,
+    )
+
+
+def _scale_room_xy(room: RoomSpec, factor: float) -> RoomSpec:
+    """Scale a room footprint and its contents in the horizontal plane."""
+
+    openings = tuple(
+        OpeningSpec(
+            wall=opening.wall,
+            kind=opening.kind,
+            width=opening.width * factor,
+            height=opening.height,
+            offset=opening.offset * factor,
+            sill_height=opening.sill_height,
+            leaf=opening.leaf,
+        )
+        for opening in room.openings
+    )
+    furniture = tuple(
+        FurnitureSpec(
+            id=item.id,
+            kind=item.kind,
+            position=(item.position[0] * factor, item.position[1] * factor),
+            rotation_z_deg=item.rotation_z_deg,
+            size=None
+            if item.size is None
+            else (item.size[0] * factor, item.size[1] * factor, item.size[2]),
+            material=item.material,
+            physics=item.physics,
+            density_kg_m3=item.density_kg_m3,
+            elevation_m=item.elevation_m,
+            static_friction=item.static_friction,
+            dynamic_friction=item.dynamic_friction,
+            restitution=item.restitution,
+            movable=item.movable,
+            tags=item.tags,
+        )
+        for item in room.furniture
+    )
+    return RoomSpec(
+        id=room.id,
+        room_type=room.room_type,
+        origin=(room.origin[0] * factor, room.origin[1] * factor),
+        size=(room.size[0] * factor, room.size[1] * factor),
+        wall_material=room.wall_material,
+        floor_material=room.floor_material,
+        ceiling_material=room.ceiling_material,
+        wall_height=room.wall_height,
+        wall_thickness=room.wall_thickness,
+        floor_thickness=room.floor_thickness,
+        ceiling_thickness=room.ceiling_thickness,
+        walls=room.walls,
+        openings=openings,
+        furniture=furniture,
+        ceiling_enabled=room.ceiling_enabled,
     )
 
 

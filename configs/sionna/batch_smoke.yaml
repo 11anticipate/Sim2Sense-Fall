@@ -1,0 +1,12 @@
+# 阶段 8 smoke 批量：三个方向的推力摔倒试验 + 纯行走 ADL 会话。
+# 展开为 run_batch.sh 后按顺序执行；中断后重新展开即续跑（幂等）。
+description: 阶段8 smoke——推力方向 x3 摔倒 + 行走/站立 ADL
+trials:
+  - {motion: stand_neutral, perturbation: push_backward}
+  - {motion: stand_neutral, perturbation: push_forward}
+  - {motion: stand_neutral, perturbation: push_left}
+sessions:
+  - config: configs/humans/keyboard.yaml
+    name: walk
+rt_frames: 12
+render_frames: true

@@ -1,0 +1,32 @@
+# 训练前批量包（B 线）。由 scripts/humans/make_dataset_configs.py --print-plan 生成，
+# 会话配置须先由该脚本产出并通过净空审计。展开：
+#   python3 scripts/sionna/batch_generate.py --plan configs/sionna/batch_train01.yaml \
+#       --out artifacts/batches/train01   &&   bash artifacts/batches/train01/run_batch.sh
+description: 训练前批量包：4 类摔倒触发 + 行走/姿势 ADL + 2 类摔倒后起身
+trials: []
+sessions:
+- config: configs/humans/dataset/fall_standing.yaml
+  name: fall_standing
+- config: configs/humans/dataset/fall_walking.yaml
+  name: fall_walking
+- config: configs/humans/dataset/fall_turning.yaml
+  name: fall_turning
+- config: configs/humans/dataset/fall_backward.yaml
+  name: fall_backward
+- config: configs/humans/dataset/adl_locomotion.yaml
+  name: adl_locomotion
+- config: configs/humans/dataset/adl_postures.yaml
+  name: adl_postures
+- config: configs/humans/dataset/fall_getup_standing.yaml
+  name: fall_getup_standing
+- config: configs/humans/dataset/fall_getup_walking.yaml
+  name: fall_getup_walking
+# 120 Hz 固定前端（09-26 预登记口径）。--frames 是步长上限而非采样率，
+# 24 帧/样本实测只有 5–40 Hz；改为按蒙皮自身节拍全率追踪，实测 492 帧/4.1 s 摔倒样本 33 s。
+rt_target_hz: 120
+rt_frames: 24
+# RT 报告里登记的分桶状态；真正的划分由 scripts/sionna/assign_splits.py 事后生成
+# splits.json（分组单位=物理会话，绝不按样本切分）。
+split_label: train01_grouped_by_session_pending_splits_json
+render_frames: false
+

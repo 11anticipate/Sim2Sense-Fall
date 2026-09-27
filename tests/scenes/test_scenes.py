@@ -95,7 +95,8 @@ def test_shipping_scene_loads(scene_spec: SceneSpec) -> None:
         "bedroom_2",
     }
     assert scene_spec.frequency_hz == pytest.approx(2.4e9)
-    assert scene_spec.footprint == (0.0, 0.0, 8.4, 7.0)
+    assert scene_spec.layout_scale_xy == pytest.approx(2.20)
+    assert scene_spec.footprint == pytest.approx((0.0, 0.0, 18.48, 15.40))
 
 
 def test_shared_walls_are_not_built_twice(scene_spec: SceneSpec) -> None:
@@ -249,8 +250,8 @@ def test_shipping_scene_plan(scene_spec: SceneSpec) -> None:
     stats = plan.stats
     assert stats["room_count"] == 6
     assert stats["prim_count"] == stats["geometry_count"] + stats["rigid_body_count"]
-    assert stats["total_floor_area_m2"] == pytest.approx(58.8)
-    assert stats["footprint_m"] == [8.4, 7.0]
+    assert stats["total_floor_area_m2"] == pytest.approx(284.592)
+    assert stats["footprint_m"] == pytest.approx([18.48, 15.40])
     assert stats["rigid_body_count"] == 1
     assert stats["rigid_body_mass_kg"] == pytest.approx(13.56, abs=0.5)
     assert "wall" in stats["primitives_by_category"]

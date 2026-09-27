@@ -1,0 +1,19 @@
+# Pre-registered gates for walk stride symmetry, set before the long-walk Isaac
+# verdict runs of 2026-09-24 (artifacts/humans/limp_ab/). The user complaint is
+# "the left leg strides visibly wider than the right"; the measured signature of
+# that complaint in the pre-fix runs was a constant fore-aft offset between the
+# feet (stagger 255 mm forward), not the per-cycle stride ratio, which was already
+# 0.98 before the fix. So the stagger gate is the load-bearing one:
+#   - 255 mm (old windows, physics) = clearly visible limp -- must fail;
+#   - 25.5 mm (new windows, same protocol, recorded A/B) = the number the fix
+#     must hold below. 50 mm is ~4% of the ~1.2 m stride, well under anything a
+#     viewer describes as limping.
+max_stagger_m: 0.05
+min_stride_ratio: 0.90
+max_stride_ratio: 1.11
+weight_floor: 0.95
+# A cycle is scored between two phase-wrap boundaries, so its frame-to-frame
+# span is one playback step short of 1.0 (0.997 at 0.4 m/s, 120 Hz). 0.98 still
+# rejects the partial walks that motivated the whole-cycle rule (the A/B demo's
+# forward segment spans 0.88 phase with no wrap; its backward segment 0.2).
+min_cycle_fraction: 0.98

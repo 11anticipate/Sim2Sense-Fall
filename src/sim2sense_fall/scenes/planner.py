@@ -237,6 +237,7 @@ class ScenePlan:
     scene_id: str
     frequency_hz: float
     seed: int
+    layout_scale_xy: float
     description: str
     prims: tuple[ScenePrim, ...]
     lights: tuple[LightSpec, ...]
@@ -262,6 +263,7 @@ class ScenePlan:
             "scene_id": self.scene_id,
             "description": self.description,
             "seed": self.seed,
+            "layout_scale_xy": self.layout_scale_xy,
             "frequency_hz": self.frequency_hz,
             "generator": "sim2sense_fall.scenes.planner",
             "materials": {name: dict(entry) for name, entry in self.materials.items()},
@@ -829,6 +831,7 @@ def plan_scene(spec: SceneSpec) -> ScenePlan:
         scene_id=spec.scene_id,
         frequency_hz=spec.frequency_hz,
         seed=spec.seed,
+        layout_scale_xy=spec.layout_scale_xy,
         description=spec.description,
         prims=tuple(prims),
         lights=tuple(lights),

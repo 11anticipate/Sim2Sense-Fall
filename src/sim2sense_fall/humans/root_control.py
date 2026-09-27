@@ -1,0 +1,148 @@
+"""Finite external root assistance for physics-based reference tracking.
+
+This is an explicit external actuator, not an unassisted balance controller.
+The root is integrated by PhysX; no pose or velocity is overwritten by it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+import yaml
+
+from .rotations import matrix_to_axis_angle, quaternion_to_matrix
+
+
+@dataclass(frozen=True, slots=True)
+class RootAssistConfig:
+    position_stiffness_n_m: float
+    position_damping_ns_m: float
+    rotation_stiffness_nm_rad: float
+    rotation_damping_nms_rad: float
+    max_force_n: float
+    max_torque_nm: float
+    gravity_compensation_fraction: float
+    max_vertical_lift_fraction_of_weight: float
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"root assistance {name} must be finite and non-negative")
+        if min(self.max_force_n, self.max_torque_nm) <= 0:
+            raise ValueError("root assistance force and torque limits must be positive")
+        if self.gravity_compensation_fraction > 1:
+            raise ValueError("gravity compensation fraction must not exceed 1")
+        if self.max_vertical_lift_fraction_of_weight > 1:
+            raise ValueError(
+                "max_vertical_lift_fraction_of_weight is a fraction of body weight and must "
+                "not exceed 1"
+            )
+        if self.max_vertical_lift_fraction_of_weight < self.gravity_compensation_fraction:
+            raise ValueError(
+                "max_vertical_lift_fraction_of_weight is below gravity_compensation_fraction, "
+                "which would clip the compensation itself instead of the feedback term. To "
+                "lift less, lower gravity_compensation_fraction and set the cap to match it"
+            )
+
+    @classmethod
+    def load(cls, path: Path) -> RootAssistConfig:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or set(payload) != set(cls.__dataclass_fields__):
+            raise ValueError("root assistance YAML must specify exactly the config fields")
+        return cls(**{key: float(value) for key, value in payload.items()})
+
+
+def blend_assist_configs(
+    base: RootAssistConfig, override: RootAssistConfig, weight: float
+) -> RootAssistConfig:
+    """Interpolate every assistance knob between two declared profiles.
+
+    Used to ramp the pelvis actuator into a lower-authority profile while the body is
+    recovering on the floor, without a step change in force: the caller moves ``weight``
+    smoothly over its own transition time. Both endpoints are validated configs, and
+    every field is linear, so ``max_vertical_lift_fraction_of_weight`` stays above
+    ``gravity_compensation_fraction`` (the invariant ``RootAssistConfig`` enforces) at
+    every intermediate weight.
+    """
+
+    if not np.isfinite(weight) or not 0.0 <= weight <= 1.0:
+        raise ValueError(f"blend weight must be in [0,1], got {weight!r}")
+    base_values, override_values = asdict(base), asdict(override)
+    if set(base_values) != set(override_values):
+        raise ValueError("assistance profiles must declare the same fields")
+    return RootAssistConfig(**{
+        key: float(base_values[key]) * (1.0 - weight) + float(override_values[key]) * weight
+        for key in base_values
+    })
+
+
+def root_wrench(
+    config: RootAssistConfig,
+    *,
+    position: np.ndarray,
+    quaternion: np.ndarray,
+    linear_velocity: np.ndarray,
+    angular_velocity: np.ndarray,
+    target_position: np.ndarray,
+    target_quaternion: np.ndarray,
+    target_linear_velocity: np.ndarray,
+    target_angular_velocity: np.ndarray,
+    mass_kg: float,
+    gravity_m_s2: float,
+    feedforward_accel_m_s2: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a norm-limited world-frame force and torque at the root COM.
+
+    The vertical component is capped at
+    ``max_vertical_lift_fraction_of_weight * mass_kg * gravity_m_s2``. Without that cap the
+    position spring adds lift on top of the configured gravity compensation, and the
+    actuator quietly carries more of the weight than the configuration says: measured over
+    a 17 s cycle session the vertical assist was 581 N against a configured 494 N (0.82 of
+    body weight against a configured 0.70), of which ~89 N was the vertical spring term.
+
+    That matters because the shear a foot can transmit is ``mu * N``, and every newton the
+    actuator lifts is a newton the feet do not carry. See docs/foot-friction-audit.md: at
+    0.82 of body weight the ground carried 0.17 of it, leaving 64 N of grip where a real
+    person on the same floor has 353 N. The cap makes the configuration mean what it says;
+    the feedback term may still push the root *down* or sideways, and may still contribute
+    lift, but not past the declared fraction.
+
+    ``feedforward_accel_m_s2`` is the reference motion's whole-body COM acceleration
+    (Newton-Euler on the reference kinematics), applied as ``m * a`` before the caps:
+    horizontally in full -- steady walking has ~zero COM acceleration, so this replaces
+    the spring as the *deliberate* source of propulsive force and the spring trims only
+    tracking error -- and vertically under the same ``gravity_compensation_fraction`` the
+    constant lift uses, so the actuator's declared weight-support fraction follows the
+    reference motion's own load profile instead of a flat average. The feedforward is
+    still external assistance, not balance: it is open-loop, and the springs remain.
+    """
+
+    for vector, size in ((position, 3), (quaternion, 4), (linear_velocity, 3),
+                         (angular_velocity, 3), (target_position, 3),
+                         (target_quaternion, 4), (target_linear_velocity, 3),
+                         (target_angular_velocity, 3)):
+        if np.shape(vector) != (size,) or not np.isfinite(vector).all():
+            raise ValueError(f"root controller expects a finite ({size},) state vector")
+    if not np.isfinite([mass_kg, gravity_m_s2]).all() or min(mass_kg, gravity_m_s2) <= 0:
+        raise ValueError("mass and gravity must be finite and positive")
+    force = (config.position_stiffness_n_m * (target_position - position)
+             + config.position_damping_ns_m * (target_linear_velocity - linear_velocity))
+    force[2] += config.gravity_compensation_fraction * mass_kg * gravity_m_s2
+    if feedforward_accel_m_s2 is not None:
+        if (np.shape(feedforward_accel_m_s2) != (3,)
+                or not np.isfinite(feedforward_accel_m_s2).all()):
+            raise ValueError("feedforward acceleration must be a finite (3,) vector")
+        force[:2] += mass_kg * feedforward_accel_m_s2[:2]
+        force[2] += config.gravity_compensation_fraction * mass_kg * feedforward_accel_m_s2[2]
+    lift_cap = config.max_vertical_lift_fraction_of_weight * mass_kg * gravity_m_s2
+    force[2] = min(float(force[2]), float(lift_cap))
+    rotation_error = matrix_to_axis_angle(
+        quaternion_to_matrix(target_quaternion) @ quaternion_to_matrix(quaternion).T
+    )
+    torque = (config.rotation_stiffness_nm_rad * rotation_error
+              + config.rotation_damping_nms_rad * (target_angular_velocity - angular_velocity))
+    force *= min(1.0, config.max_force_n / max(float(np.linalg.norm(force)), 1e-12))
+    torque *= min(1.0, config.max_torque_nm / max(float(np.linalg.norm(torque)), 1e-12))
+    return force, torque

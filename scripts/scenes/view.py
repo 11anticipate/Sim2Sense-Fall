@@ -94,19 +94,17 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 1
     try:
         import omni.usd
-        from omni.kit.viewport.utility import get_active_viewport
 
-        from sim2sense_fall.scenes.view import configure_inspection_view
+        from sim2sense_fall.scenes.view import apply_inspection_view
 
         for _ in range(5):
             app.update()
-        camera_path = configure_inspection_view(
-            omni.usd.get_context().get_stage(), mode=args.view, aspect_ratio=1600 / 900
+        apply_inspection_view(
+            omni.usd.get_context().get_stage(),
+            mode=args.view,
+            aspect_ratio=1600 / 900,
+            require_viewport=True,
         )
-        viewport = get_active_viewport()
-        if viewport is None:
-            raise RuntimeError("Isaac Sim did not create an active viewport")
-        viewport.camera_path = camera_path
         LOGGER.info("inspection view: %s (temporary session layer)", args.view)
         if args.activate_physics or args.settle_seconds > 0:
             from sim2sense_fall.scenes.usd import activate_physics, step_simulation

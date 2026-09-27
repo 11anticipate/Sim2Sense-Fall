@@ -54,6 +54,7 @@ def load_scene_manifest(path: Path) -> ScenePlan:
             scene_id=payload["scene_id"],
             frequency_hz=payload["frequency_hz"],
             seed=payload["seed"],
+            layout_scale_xy=payload.get("layout_scale_xy", 1.0),
             description=payload["description"],
             prims=tuple(prims),
             lights=lights,
