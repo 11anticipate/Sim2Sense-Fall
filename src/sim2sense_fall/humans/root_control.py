@@ -54,6 +54,30 @@ class RootAssistConfig:
         return cls(**{key: float(value) for key, value in payload.items()})
 
 
+def blend_assist_configs(
+    base: RootAssistConfig, override: RootAssistConfig, weight: float
+) -> RootAssistConfig:
+    """Interpolate every assistance knob between two declared profiles.
+
+    Used to ramp the pelvis actuator into a lower-authority profile while the body is
+    recovering on the floor, without a step change in force: the caller moves ``weight``
+    smoothly over its own transition time. Both endpoints are validated configs, and
+    every field is linear, so ``max_vertical_lift_fraction_of_weight`` stays above
+    ``gravity_compensation_fraction`` (the invariant ``RootAssistConfig`` enforces) at
+    every intermediate weight.
+    """
+
+    if not np.isfinite(weight) or not 0.0 <= weight <= 1.0:
+        raise ValueError(f"blend weight must be in [0,1], got {weight!r}")
+    base_values, override_values = asdict(base), asdict(override)
+    if set(base_values) != set(override_values):
+        raise ValueError("assistance profiles must declare the same fields")
+    return RootAssistConfig(**{
+        key: float(base_values[key]) * (1.0 - weight) + float(override_values[key]) * weight
+        for key in base_values
+    })
+
+
 def root_wrench(
     config: RootAssistConfig,
     *,

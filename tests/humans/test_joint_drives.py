@@ -212,10 +212,26 @@ def test_damping_scale_rescales_the_authored_damping_and_restores() -> None:
     np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 50.0))
 
 
+def test_zero_damping_scale_is_a_legal_fully_passive_collapse() -> None:
+    """damping_scale 0 = fully passive limbs (no drive torque at all).
+
+    The ballistic-collapse NaN regime this used to be refused for is closed by
+    the per-joint maxJointVelocity clamp at authoring time, not by residual
+    damping: the clamp bounds the joint speeds, hence the floor-impact energy.
+    """
+
+    runtime = _runtime(stiffness=250.0, damping=50.0)
+    assert HumanRuntime.set_control_scale(runtime, 0.0, damping_scale=0.0)
+    np.testing.assert_allclose(runtime.articulation.damping, np.zeros(14))
+    for _ in range(10):
+        assert HumanRuntime.set_control_scale(runtime, 0.0, damping_scale=0.0)
+    np.testing.assert_allclose(runtime.articulation.damping, np.zeros(14))
+    assert HumanRuntime.set_control_scale(runtime, 1.0)
+    np.testing.assert_allclose(runtime.articulation.damping, np.full(14, 50.0))
+
+
 def test_out_of_range_damping_scale_is_refused() -> None:
-    with pytest.raises(ValueError, match=r"within \(0, 1\]"):
-        HumanRuntime.set_control_scale(_runtime(), 0.0, damping_scale=0.0)
-    with pytest.raises(ValueError, match=r"within \(0, 1\]"):
+    with pytest.raises(ValueError, match=r"within \[0, 1\]"):
         HumanRuntime.set_control_scale(_runtime(), 0.0, damping_scale=1.5)
 
 

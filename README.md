@@ -12,18 +12,18 @@
 - 评测重点：漏报率、误报率、F1、报警延迟、跨域性能、仿真到真实差距。
 - 隐私表述：项目以“不采集视频、最小化保存人体网格、限制原始无线数据访问”为隐私目标；不能把无线感知直接宣称为绝对零隐私风险。
 
-## 当前状态（2026-09-25）
+## 当前状态（2026-09-27）
 
 固定公寓、SMPL 蒙皮、多轴 PhysX 人体和真实 AMASS 导入已运行；键盘可控制前进、后退、
-转向和停止，并显示实际物理姿态。当前使用有限根外力辅助，**整体动作质量尚未通过验收**：
-行走滑步已实施接触一致控制，实测与适用边界见 [滑步专项](docs/slip-resolution-2026-09-25.md)。
-蹲/起接触、部分动作穿地/穿墙及右臂自然性仍未完成统一验收。
+转向、停止、蹲下（`C`）、起立（`V`）、弯腰（`B`）、坐地（`N`）、摔倒（`F`）与
+摔倒后起身（`G`）。当前仍使用有界根外力辅助，**不是自主平衡**；行走/转向/启停/站立与
+蹲姿保持已过实测门，起身与姿势过渡仍未过门。逐活动实测门见
+[人体仿真指南](docs/human-simulation.md)，起身悬空的定位与修复见
+[起身悬空专项](docs/getup-float-2026-09-27.md)，摔倒释放见 [摔倒释放专项](docs/fall-release-2026-09-27.md)。
 
-蹲下、起立和摔倒及其切换已实现，但蹲/起质量仍未通过；路线由用户键盘控制，不做主动避障。
-起立按蹲姿回站姿规划，R 仍是显式复位。任务与验收顺序见 [当前计划](task_plan.md)。
-
-历史曾运行固定公寓 + 实际物理后推跌倒 → Sionna 复数 CIR smoke，相关旧产物现已删除；
-当前按动作先行约定暂停数据生产。规模数据、动态家具同步、检测训练、域随机化与真实数据验证仍未完成。
+数据生产已按新代码恢复：批量包 `train01`（8 个键盘会话，120 Hz 原生蒙皮 → 分段导出 →
+Sionna 复数 CIR → 分组感知划分）。规模数据、动态家具同步、跨场景/跨受试者泛化、
+真实数据验证仍未完成。任务与验收顺序见 [当前计划](task_plan.md)。
 现行指南、证据记录与历史文档统一从 [文档索引](docs/README.md) 查阅。
 
 ## 目录
@@ -114,8 +114,29 @@ python3 scripts/humans/keyboard.py --dry-run --out artifacts/humans/keyboard_dry
 ~/isaacsim/python.sh scripts/humans/keyboard.py
 ```
 
-W/S 前后移动，A/D 转向，空格停止，R 复位，Esc 退出。蹲下、起立和摔倒键位仍待实现。
+W/S 前后移动，A/D 转向（仅在按住 W/S 时生效），空格停止，R 复位，Esc 退出；
+`C` 蹲下、`V` 起立、`B` 弯腰、`N` 坐地、`F` 摔倒、`G` 摔倒后起身。
 当前操作说明、记录文件及已知问题见 [键盘控制](docs/keyboard-control.md)。
+
+## 训练前数据流水线
+
+```bash
+# 1) 出生点净空审计（spawn 必须来自审计结果，不允许凭空坐标）
+PYTHONPATH=src python3 scripts/humans/audit_spawn_clearance.py --human-radius-m 0.9 --pick 8 \
+    --out artifacts/humans/spawn_clearance_activity.json
+# 2) 生成数据集会话配置 + 批量计划
+PYTHONPATH=src python3 scripts/humans/make_dataset_configs.py
+# 3) 展开为幂等脚本并执行（Isaac 会话 → 分段导出 → Sionna CIR；中断可重跑）
+PYTHONPATH=src python3 scripts/sionna/batch_generate.py --plan configs/sionna/batch_train01.yaml \
+    --out artifacts/batches/train01 && bash artifacts/batches/train01/run_batch.sh
+# 4) 分组感知划分（分组单位=物理会话，绝不按样本切分）
+PYTHONPATH=src python3 scripts/sionna/assign_splits.py --batch artifacts/batches/train01 \
+    --seed 20260927 --fractions 0.6,0.2,0.2
+# 5) 训练入口消费 splits
+~/.local/opt/sionna/bin/python scripts/sionna/train_baseline.py \
+    --sionna-dir artifacts/batches/train01/sionna --splits artifacts/batches/train01/splits.json \
+    --eval-split test --device cuda
+```
 
 ## 室内场景
 

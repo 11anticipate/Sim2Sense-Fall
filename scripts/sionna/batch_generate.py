@@ -33,6 +33,10 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from sim2sense_fall.humans.quality import SCHEMA_VERSION  # noqa: E402
 
 DEFAULT_ISAAC_PYTHON = Path.home() / "isaacsim" / "python.sh"
 DEFAULT_SIONNA_PYTHON = Path.home() / ".local" / "opt" / "sionna" / "bin" / "python"
@@ -48,7 +52,14 @@ class BatchPlan:
     trials: list[dict[str, str]] = field(default_factory=list)
     sessions: list[dict[str, str]] = field(default_factory=list)
     rt_frames: int = 12
+    # When set, every RT stage traces at this channel rate instead of a frame count
+    # (`--frames` is a stride maximum, so 96 requested frames of a 492-frame 120 Hz
+    # segment silently become 82 frames at 20 Hz).
+    rt_target_hz: float | None = None
     render_frames: bool = False
+    # Recorded into every RT report. The split itself is assigned afterwards by
+    # scripts/sionna/assign_splits.py; this only says what the batch promises.
+    split_label: str = "smoke_only_not_train_test"
 
 
 def _identifier(value: Any, field_name: str) -> str:
@@ -75,7 +86,10 @@ def load_plan(path: Path) -> BatchPlan:
         trials=list(payload.get("trials") or []),
         sessions=list(payload.get("sessions") or []),
         rt_frames=int(payload.get("rt_frames", 12)),
+        rt_target_hz=(None if payload.get("rt_target_hz") is None
+                      else float(payload["rt_target_hz"])),
         render_frames=bool(payload.get("render_frames", False)),
+        split_label=str(payload.get("split_label", "smoke_only_not_train_test")),
     )
     for trial in plan.trials:
         if not {"motion", "perturbation"} <= set(trial):
@@ -92,6 +106,8 @@ def load_plan(path: Path) -> BatchPlan:
         raise ValueError("the plan declares no work")
     if not 2 <= plan.rt_frames <= 512:
         raise ValueError("rt_frames must be within [2, 512]")
+    if plan.rt_target_hz is not None and not 1.0 <= plan.rt_target_hz <= 2000.0:
+        raise ValueError("rt_target_hz must be within [1, 2000]")
     return plan
 
 
@@ -108,13 +124,23 @@ def usable_trial(trials_dir: Path, motion: str, perturbation: str) -> Path | Non
 
 
 def session_accepted(report_path: Path) -> bool:
+    """Did the session *run*, not was every activity good.
+
+    Admission is per segment (`export_session_mesh._activity_gate`), and the
+    aggregate `motion_accuracy_accepted` flag is dragged down by any single failing
+    activity -- so gating the batch's idempotency on it made the driver re-run
+    perfectly usable sessions forever (train01 re-emitted 7 of 8 sessions). The
+    exporter keeps its own invariants (completed, no errors, current measurement
+    schema) as the hard gate, and this mirrors exactly those.
+    """
+
     if not report_path.is_file():
         return False
     report = json.loads(report_path.read_text(encoding="utf-8"))
     return bool(
         report.get("runtime_completed") is True
         and not report.get("errors")
-        and report.get("motion_accuracy_accepted") is True
+        and (report.get("motion_quality") or {}).get("schema_version") == SCHEMA_VERSION
     )
 
 
@@ -135,6 +161,8 @@ def admitted_session_sources(export_dir: Path) -> list[dict[str, Any]]:
 
 
 def rt_done(sionna_dir: Path, sample_id: str) -> bool:
+    """``sionna_dir`` may be a per-session namespace; see the session loop below."""
+
     report = sionna_dir / f"{sample_id}.import.json"
     if not report.is_file():
         return False
@@ -144,11 +172,16 @@ def rt_done(sionna_dir: Path, sample_id: str) -> bool:
 def expand(plan: BatchPlan, args: argparse.Namespace) -> tuple[list[str], list[dict[str, str]]]:
     """Return the pending shell commands plus the expected sample manifest."""
 
+    def rate_args() -> list[str]:
+        return (["--target-hz", str(plan.rt_target_hz)] if plan.rt_target_hz
+                else ["--frames", str(plan.rt_frames)])
+
     def rt_command(sample_id: str, argv: list[str]) -> str:
         # Rare GPU scheduling transients (~2 in 9 runs) can fail the strict
         # static-repeat check; a failed sample leaves no import.json, so the
         # next re-expansion re-emits it. The batch must not abort on it.
         return shlex.join(argv) + " || " + shlex.join([
+
             "echo", f"transient-failure: {sample_id}",
         ]) + f" >> {shlex.quote(str(args.out / 'batch_failures.log'))}"
 
@@ -185,7 +218,8 @@ def expand(plan: BatchPlan, args: argparse.Namespace) -> tuple[list[str], list[d
         if not rt_done(sionna_dir, sample_id):
             commands.append(rt_command(sample_id, [
                 str(args.sionna_python), "scripts/sionna/import_fall_mesh.py",
-                "--frames", str(args.rt_frames), "--out", str(sionna_dir),
+                *rate_args(), "--out", str(sionna_dir),
+                "--split", plan.split_label,
                 *(["--render-frames"] if plan.render_frames else []),
                 "--trial-json", str(trial_json),
             ]))
@@ -209,16 +243,22 @@ def expand(plan: BatchPlan, args: argparse.Namespace) -> tuple[list[str], list[d
         # the summarize pass (or a re-expansion) enumerate the admitted ones.
         expected.append({"sample_id": f"{name}::*", "activity": "adl", "source": str(export_dir)})
         if (export_dir / "manifest.json").is_file():
+            # Segment ids are per-session (`stand_00`, `walk_00`, ...), so writing every
+            # session's samples into one directory makes them overwrite each other: the
+            # first train01 batch produced 9 CIR files from 26 admitted segments. Each
+            # session therefore gets its own namespace under sionna/.
+            session_out = sionna_dir / name
             for row in admitted_session_sources(export_dir):
                 sample_id = row["sample_id"]
                 expected.append({
-                    "sample_id": sample_id, "activity": "adl",
+                    "sample_id": f"{name}/{sample_id}", "activity": "adl",
                     "source": str(row["export_dir"] / f"{sample_id}.mesh.npz"),
                 })
-                if not rt_done(sionna_dir, sample_id):
-                    commands.append(rt_command(sample_id, [
+                if not rt_done(session_out, sample_id):
+                    commands.append(rt_command(f"{name}/{sample_id}", [
                         str(args.sionna_python), "scripts/sionna/import_fall_mesh.py",
-                        "--frames", str(args.rt_frames), "--out", str(sionna_dir),
+                        *rate_args(), "--out", str(session_out),
+                        "--split", plan.split_label,
                         *(["--render-frames"] if plan.render_frames else []),
                         "--dir", str(export_dir), "--sample", sample_id,
                     ]))
@@ -227,7 +267,7 @@ def expand(plan: BatchPlan, args: argparse.Namespace) -> tuple[list[str], list[d
 
 def summarize(sionna_dir: Path) -> dict[str, Any]:
     rows = []
-    for report_path in sorted(sionna_dir.glob("*.import.json")):
+    for report_path in sorted(sionna_dir.glob("**/*.import.json")):
         report = json.loads(report_path.read_text(encoding="utf-8"))
         rows.append({
             "sample_id": report.get("channel_sample_id") or report_path.stem,
@@ -270,6 +310,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if summary["failures"] else 0
 
     commands, expected = expand(plan, args)
+    # The batch root must exist before the script can be written into it: a fresh
+    # plan has no stage output to create it, and the first expansion of
+    # artifacts/batches/<name> died with FileNotFoundError on run_batch.sh.
+    args.out.mkdir(parents=True, exist_ok=True)
     script_path = args.out / "run_batch.sh"
     header = (
         "#!/usr/bin/env bash\n"

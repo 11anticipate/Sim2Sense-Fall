@@ -3,6 +3,110 @@
 本文件保留各轮原始记录；正文中的“当前”“下一步”“仍未做”只对应其日期和配置。
 当前状态与任务统一见 [计划](../task_plan.md)，全部指南与历史审计见 [文档索引](README.md)。
 
+## 2026-09-27 训练前数据链路：批量包 train01 落地，正式训练的入口打通
+
+用户指令：把正式模型训练之前的任务做完。数据卡见 [dataset-train01](dataset-train01.md)。
+
+- **净空审计先行**（P1-B「出生点/复位点支撑面与人体净空」闭环）：`audit_spawn_clearance.py`
+  逐格检查 6 个房间地板，站立包络（r=0.30 m）净空率 23.8–76.9%、活动包络（r=0.90 m）
+  0–72.3%；`make_dataset_configs.py` **强制**会话 spawn 来自审计清单，凭空坐标直接报错。
+- **批量包 train01**：8 个键盘会话（站立摔/行走中摔/转向中摔/后退中摔 + 行走 ADL +
+  姿势 ADL + 2 个摔倒后起身），`--native-mesh` 120 Hz 原生蒙皮 → 46 段 →
+  **31 段过分段门并完成 Sionna 复数 CIR**（72.6 s 通过准入的蒙皮真值）。
+  未过门的 15 段（起身、坐/蹲/弯腰过渡、起立交接）按门拒收，未放宽任何阈值。
+- **分组感知划分**：新增 `detection_split.py` + `scripts/sionna/assign_splits.py`。
+  分组单位=物理会话（同会话分段共享连续轨迹与接触历史），哈希 (seed,label,group) 定序，
+  分层保证每个标签在组数足够时三个 split 都有；泄漏检查为空；
+  `crouch/sit` 只有 1 组 → 显式记为 `insufficient_groups`，不假装被跨组评测过。
+  train/val/test = 16/11/4 样本。训练入口新增 `--splits/--eval-split`。
+- **正样本为 0 的硬阻塞已定位并修掉**：键盘会话没有试验那样的显式失衡起点，
+  而标签规则要求 onset 才给正样本 → 第一次训练冒烟 `fall windows in train: 0`。
+  新增 `session_event_times()` 从**实测根高**导出：取冲击前「骨盆仍在摔倒前高度 5 cm 以内」
+  的最后一帧（高度口径而非速度口径，接触回弹抹不掉标签），总降幅 <0.15 m 则不给标签
+  （fail-closed），并在 `ChannelSample.onset_source` 里标明这是导出值不是人工标注。
+  实测导出点落在按键请求后 0.15–0.43 s、冲击前 0.17–0.52 s——**请求时间≠失衡起点**
+  这条旧警告现在是量出来的。修后 train 有 90 个摔倒窗。
+- **链路验证（非性能结论）**：分组留出整会话 `fall_walking` 后，窗口准确率 0.88–0.95、
+  速度头 MAE 6.33 Hz（120 Hz mesh 峰值多普勒标签解析成功）。报告仍自标
+  `flow_smoke_only`：31 样本 / 单受试者 / 单场景 / 单 seed，n=1 会话留出。
+- **本批未达预登记口径（如实）**：信道侧实测 5–40 Hz，而 09-26 预登记要求 120 Hz 固定前端。
+  成本已量：24 帧/样本约 60 s → 摔倒段提到 120 Hz（480 帧）约 20 min/样本、全批约 10 h。
+  属用户决策项（整批加密 vs 仅摔倒段加密），未擅自省算力或谎报达标。
+- **顺带修掉的三个会埋雷的缺陷**（均带回归测试）：
+  RT 输出按会话命名空间分目录——此前不同会话的同名分段（每段都有 `stand_00`）写进同一目录
+  互相覆盖，26 个准入段只剩 9 个 CIR；`detection_data` 的样本身份改为路径命名空间限定，
+  平铺目录保持旧行为。`batch_generate.session_accepted` 曾把「聚合动作合格」当幂等条件，
+  导致 7/8 会话被无限重跑，现按导出器的分段准入语义只看运行完整性。
+- CPU 门禁：compileall 干净、ruff 全过、pytest **480 passed / 12 skipped**（469→480）。
+  IsaacLab venv 下的 OpenUSD 相关 7 项与 sionna-import 2 项在该环境失败（缺 `PhysxSchema`、
+  该 venv 恰好装了 sionna），与本轮改动无关，系统 Python 下它们是被跳过的。
+
+## 2026-09-27 用户实测：按 G 起身「一直在空中」——两处根因，已修（起身仍不过门）
+
+用户要求：查清 G 起身为什么悬空，并把正式训练前的任务做完。专项全文见
+[起身悬空专项](getup-float-2026-09-27.md)。
+
+- **根因 1（根高）**：`_apply_playback()` 用素材自带的**绝对骨盆高度曲线**，而 `load_action_clip`
+  只在片段**首帧**对一次地。新工具 `scripts/humans/diagnose_getup_float.py` 逐帧量出：出厂
+  `CMU/140/140_01` 起身曲线 830 帧**全部**浮空，中位 87.6 mm、最大 142.6 mm，末帧仍高
+  118 mm。脚够不到地 → 只能靠骨盆外力 → 实测外力中位 **1.00 倍体重**（888 帧里 637 帧顶在
+  `max_vertical_lift_fraction_of_weight: 1.0` 上限）、地面法向力中位 **0 N**、最长无支撑 3.89 s。
+  **修**：`ActionConfig.get_up_contact_closure`（默认开），把蹲/坐已验证的接触闭包根高推广到回放路径。
+- **根因 2（交接）**：改完关节误差仍 114.0°。查 `control.npz` 交接瞬间：摔倒期间驱动归零、
+  指令停在**冻结的摔倒前站姿**（右膝 cmd 18.5° vs 实测 136.4°），`G` 恢复满驱动后每步限速器
+  仍以旧指令为锚 → 首帧下发 22.4°，腿在半空被抽直。**修**：`actions.recovery_command_anchor()`
+  + `keyboard.py` 在交接处把限速锚点重设为实测关节角（动作层首帧指令本就等于实测位姿，有回归测试）。
+- **口径变更（先写后跑）**：`MotionQualityConfig` 新增低姿支撑类（`getting_up`/`sitting`/`sit`）——
+  主接触集（踝/脚/膝/髋/手/腕/肘/骨盆/脊柱）任一贴地即算支撑、全身蒙皮最低点 p95 ≤ 20 mm、
+  主接触滑速 ≤ 0.25 m/s、关节误差 ≤ 30°；并新增对所有活动生效的 `min_ground_load_fraction: 0.2`
+  （地板必须承担 ≥20% 体重）。脚类 5 mm / 0.15 m/s / 15° 门不变，两套数值同时上报。
+  会话级 15° 站姿门按官方规则「跌倒后的关节轨迹不强制满足站姿跟踪门槛」把 `getting_up` 移出口径。
+- **三档单因子消融**（同 seed、14 s 协议、120 Hz 原生蒙皮，`artifacts/diag_getup_closure/`）：
+  地面承重 0.00 → 0.23 → 0.23 倍体重；骨盆外力 1.00 → 0.78 → 0.78；主接触帧占比 0.45 → 0.91 → 0.92；
+  最长无支撑 2.808 → 0.117 → 0.117 s；全身蒙皮最低点 p95 142.8 → 40.5 → 40.8 mm；
+  最大关节误差 114.0 → 114.0 → 96.9°；主接触滑速 p95 0.902 → 0.671 → 0.599 m/s；
+  交接 `standing_up` 滑速 0.695 → 0.371 → 0.360 m/s。`stand` 段由失败转为全过。三档 `errors: []`。
+- **视觉复核**：`--follow` 同相机渲染同刻（`getup_ab_sheet.png`）。t=9.0 s 改前是「坐在半空蹬腿」
+  （影子与身体分离），改后是手掌压地、膝近地的四肢推起（影子贴身）。
+- **仍未过门（如实）**：起身 5 项门仍失败 4 项（无支撑 0.117 s、滑速 0.599、关节 96.9°、穿地 >5 mm）。
+  范式限制：回放 + PD 跟踪 + 骨盆外力产生不了「由接触力驱动的起身」，素材关节轨迹与地面约束本不相容
+  （09-26 已记：库内限位内 0 条仰躺起身）。正在 A/B 恢复期垂直辅助上限
+  （`configs/humans/root_assist_recovery.yaml`，0.45/0.55，`blend_assist_configs` 平滑接入，arm `after3`）；
+  再往下需要物理起身策略（P0-C 自主平衡，独立课题）。起身段因此**暂不入训练集**（分段准入会自动拒收）。
+- 顺带关闭/修掉的工程缺陷：
+  - `batch_generate.py` 首次展开新批次目录时 `FileNotFoundError`（写 `run_batch.sh` 前不建目录），已修 + 2 条回归。
+  - 导出器把 `motion_quality.schema_version` 写死 `== 1`，与 quality 模块漂移 → 真实会话被误判
+    「measurement machinery failed」。改为两端共享 `SCHEMA_VERSION` 常量 + 拒收旧 schema 的回归测试。
+  - `export_session_mesh.py` 缺 `src` 路径引导，批量脚本用裸 `python3` 调用时 ImportError，按仓库约定补 `sys.path` 引导。
+- CPU 门禁：compileall 干净、ruff 全过、pytest **469 passed / 12 skipped**（452 → 469，新增起身闭包 5 条、
+  限速混合 3 条、批量展开 2 条、导出 schema 1 条、文档链接 2 条、净空审计等）。
+
+## 2026-09-27 用户实测：摔倒"像雕像"——驱动释放 + 被动关节黏性（两轮，已解决）
+
+用户给出机制方向：摔倒之后各个关节 PD 控制器不应该发力。定位与之吻合：fall 时位置驱动
+已归零，但保留的阻尼（0.15 × 60–150 Nm·s/rad）在速度目标被钳 0 时是纯速度刹车
+（高速段 150–390 Nm，远超重力矩）——全阻尼终端膝速仅 ~19 deg/s 的旧实测即"雕像感"。
+零阻尼的既定 NaN 域（2864 deg/s 触地炸求解器）改用逐关节 `maxJointVelocity`（20 rad/s）
+封住，不再依赖残余阻尼。专项见 [摔倒释放](fall-release-2026-09-27.md)。
+
+- **第一轮 A/B/C 单因子**（`scripts/humans/fall_release_ab.py`，每档一会话两摔）：
+  A(0.15) 触地 1.61 s/膝 21°（雕像）；C(0+限速) 触地 0.36 s/膝 134–141°/零 NaN。
+  限速确实封住 NaN 域；正常动作峰值 8.41 rad/s（限速 42%），常规门零回归。
+- **用户复看否决 C 档**："像一摊水，连基本人的样子都看不出来"，提出补回真实关节
+  阻尼。数据支持：0.36 s 快过躯干自由落体（0.43 s），无任何关节阻力即"水"。
+- **第二轮 D/E/F/G 细扫**（限速常开）：D(0.02) 1.4 s、E(0.01) 1.30 s/膝 50–78°、
+  F(0.04) 近雕像、**G(0.005) 触地 0.94 s 正中真人 0.6–1.0 s 窗口、平躺屈膝
+  （髋 11–21°、膝 112–115°、肘 ~8°）保持人形、峰值 866 deg/s 碰不到限速——采纳**。
+  0→0.94→1.30→1.42 s 说明该参数是"悬崖"不是"斜坡"，调参需细步进。
+- **过程缺陷如实**：首跑全局误差 39.7°——USD `maxJointVelocity` 单位是 deg/s，
+  按 rad/s 直写等于钳 20 deg/s 全身爬行（站立 p95 恰 0.35 rad/s 暴露）；
+  修复为 authoring 时 rad2deg，带缺陷产物归档 `invalid_run_units_bug/`。
+- **采纳终值**：四配置 `fall_damping_scale: 0.005` + `joint_velocity_limit_rad_s: 20.0`。
+  默认 demo 回归 errors=[]、误差 5.527°≤15°、滑速 p95 0.019≤0.15。CPU 452 passed/
+  12 skipped、compileall/Ruff 全过。
+- **未做**：侧向/行走中摔倒未复测新机制；限速 20 rad/s 先验选取未扫描；
+  0.005 由确定性重复支持非统计；"真人 0.6–1.0 s"为文献常识引用未实测标定。
+
 ## 2026-09-26 检测训练侧准备（A 线：表示 / DTW 基线 / 训练骨架）
 
 - **距离-时间图表示** `src/sim2sense_fall/range_time.py`：逐抽头 dB 功率图，以
@@ -430,36 +534,6 @@
   膝关节脉冲；(b) 提高失衡力+缩短作用；(c) 保持现状。手感由用户 GUI
   判定。证据 artifacts/diag_fall_damp*/、diag_fallgetup*。
 
-## 2026-09-26 摔倒两段式"腿软"机制（用户选定方案 a）
-
-- **物理分析**：从近直腿站姿直接释放驱动，重力对膝的力矩≈0（准平衡），
-  腿只能被阻尼限速慢慢折（实测前半膝峰 15.5°/s）——下压载荷与降阻尼
-  都无效（各 A/B 实测）。真人的"腿一下子软了"= 膝主动失力内弯。
-- **两段式机制**：相位1（0.25 s）驱动保持开启，膝/髋目标快速内弯
-  （膝 +70°/髋 −50° 线性斜坡，驱动限速 ~348°/s）+ 胸部下压载荷 200 N；
-  相位2 释放驱动进入瘫倒——此时膝已弯、重力矩大，坍缩自然加速。
-  `fall_buckle_*` 四旋钮入配置；机制描述如实更新。
-- **GPU 实测（同协议）**：坍缩 1.62→**1.13 s**（真人 0.4–0.8 s 量级），
-  前半段膝峰 15.5→**348.5°/s**（"一下子失去控制"），触发后 0.3 s 根高
-  下降 3 mm→**72 mm**（立即垮塌），零 errors；摔倒标签/撞击事件/G 起身
-  链路全部完好。驱动限速是腿软速度的上限旋钮（max_joint_speed_rad_s）。
-- 待用户 GUI 复验观感；不自然之处再迭代。
-
-## 2026-09-26 摔倒两段式"腿软"机制（用户选定方案 a）
-
-- **物理分析**：从近直腿站姿直接释放驱动，重力对膝的力矩≈0（准平衡），
-  腿只能被阻尼限速慢慢折（实测前半膝峰 15.5°/s）——下压载荷与降阻尼
-  都无效（各 A/B 实测）。真人的"腿一下子软了"= 膝主动失力内弯。
-- **两段式机制**：相位1（0.25 s）驱动保持开启，膝/髋目标快速内弯
-  （膝 +70°/髋 −50° 线性斜坡，驱动限速 ~348°/s）+ 胸部下压载荷 200 N；
-  相位2 释放驱动进入瘫倒——此时膝已弯、重力矩大，坍缩自然加速。
-  `fall_buckle_*` 四旋钮入配置；机制描述如实更新。
-- **GPU 实测（同协议）**：坍缩 1.62→**1.13 s**（真人 0.4–0.8 s 量级），
-  前半段膝峰 15.5→**348.5°/s**（"一下子失去控制"），触发后 0.3 s 根高
-  下降 3 mm→**72 mm**（立即垮塌），零 errors；摔倒标签/撞击事件/G 起身
-  链路全部完好。驱动限速是腿软速度的上限旋钮（max_joint_speed_rad_s）。
-- 待用户 GUI 复验观感；不自然之处再迭代。
-
 ## 2026-09-26 摔倒恢复原机制 + G 起身朝向对齐（用户实测反馈）
 
 - **摔倒恢复原机制（用户决定）**：两段式腿软 revert（cc582d0），恢复
@@ -479,6 +553,36 @@
   与片段躺姿对齐——"任意倒姿 → 固定起身片段"的本质约束，彻底消除需
   物理起身控制（P0-C 课题）或定制仰躺起身素材（库里筛过：限位内 0 条）。
   测试 quaternion_slerp 单元 + 回放朝向有界断言，450 passed。
+
+## 2026-09-26 摔倒两段式"腿软"机制（用户选定方案 a）
+
+- **物理分析**：从近直腿站姿直接释放驱动，重力对膝的力矩≈0（准平衡），
+  腿只能被阻尼限速慢慢折（实测前半膝峰 15.5°/s）——下压载荷与降阻尼
+  都无效（各 A/B 实测）。真人的"腿一下子软了"= 膝主动失力内弯。
+- **两段式机制**：相位1（0.25 s）驱动保持开启，膝/髋目标快速内弯
+  （膝 +70°/髋 −50° 线性斜坡，驱动限速 ~348°/s）+ 胸部下压载荷 200 N；
+  相位2 释放驱动进入瘫倒——此时膝已弯、重力矩大，坍缩自然加速。
+  `fall_buckle_*` 四旋钮入配置；机制描述如实更新。
+- **GPU 实测（同协议）**：坍缩 1.62→**1.13 s**（真人 0.4–0.8 s 量级），
+  前半段膝峰 15.5→**348.5°/s**（"一下子失去控制"），触发后 0.3 s 根高
+  下降 3 mm→**72 mm**（立即垮塌），零 errors；摔倒标签/撞击事件/G 起身
+  链路全部完好。驱动限速是腿软速度的上限旋钮（max_joint_speed_rad_s）。
+- 待用户 GUI 复验观感；不自然之处再迭代。
+
+## 2026-09-26 摔倒两段式"腿软"机制（用户选定方案 a）
+
+- **物理分析**：从近直腿站姿直接释放驱动，重力对膝的力矩≈0（准平衡），
+  腿只能被阻尼限速慢慢折（实测前半膝峰 15.5°/s）——下压载荷与降阻尼
+  都无效（各 A/B 实测）。真人的"腿一下子软了"= 膝主动失力内弯。
+- **两段式机制**：相位1（0.25 s）驱动保持开启，膝/髋目标快速内弯
+  （膝 +70°/髋 −50° 线性斜坡，驱动限速 ~348°/s）+ 胸部下压载荷 200 N；
+  相位2 释放驱动进入瘫倒——此时膝已弯、重力矩大，坍缩自然加速。
+  `fall_buckle_*` 四旋钮入配置；机制描述如实更新。
+- **GPU 实测（同协议）**：坍缩 1.62→**1.13 s**（真人 0.4–0.8 s 量级），
+  前半段膝峰 15.5→**348.5°/s**（"一下子失去控制"），触发后 0.3 s 根高
+  下降 3 mm→**72 mm**（立即垮塌），零 errors；摔倒标签/撞击事件/G 起身
+  链路全部完好。驱动限速是腿软速度的上限旋钮（max_joint_speed_rad_s）。
+- 待用户 GUI 复验观感；不自然之处再迭代。
 
 ## 2026-09-25 检测基线最小闭环（CIR → 特征 → 报警 → 指标）
 
@@ -1129,7 +1233,7 @@
 - 场景独立重建 `scene_rebuild/` 并通过 Isaac 复验，动态椅子抬高 0.25 m 后落回，
   原公寓场景未改写。
 - 产物 `artifacts/amass_audit_20260924/`；完整方法、数据版本、seed、指标、截图与复现命令
-  见 [本轮审计](amass-physics-audit-2026-09-24.md)。阶段 7 仍部分完成。
+  见 [本轮审计](history/amass-physics-audit-2026-09-24.md)。阶段 7 仍部分完成。
 
 ## 2026-09-23 — 手臂 T-pose 修复与两个可视化缺陷定位
 
@@ -1152,7 +1256,7 @@
 
 ## 2026-09-23 — AMASS 整机基修复、批量容错与筛选口径统一
 
-- **缺陷**：`retarget_amass_clip` 用 `up_axis_conversion("y","z")` 搬运 AMASS 的关节旋转，该基只保证 up 不变、表达不了偏航，把人体的左右轴放到了管线的前向轴上。这正是 `docs/mesh-orientation-defect.md` 记录过、网格路径已用 `body_frame_conversion` 修掉的同一类错误，AMASS 路径当时漏改。
+- **缺陷**：`retarget_amass_clip` 用 `up_axis_conversion("y","z")` 搬运 AMASS 的关节旋转，该基只保证 up 不变、表达不了偏航，把人体的左右轴放到了管线的前向轴上。这正是 `docs/history/mesh-orientation-defect.md` 记录过、网格路径已用 `body_frame_conversion` 修掉的同一类错误，AMASS 路径当时漏改。
 - **实测证据**：修复前髋/膝/踝/脊柱的屈伸能量落在管线 `x`（中位 15–19°），与 rig 声明的 `y` 完全错位；改用 `AMASS_BODY_FRAME = up=y, forward=z, left=x` 后同样的屈伸落到 `y`（膝 19.0°/19.3° 左右对称）。关节槽位映射另做独立确认：AMASS `poses` 第 10、11 槽在 40/40 条抽样序列中恒为零，正是 SMPL 两个叶子 foot 关节的特征，说明槽位 `k` 就是项目拓扑的第 `k` 个关节，不存在重排序。
 - **改动**：`motion.py` 新增公开 `BodyFrame` 与 `AMASS_BODY_FRAME`（含推导依据），`retarget_amass_clip` 改收整机基并删除 `source_up_axis`/`target_up_axis` 两个错误默认旋钮；`import_amass.py` 增加资产交叉校验，模板实测帧与 AMASS 假定帧不一致时直接失败。
 - **批量容错**：`load_amass_library` 原来遇到第一条不合格序列就抛错，实测 `amass__01_05_poses` 一处 122.8° 跳变即让 2198 条的筛查整体失败。现返回 `AmassLibraryLoad(clips, failures)`，逐文件跳过并记录原因，仅在全库无一条可读时报错。
@@ -1268,7 +1372,7 @@
 
 ## 2026-09-22 — 阶段 7 第一次批判性复审（历史快照）
 
-- 完整验收不通过，阶段 7 恢复未完成状态；程序骨架/CPU 契约部分可用。详见 [`stage7-review.md`](stage7-review.md)。该快照的资产扫描结论已被二次验收纠正。
+- 完整验收不通过，阶段 7 恢复未完成状态；程序骨架/CPU 契约部分可用。详见 [`history/stage7-review.md`](history/stage7-review.md)。该快照的资产扫描结论已被二次验收纠正。
 - 当时误报两个配置资产根不存在、SMPL 审计 0/5；二次验收确认项目内已有 3 个 SMPL v1.1.0 pickle，并通过 neutral CPU 加载与静止蒙皮复验。AMASS 原始序列仍未发现。
 - CPU：compileall、134 passed / 8 skipped、本机 Ruff 通过；plan/build/simulate CPU 路径通过。`uv tool run ruff check .` 退出 46，DBus `Process 2 is a kernel thread, refusing.`。
 - 六项待整改：伪模型导致真实蒙皮假通过及禁止降级无效；PD 目标重复转弧度；体点/方向速度混用导致假撞击；索引把 120 Hz 写成 120 s；联合键不保证人物隔离；日常动作超跟踪容差仍标可用。
@@ -1440,7 +1544,7 @@
 
 ### 验收阶段 3 完成：报告与最终验证
 
-- 完成 `docs/indoor-scene-review.md`：6 项可复现待修缺陷、研究用途边界、证据位置与整改顺序。
+- 完成 `docs/history/indoor-scene-review.md`：6 项可复现待修缺陷、研究用途边界、证据位置与整改顺序。
 - 重新 headless 导出到 `artifacts/acceptance/rebuilt/` 成功，USD SHA-256 与原件完全相同：`2e5fb8ec7523e972b5ef3ffb7f545a1078ffbf43480fc208e5f801c783cf86cb`。
 - 三种新查看模式在 Isaac 无界面下完成视口集成：相机切换正确；top/roofless 隐藏 6 块吊顶，exterior 恢复；231 碰撞体保留；源文件哈希不变。见 `inspection_view_checks.json` / `inspection_view.log`。没有 GPU 画面输出，GUI/RTX 视觉仍待验证。
 - 从实际 USD 生成并检查了对比图与布局标注图；三维预览采用 CPU 深度缓冲，图上明确标注不是 RTX 截图。
@@ -1470,7 +1574,7 @@
 - 已把通过验证的 USD/清单更新到默认 `artifacts/scenes/`；旧版本备份在 `artifacts/remediation/before/`。新 USD SHA-256 为 `38f062c3ca9d54e5ab8f2b2cc7428ce06cb85c7933d74530a3c3452958403b86`。
 - 更新后实际 USD 几何审计：家具越界、家具/墙体体积交集均为空；地基顶面 -0.12 m，与地板底面接触，行走面仍为 0 m。
 - 已生成并逐张检查修复后的 CPU 立体预览和平面图；未把 CPU 预览写成 RTX 截图。
-- `docs/indoor-scene-remediation.md` 汇总六项闭环、测试结果、资产/源码哈希和后续边界；`task_plan.md`、研究笔记与场景文档已同步。未提交或推送。
+- `docs/history/indoor-scene-remediation.md` 汇总六项闭环、测试结果、资产/源码哈希和后续边界；`task_plan.md`、研究笔记与场景文档已同步。未提交或推送。
 
 ## 场景目录整理 — 迁移完成
 
@@ -1561,7 +1665,7 @@
 
 ## 2026-09-23 物理交互 P0 修复（阶段 7 之后）
 
-对照 `docs/physics-interaction-audit.md` 的根因清单，本轮完成 P0-1 与 P0-2，并在修复过程中
+对照 `docs/history/physics-interaction-audit.md` 的根因清单，本轮完成 P0-1 与 P0-2，并在修复过程中
 发现并修掉了第三条更隐蔽的缺陷。全部结论均有 GPU 实跑证据。
 
 ### P0-1 出生/站立高度两种约定混用 —— 已修复
@@ -1673,7 +1777,7 @@ DISPLAY=:0 ~/isaacsim/python.sh scripts/humans/simulate.py --trial stand_neutral
 
 ### 修掉的缺陷：SMPL 导入被偏航 90°（真缺陷）
 
-详见 [`mesh-orientation-defect.md`](mesh-orientation-defect.md)。摘要：
+详见 [`history/mesh-orientation-defect.md`](history/mesh-orientation-defect.md)。摘要：
 
 - **文件帧 ≠ 管线帧**。授权 pkl 是 `X=横向(左右) Y=上 Z=前`；管线（`RestSkeleton` 文档）
   是 `X=前 Y=左 Z=上`。两者差一个绕垂直轴的 90°。
@@ -1938,7 +2042,7 @@ torch 2.11.0+cu130、CUDA 可用（RTX 4060）。`verify_sionna.py` 全通过。
 
 ## 2026-09-23 本轮完成状态（取代上方“进行中”）
 
-- 完整复核与复现命令见 [verification-2026-09-23.md](verification-2026-09-23.md)。
+- 完整复核与复现命令见 [verification-2026-09-23.md](history/verification-2026-09-23.md)。
 - 静态站立：5秒、无根支撑；下降1.195 mm、漂移7.593 mm、倾角4.668°、关节误差0.776°。新 stable 配置保留有限力矩，足部使用显式平足胶囊近似。
 - 后推物理跌倒：0.833 s失稳、0.933 s撞击代理，最低网格点−32.1 mm，通过既有−50 mm门槛；非零穿透如实记录。站立/后推最终两项均usable。
 - 公寓231个几何部件 + 实际后推人体 → 11帧复数CIR，在Sionna CUDA实跑通过；相对无人非相干增益约−11.74..−0.013 dB，旧数值撤回。
@@ -1996,7 +2100,7 @@ torch 2.11.0+cu130、CUDA 可用（RTX 4060）。`verify_sionna.py` 全通过。
 问：能不能像真实世界一样给脚加摩擦力解决滑步。答：**不能单独解决**，已定量。
 新增常驻工具 `scripts/humans/audit_friction_budget.py`（CPU、不需要 Isaac、只读已有会话），
 证据 `artifacts/humans/friction_budget/report.json`，完整口径见
-[足部摩擦审计](foot-friction-audit.md)。本轮没有改任何物理参数。
+[足部摩擦审计](history/foot-friction-audit.md)。本轮没有改任何物理参数。
 
 - **先修了两个盲区。** (1) 人体碰撞体**没有任何物理材质**——`human_trial.usda` 里只有
   `PhysicsCollisionAPI`/`PhysxCollisionAPI`/`PhysxContactReportAPI`，没有 `MaterialBindingAPI`，
@@ -2079,7 +2183,7 @@ torch 2.11.0+cu130、CUDA 可用（RTX 4060）。`verify_sionna.py` 全通过。
 
 用户要求「按推荐来，但要注意实测测试」，故本项全程实跑（CPU、只读、无 Isaac）。
 新增常驻审计 `scripts/humans/audit_support_mask.py`，证据
-`artifacts/humans/support_mask_audit/audit.json`，文档 [支撑掩码审计](support-mask-audit.md)。
+`artifacts/humans/support_mask_audit/audit.json`，文档 [支撑掩码审计](history/support-mask-audit.md)。
 
 - **掩码定义**：`load_gait` 只用**水平位移**（脚 x 与根前进反向）推支撑相，并用
   `|stance_speed − gait.speed_m_s| ≤ 0.15` 加门。**从不看脚的高度，也不看世界系静止。**
@@ -2117,7 +2221,7 @@ torch 2.11.0+cu130、CUDA 可用（RTX 4060）。`verify_sionna.py` 全通过。
 用户明确：主方向是「SMPL+AMASS 在 Isaac Sim 里把动作做出来」，**没必要为了可 CPU 测试
 丢失准确性**。据此把判据从几何代理换成模拟器实测，并对上一条几何审计做修正。
 新工具 `scripts/humans/audit_mask_vs_contact.py`，证据
-`artifacts/humans/mask_vs_contact/all.json`，文档 [掩码对实测接触](mask-vs-contact-audit.md)。
+`artifacts/humans/mask_vs_contact/all.json`，文档 [掩码对实测接触](history/mask-vs-contact-audit.md)。
 
 - **方法**：对已有实跑的每帧每脚读三个独立陈述——掩码的 `claimed`（来自 `gait_phase`）、
   **PhysX 的 `contacted`**（法向冲量 > `slip_min_impulse_ns`）、以及由**记录的实际关节状态**
@@ -2176,7 +2280,7 @@ IK 与摆动目标对着干，误差转到关节上——这是**下一步的主
 
 用户实测反馈：走起来左腿迈得比右腿大很多。全程按「判据用实测/实际管线」做。
 新工具 `scripts/humans/fit_gait_windows.py`，证据
-`artifacts/humans/gait_window_fit/fit.json`，文档 [步幅窗口拟合](gait-window-fit.md)。
+`artifacts/humans/gait_window_fit/fit.json`，文档 [步幅窗口拟合](history/gait-window-fit.md)。
 
 - **量化**（走发货管线：`gait.sample` + `gait.tilt` + 前向运动学）：两脚平均前后偏置
   **forward 247.1 mm**（左脚平均在骨盆前 +108.6、右脚在后 −138.4）、**backward 95.8 mm**；

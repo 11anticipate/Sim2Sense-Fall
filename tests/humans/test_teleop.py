@@ -123,3 +123,18 @@ def test_plantedness_gate_drops_support_frames_the_reference_itself_slides():
         planted_support_mask(travel, slip_m_s, float("nan"))
     with pytest.raises(ValueError):
         planted_support_mask(travel, slip_m_s[:, :1], 0.15)
+
+
+def test_keyboard_config_joint_velocity_limit_contract(tmp_path):
+    """The clamp lets fall_damping_scale be 0; an invalid value must be refused."""
+    settings = load_keyboard_config(ROOT / "configs/humans/keyboard.yaml", ROOT)
+    assert settings["joint_velocity_limit_rad_s"] == pytest.approx(20.0)
+    assert settings["actions"]["fall_damping_scale"] == pytest.approx(0.005)
+    text = (ROOT / "configs/humans/keyboard.yaml").read_text(encoding="utf-8")
+    bad_path = tmp_path / "bad_limit.yaml"
+    bad_path.write_text(
+        text.replace("joint_velocity_limit_rad_s: 20.0", "joint_velocity_limit_rad_s: 0.0"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="joint_velocity_limit_rad_s"):
+        load_keyboard_config(bad_path, ROOT)

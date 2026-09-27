@@ -64,6 +64,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--scene-config", type=Path, default=REPO_ROOT / "configs/scenes/indoor_apartment.yaml"
     )
     p.add_argument("--frames", type=int, default=12)
+    p.add_argument("--target-hz", type=float, default=None,
+                   help="trace at this channel sample rate instead of a frame count. "
+                        "--frames is a target *maximum* (uniform stride), so asking for 96 "
+                        "frames of a 492-frame 120 Hz segment silently yields 82 frames at "
+                        "20 Hz; this option derives the frame count from the mesh's own "
+                        "cadence and fails when the recording cannot support the rate "
+                        "(a 30 Hz mesh may never be claimed as 50 Hz motion truth).")
+    p.add_argument("--target-hz-tolerance", type=float, default=0.02,
+                   help="relative slack allowed between --target-hz and the achieved rate")
     p.add_argument("--frequency-hz", type=float, default=3.5e9)
     p.add_argument("--bandwidth-hz", type=float, default=100e6)
     p.add_argument("--max-delay-s", type=float, default=2e-6)
@@ -85,11 +94,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "derived from the tx/rx midpoint"
         ),
     )
+    p.add_argument("--split", default="smoke_only_not_train_test",
+                   help="what this sample's split status is; the batch driver passes "
+                        "the plan's split_label so a grouped batch does not keep claiming "
+                        "'smoke_only'. The authoritative assignment lives in splits.json "
+                        "(scripts/sionna/assign_splits.py).")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     for key in ("frequency_hz", "bandwidth_hz", "max_delay_s", "standoff_m", "height_m"):
         if not np.isfinite(getattr(args, key)) or getattr(args, key) <= 0:
             p.error(f"{key} must be finite and positive")
+    if args.target_hz is not None and not np.isfinite(args.target_hz) or (
+            args.target_hz is not None and args.target_hz <= 0):
+        p.error("target-hz must be finite and positive")
+    if not np.isfinite(args.target_hz_tolerance) or not 0 <= args.target_hz_tolerance < 1:
+        p.error("target-hz-tolerance must be in [0, 1)")
     if args.frames < 2 or args.samples_per_src < 1 or args.max_depth < 0 or args.seed < 0:
         p.error("frames >= 2, samples > 0, depth and seed >= 0 required")
     if args.frequency_hz != 3.5e9:
@@ -196,7 +215,17 @@ def solve(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     vertices, faces, times, info = load_geometry(args)
-    frames = regular_frame_indices(len(times), args.frames)
+    requested = args.frames
+    if args.target_hz is not None:
+        native_hz = 1.0 / float(np.median(np.diff(times)))
+        if args.target_hz > native_hz * (1.0 + args.target_hz_tolerance):
+            raise SystemExit(
+                f"the mesh stream is {native_hz:.1f} Hz; refusing to claim "
+                f"{args.target_hz:.1f} Hz channel truth from it -- record at a higher rate "
+                "(keyboard.py --native-mesh) instead of interpolating"
+            )
+        requested = int(round((float(times[-1]) - float(times[0])) * args.target_hz)) + 1
+    frames = regular_frame_indices(len(times), requested)
     grid = delay_grid(args.bandwidth_hz, args.max_delay_s)
     origin = vertices[0].mean(axis=0)[:2]
     offset = np.zeros(3) if args.scene == "apartment" else np.r_[origin, 0.0]
@@ -225,7 +254,10 @@ def main(argv: list[str] | None = None) -> int:
         "scene": scene_info,
         "material": material.as_dict(),
         "seed": args.seed,
-        "split": "smoke_only_not_train_test",
+        "split": str(args.split),
+        "target_hz": None if args.target_hz is None else float(args.target_hz),
+        "requested_frames": int(requested),
+        "mesh_source_frames": int(len(times)),
         "hardware_profile": "iso_1x1_3.5GHz_V",
         "subject_id": info["subject"],
         "repeat_tolerance": {"absolute": 1e-9, "relative": 1e-5},
@@ -345,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
             f"delta={record['delta_vs_no_body_db']:+.3f} dB"
         )
     channel = np.stack(channels)
+    achieved_hz = 1.0 / float(np.diff(times[frames])[0])
     label = info["label"]["label"]
     activity = channel_activity(label, info["fidelity"])
     # The reference's intended action is not evidence that a lowering was intentional ADL.
@@ -357,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         timestamp_s=times[frames],
         channel=channel,
         channel_representation="cir",
-        sample_rate_hz=1 / float(np.diff(times[frames])[0]),
+        sample_rate_hz=achieved_hz,
         simulator_version=f"sionna-rt {importlib.metadata.version('sionna-rt')}",
         metadata=report,
     )
@@ -367,6 +400,11 @@ def main(argv: list[str] | None = None) -> int:
     motion_change = float(np.max(np.abs(channel - channel[0])))
     checks = {
         "baseline_has_paths": baseline_info["path_count"] > 0,
+        # A declared rate that the stride cannot deliver is a labelling lie, not a
+        # performance miss: `--frames` is a maximum, so it can only trace slower.
+        "target_rate_achieved": (args.target_hz is None
+                                 or achieved_hz
+                                 >= args.target_hz * (1.0 - args.target_hz_tolerance)),
         "static_body_repeat": static_error < max(1e-9, 1e-5 * float(np.max(np.abs(channel[0])))),
         "baseline_repeat": repeat_error < max(1e-9, 1e-5 * float(np.max(np.abs(baseline)))),
         "body_changes_complex_channel": body_change > 1e-9,

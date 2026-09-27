@@ -586,6 +586,7 @@ def _author_joint(
     root_path: str,
     limits_deg: tuple[float, float] | None,
     drive: tuple[float, float, float, str] | None,
+    max_joint_velocity_rad_s: float | None = None,
 ) -> None:
     """Author either a fixed or a revolute joint from a plan entry."""
 
@@ -610,6 +611,20 @@ def _author_joint(
         api.CreateDampingAttr().Set(float(damping))
         api.CreateMaxForceAttr().Set(float(max_force))
         api.CreateTargetPositionAttr().Set(0.0)
+        if max_joint_velocity_rad_s is not None:
+            # PhysX per-joint velocity clamp. Normal actions stay far below it
+            # (walking peaks around 5-9 rad/s); it only bounds the ballistic
+            # joint speeds a fully released ragdoll reaches, so the floor
+            # impact of a drives-off fall stays inside the solver's finite
+            # regime instead of NaN-ing on non-finite link positions.
+            # USD/PhysX angular units are DEGREES, not radians: authoring the
+            # rad/s value directly clamped the drives to 20 deg/s and the whole
+            # body moved at p95 0.35 rad/s with 40 deg tracking errors (measured
+            # in artifacts/humans/keyboard_fall_release_regression, first run).
+            joint_api = runtime.PhysxSchema.PhysxJointAPI.Apply(definition.GetPrim())
+            joint_api.CreateMaxJointVelocityAttr().Set(
+                float(np.rad2deg(max_joint_velocity_rad_s))
+            )
 
 
 def _apply_damping(
@@ -652,6 +667,7 @@ def author_human(
     skin_points: np.ndarray | None = None,
     skin_faces: np.ndarray | None = None,
     friction: tuple[float, float] | None = None,
+    joint_velocity_limit_rad_s: float | None = None,
 ) -> dict[str, Any]:
     """Author the articulation into an existing stage under ``root_path``.
 
@@ -666,8 +682,18 @@ def author_human(
     runtime = pxr_modules()
     if not root_path.startswith("/"):
         raise ValueError(f"root_path must be an absolute prim path, got {root_path!r}")
+    if joint_velocity_limit_rad_s is not None and (
+        not np.isfinite(joint_velocity_limit_rad_s) or joint_velocity_limit_rad_s <= 0
+    ):
+        raise ValueError(
+            "joint_velocity_limit_rad_s must be finite and positive when given, "
+            f"got {joint_velocity_limit_rad_s!r}"
+        )
     _ensure_xform(runtime, stage, "/World")
-    report: dict[str, Any] = {"damping_authored": False}
+    report: dict[str, Any] = {
+        "damping_authored": False,
+        "joint_velocity_limit_rad_s": joint_velocity_limit_rad_s,
+    }
 
     # --- root link: the pelvis, a free body carrying the articulation ---------
     root = runtime.UsdGeom.Xform.Define(stage, root_path)
@@ -770,6 +796,7 @@ def author_human(
             root_path=root_path,
             limits_deg=(joint.lower_deg, joint.upper_deg),
             drive=(joint.stiffness, joint.damping, joint.max_force, joint.drive_type),
+            max_joint_velocity_rad_s=joint_velocity_limit_rad_s,
         )
     for fixed in plan.fixed_joints:
         spec = SimpleNamespace(
@@ -862,6 +889,7 @@ def build_human_stage(
     skin_points: np.ndarray | None = None,
     skin_faces: np.ndarray | None = None,
     friction: tuple[float, float] | None = None,
+    joint_velocity_limit_rad_s: float | None = None,
 ) -> Path:
     """Author the human, optionally into a copy of an existing scene, and save.
 
@@ -899,6 +927,7 @@ def build_human_stage(
         skin_points=skin_points,
         skin_faces=skin_faces,
         friction=friction,
+        joint_velocity_limit_rad_s=joint_velocity_limit_rad_s,
     )
     position = tuple(float(v) for v in (spawn_position or plan.spawn_root_position))
     root_prim = stage.GetPrimAtPath(root_path)
@@ -1713,12 +1742,17 @@ class HumanRuntime:
         and it cannot hold a pose, so the gravity-drop positive control stays real.
 
         ``damping_scale`` (fall collapse support) rescales that kept damping:
-        ``set_control_scale(0, 0.15)`` is a limp-but-viscous ragdoll -- the full
-        damping of 60-150 Nm s/rad makes the collapse a slow rigid crumple
-        (terminal knee speed ~19 deg/s under its own gravity torque), while zero
-        damping is the measured solver-NaN regime. Callers must restore with
+        ``set_control_scale(0, 0.15)`` is a limp-but-viscous ragdoll; the damping
+        floor can go to 0 (``set_control_scale(0, 0.0)`` = fully passive limbs)
+        because the ballistic-collapse NaN regime the full damping used to mask
+        is now closed by the per-joint ``maxJointVelocity`` clamp instead -- the
+        joint-speed ceiling bounds the floor-impact energy, so the damping term
+        no longer has to. When the stage was authored WITHOUT the clamp, a zero
+        damping scale reintroduces that measured NaN regime
+        (``non-finite world position for link 'pelvis'``); callers relying on
+        damping alone must keep the scale positive. Callers must restore with
         ``set_control_scale(1.0)`` whose default damping_scale of 1 rewrites the
-        authored damping. The action config bounds the scale to [0.05, 1].
+        authored damping. The action config bounds the scale to [0, 1].
 
         Used by the ``control_failure`` perturbation and by the verification negative
         control. Returning ``False`` lets the caller mark the trial as not carrying the
@@ -1733,8 +1767,8 @@ class HumanRuntime:
 
         if not 0.0 <= scale <= 1.0:
             raise ValueError(f"control scale must be within [0, 1], got {scale!r}")
-        if not 0.0 < damping_scale <= 1.0:
-            raise ValueError(f"damping scale must be within (0, 1], got {damping_scale!r}")
+        if not 0.0 <= damping_scale <= 1.0:
+            raise ValueError(f"damping scale must be within [0, 1], got {damping_scale!r}")
         try:
             # This method is also exercised duck-typed against a bare namespace by
             # the CPU tests, so besides the articulation it may only rely on the

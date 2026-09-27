@@ -31,6 +31,7 @@ from sim2sense_fall.humans.actions import (
     ActionState,
     load_action_clip,
     load_posture,
+    recovery_command_anchor,
 )
 from sim2sense_fall.humans.assets import select_body
 from sim2sense_fall.humans.contact_control import (
@@ -42,7 +43,7 @@ from sim2sense_fall.humans.mesh_sequence import fit_mesh_to_rest_joints, skin_me
 from sim2sense_fall.humans.quality import MotionQualityConfig, motion_quality
 from sim2sense_fall.humans.recording import ChunkRecorder
 from sim2sense_fall.humans.rig import LinkTransform, fit_rest_skeleton, plan_human_rig
-from sim2sense_fall.humans.root_control import RootAssistConfig, root_wrench
+from sim2sense_fall.humans.root_control import RootAssistConfig, blend_assist_configs, root_wrench
 from sim2sense_fall.humans.rotations import matrix_to_axis_angle, quaternion_to_matrix
 from sim2sense_fall.humans.teleop import (
     KeyboardIntent,
@@ -178,7 +179,7 @@ def demo_keys(settings: dict[str, Any], elapsed_s: float) -> set[str]:
     return set()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=REPO_ROOT / "configs/humans/keyboard.yaml")
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "artifacts/humans/keyboard")
@@ -201,7 +202,9 @@ def main() -> int:
             "120 Hz recording when exporting sessions for the Sionna importer"
         ),
     )
-    args = parser.parse_args()
+    # argv is injectable so experiment harnesses can reuse this exact entry
+    # point (identical physics setup) with generated per-trial configs.
+    args = parser.parse_args(argv)
     if not np.isfinite(args.seconds) or args.seconds < 0:
         parser.error("seconds must be finite and nonnegative")
     if args.headless and not args.demo and args.seconds == 0 and not args.dry_run:
@@ -216,7 +219,11 @@ def main() -> int:
     locomotion_assistance = RootAssistConfig.load(
         settings.get("locomotion_root_assist", settings["root_assist"])
     )
+    recovery_path = settings.get("recovery_root_assist")
+    recovery_assistance = None if recovery_path is None else RootAssistConfig.load(recovery_path)
+    recovery_modes = set(settings.get("recovery_modes", ["getting_up", "standing_up"]))
     assist_blend = 1.0
+    recovery_blend = 0.0
     feedforward_scale = settings["reference_feedforward_scale"]
     ff_com_prev = ff_com_prev2 = None
     ff_accel = None
@@ -367,6 +374,9 @@ def main() -> int:
     skins: deque[np.ndarray] = deque(maxlen=skin_capacity)
     skin_times: deque[float] = deque(maxlen=skin_capacity)
     foot_heights: deque[np.ndarray] = deque(maxlen=skin_capacity)
+    # Whole-body lowest skinned vertex per mesh frame: the low-posture gate needs
+    # "is any part of the body on the floor", which the two foot heights cannot say.
+    body_heights: deque[float] = deque(maxlen=skin_capacity)
     owners = np.asarray(mesh.topology.joint_names)[mesh.weights.argmax(axis=1)]
     foot_masks = [np.isin(owners, [f"{side}_ankle", f"{side}_foot"])
                   for side in ("left", "right")]
@@ -394,6 +404,7 @@ def main() -> int:
             skin_points=mesh.vertices,
             skin_faces=mesh.faces,
             friction=settings.get("human_friction"),
+            joint_velocity_limit_rad_s=settings.get("joint_velocity_limit_rad_s"),
         )
         stage = open_scene(app, args.out / "human_keyboard.usda")
         # Create all visual structure before the tensor views. Only points change later.
@@ -416,8 +427,10 @@ def main() -> int:
             app.update()
 
         def reset() -> None:
-            nonlocal assist_blend, ff_com_prev, ff_com_prev2, ff_accel, ff_mode
+            nonlocal assist_blend, recovery_blend
+            nonlocal ff_com_prev, ff_com_prev2, ff_accel, ff_mode
             assist_blend = 1.0
+            recovery_blend = 0.0
             ff_com_prev = ff_com_prev2 = None
             ff_accel = None
             ff_mode = None
@@ -479,6 +492,7 @@ def main() -> int:
 
         def before_step(dt: float, _context: Any) -> None:
             nonlocal clock_s, previous_target, previous_stance_mode, assist_blend
+            nonlocal recovery_blend
             nonlocal ff_com_prev, ff_com_prev2, ff_accel, ff_mode
             if errors:
                 return
@@ -531,6 +545,15 @@ def main() -> int:
                             raise RuntimeError("could not restore position drives for get_up")
                         if stance:
                             stance.reset()
+                        # Re-anchor the per-step slew limiter at the body's real pose.
+                        # The fallen command stream is the frozen pre-fall pose (measured
+                        # 18.5 deg knee against a 136.4 deg body), and chasing it yanks
+                        # the collapsed limbs straight while the pelvis is still down.
+                        anchor = recovery_command_anchor(
+                            actions.mode, runtime.joint_positions_rad()
+                        )
+                        if anchor is not None:
+                            previous_target = replace(previous_target, joints=anchor)
                 target = controller.advance(
                     actions.command(intent.command()) if actions else intent.command(),
                     dt,
@@ -682,6 +705,17 @@ def main() -> int:
                         + getattr(locomotion_assistance, key)*assist_blend
                         for key, value in asdict(assistance).items()
                     })
+                if recovery_assistance is not None:
+                    recovery_blend = float(np.clip(
+                        recovery_blend
+                        + (1 if target.mode in recovery_modes else -1) * dt
+                        / controller.config.transition_s,
+                        0.0, 1.0,
+                    ))
+                    if recovery_blend > 0.0:
+                        active_assistance = blend_assist_configs(
+                            active_assistance, recovery_assistance, recovery_blend
+                        )
                 force, torque = root_wrench(
                     active_assistance,
                     position=position,
@@ -735,6 +769,7 @@ def main() -> int:
                         "root_quaternion": quaternion.copy(),
                         "target": target.position,
                         "joints": runtime.joint_positions_rad(),
+                        "joint_speeds": runtime.joint_velocities_rad_s(),
                         "joint_target": target.joints,
                         "force": force,
                         "torque": torque,
@@ -760,6 +795,7 @@ def main() -> int:
                     skins.append(vertices.astype(np.float32))
                     skin_times.append(clock_s)
                     foot_heights.append(np.array([vertices[mask, 2].min() for mask in foot_masks]))
+                    body_heights.append(float(vertices[:, 2].min()))
                 clock_s += dt
             except Exception as exc:
                 LOGGER.exception("physics keyboard callback failed")
@@ -822,6 +858,7 @@ def main() -> int:
                     skins.append(vertices.astype(np.float32))
                     skin_times.append(clock_s)
                     foot_heights.append(np.array([vertices[mask, 2].min() for mask in foot_masks]))
+                    body_heights.append(float(vertices[:, 2].min()))
                 if settings.get("camera_follow", True):
                     # camera_follow: false leaves the viewport camera to the user
                     # (orbit/fly in the GUI); we never overwrite it again.
@@ -911,6 +948,7 @@ def main() -> int:
                     "root_quaternion",
                     "target",
                     "joints",
+                    "joint_speeds",
                     "joint_target",
                     "force",
                     "torque",
@@ -932,7 +970,13 @@ def main() -> int:
                 float(arrays["time_s"][0]),
                 float(arrays["time_s"][-1]),
             ]
-            controlled = ~np.isin(arrays["mode"], ["falling", "fallen"])
+            # The session-level standing-tracking gate covers the frames it is a
+            # statement about. Fall frames are released control; floor-recovery
+            # frames are contact-constrained against the ground, which the official
+            # rule already excludes: "跌倒后的关节轨迹不强制满足站姿跟踪门槛"
+            # (task_plan 验收规则). They stay judged by their own per-activity gate
+            # (MotionQualityConfig.low_posture_joint_error_deg), so nothing is hidden.
+            controlled = ~np.isin(arrays["mode"], ["falling", "fallen", "getting_up"])
             provenance["joint_error_max_deg"] = (
                 None
                 if not controlled.any()
@@ -942,7 +986,9 @@ def main() -> int:
                     ).max()
                 )
             )
-            provenance["joint_tracking_scope"] = "controlled_frames_excluding_fall"
+            provenance["joint_tracking_scope"] = (
+                "controlled_frames_excluding_fall_and_floor_recovery"
+            )
             provenance["force_peak_n"] = float(np.linalg.norm(arrays["force"], axis=1).max())
             provenance["contact_paths"] = sorted({p for row in records for p in row["contacts"]})
             provenance["contact_samples"] = sum(len(row["contacts"]) for row in records)
@@ -988,12 +1034,14 @@ def main() -> int:
                 skins.popleft()
                 skin_times.popleft()
                 foot_heights.popleft()
+                body_heights.popleft()
             np.savez_compressed(
                 args.out / "recording.npz",
                 time_s=np.asarray(skin_times),
                 mesh_vertices_xyz=np.stack(skins),
                 mesh_faces=mesh.faces,
                 foot_min_z_m=np.stack(foot_heights),
+                body_min_z_m=np.asarray(body_heights),
             )
             provenance["skin_min_z_m"] = float(min(skin[:, 2].min() for skin in skins))
         provenance["fall"] = None if actions is None else actions.fall_report()
@@ -1001,6 +1049,7 @@ def main() -> int:
             list(records), np.asarray(skin_times), np.asarray(foot_heights),
             config=quality_config, dt_s=config.simulation.physics_dt_s,
             mass_kg=plan.total_mass_kg, gravity_m_s2=config.simulation.gravity_m_s2,
+            skin_min_z_m=np.asarray(body_heights),
         )
         acceptance = {
             "complete_recording_window": bool(records)

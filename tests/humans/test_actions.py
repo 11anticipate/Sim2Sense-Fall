@@ -135,10 +135,12 @@ def test_invalid_action_settings_fail_before_physics():
         ActionConfig(float("nan"), 0.025, 350, 0.25, 0, 0.6, 50)
     with pytest.raises(ValueError):
         ActionConfig(1, 0.025, 350, 0.25, 2, 0.6, 50)
-    # The fall damping scale is bounded away from zero: zero damping is the
-    # measured solver-NaN regime (docs/progress.md 2026-09-25). NaN is caught
-    # by the generic finiteness check before the range check.
-    for bad_scale in (0.0, 0.01, 1.5):
+    # Zero damping is now legal (fully passive collapse; the solver-NaN regime
+    # is closed by the authored maxJointVelocity clamp, not by damping). Above
+    # 1 would amplify the damping. NaN is caught by the generic finiteness
+    # check before the range check.
+    assert ActionConfig(1, 0.025, 350, 0.25, 0, 0.6, 50, fall_damping_scale=0.0)
+    for bad_scale in (-0.1, 1.5):
         with pytest.raises(ValueError, match="fall damping scale"):
             ActionConfig(1, 0.025, 350, 0.25, 0, 0.6, 50, fall_damping_scale=bad_scale)
     with pytest.raises(ValueError, match="must be finite"):

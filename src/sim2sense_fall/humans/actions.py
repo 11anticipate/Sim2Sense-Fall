@@ -14,7 +14,7 @@ from .amass import (
     load_amass_clip,
     normalize_root_motion,
 )
-from .contact_control import capsule_bottom, sideways_leg_dofs
+from .contact_control import capsule_bottom, has_collision_geometry, sideways_leg_dofs
 from .rig import (
     AXIS_PROJECTION_TOLERANCE_RAD,
     HumanRigPlan,
@@ -64,14 +64,29 @@ class ActionConfig:
     fallen_height_fraction: float
     fallen_tilt_deg: float
     # Fraction of the authored joint damping kept while falling. The position
-    # drives are released (fall_control_scale 0), but PhysX drive damping is a
-    # property the body keeps: at full damping the collapse is a slow rigid
-    # crumple, at zero it folds ballistically and the floor impact NaNs the
-    # solver (measured 2864 deg/s mid-fall; see HumanRuntime.set_control_scale).
-    # The scale keeps a bounded viscous term: limp on screen, solver-safe.
+    # drives are released (fall_control_scale 0); 0 also releases the viscous
+    # term so the limbs fold under gravity alone with no drive torque at all
+    # (user decision 2026-09-26: a PD damped collapse reads as a statue).
+    # Zero is solver-safe ONLY when the rig was authored with a per-joint
+    # maxJointVelocity clamp, which bounds the ballistic joint speeds and thus
+    # the floor-impact energy that NaN'd the solver at 2864 deg/s mid-fall.
+    # Positive values keep a bounded viscous brake instead (see
+    # HumanRuntime.set_control_scale for the measured full-damping crumple).
     fall_damping_scale: float = 0.15
+    # Ground the replayed get-up by contact closure instead of trusting the clip's
+    # absolute root-height curve. ``load_action_clip`` grounds a clip **once**, on
+    # its first frame, so every later frame carries that mocap subject's own pelvis
+    # trajectory. Measured on the shipped ``CMU/140/140_01`` source, that curve
+    # floats 3-14 cm above the floor for all 830 frames and is still 11.8 cm high on
+    # the final standing frame (``scripts/humans/diagnose_getup_float.py``,
+    # ``artifacts/humans/getup_float/``). With the feet that far off the ground
+    # nothing can push, so the pelvis actuator carries 100% of body weight and the
+    # body rises on a wire -- the defect this closes.
+    get_up_contact_closure: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.get_up_contact_closure, bool):
+            raise ValueError("get_up_contact_closure must be a bool")
         if not np.isfinite(list(vars(self).values())).all():
             raise ValueError("action settings must be finite")
         if (
@@ -81,10 +96,10 @@ class ActionConfig:
             raise ValueError("action timings and force must be positive")
         if not 0 <= self.fall_control_scale <= 1:
             raise ValueError("fall control scale must be in [0,1]")
-        if not 0.05 <= self.fall_damping_scale <= 1:
+        if not 0 <= self.fall_damping_scale <= 1:
             raise ValueError(
-                "fall damping scale must be in [0.05, 1]: below 0.05 the collapse is the "
-                "measured solver-NaN regime, above 1 would amplify the damping"
+                "fall damping scale must be in [0, 1]: 0 is fully passive and requires the "
+                "rig to carry a maxJointVelocity clamp, above 1 would amplify the damping"
             )
         if not 0 < self.fallen_height_fraction < 1 or not 0 < self.fallen_tilt_deg < 90:
             raise ValueError("invalid fallen posture thresholds")
@@ -361,6 +376,29 @@ def load_action_clip(spec: dict[str, Any], plan: HumanRigPlan, *, dt_s: float) -
     )
 
 
+def recovery_command_anchor(mode: str, measured_joints: np.ndarray) -> np.ndarray | None:
+    """The pose the command stream must be re-anchored to at a recovery handover.
+
+    While a fall is latched the position drives are scaled to ``fall_control_scale``
+    (0 by default) and the commanded pose stays the **frozen pre-fall** one, so the
+    body collapses somewhere else: measured on the shipped demo, the right knee sat
+    at 136.4 deg against an 18.5 deg command. When ``G`` restores full drives, the
+    per-step slew limiter in ``keyboard.py`` still chases that stale command, so the
+    first recovery frame is a 114 deg error and the limbs snap straight while the
+    pelvis is still on the floor -- the "kicking at the air" half of the defect, on
+    top of the floating root height that ``get_up_contact_closure`` fixes.
+
+    Returning the measured joints here re-anchors the limiter to the body's actual
+    pose, which is the only state a recovery can legitimately start from.
+    """
+
+    if mode != "getting_up":
+        return None
+    if not np.isfinite(measured_joints).all():
+        raise ValueError("recovery anchor requires finite measured joints")
+    return np.asarray(measured_joints, dtype=np.float64).copy()
+
+
 class ActionState:
     """Edge-triggered posture actions, motion playback and a latched physical fall.
 
@@ -391,6 +429,15 @@ class ActionState:
         # blended configuration by contact closure instead of blended linearly;
         # without it (state-machine fixtures) the historical linear blend runs.
         self.plan = plan
+        # Every link carrying collision geometry, for the get-up contact closure. A
+        # recovery rests on whatever is underneath -- spine, hip, hand, then feet --
+        # so the closure set cannot be a fixed pair of ankles; this is the same rule
+        # ``load_action_clip`` applies once, to ground the clip's first frame.
+        self.closure_links: tuple[str, ...] = (
+            tuple(link.name for link in plan.links if has_collision_geometry(link))
+            if plan is not None
+            else ()
+        )
         self.active_contacts: tuple[str, ...] = ("left_ankle", "right_ankle")
         # Horizontal support compensation: the root xy shifts so the FEET stay
         # planted while the blended configuration moves them in body frame.
@@ -697,7 +744,6 @@ class ActionState:
         index = min(int(elapsed / clip.frame_dt_s), len(clip.joints) - 1)
         blend = _smoothstep(elapsed / _CLIP_BLEND_S)
         q = (1 - blend) * state["source_joints"] + blend * clip.joints[index]
-        height = (1 - blend) * state["source_height_m"] + blend * clip.heights_m[index]
         # 朝向 = 从实测躺姿测地过渡到 "锚定 yaw ⊕ 片段倾角"(片段前向已对齐
         # 实测前向, 端点一致故测地线无自旋); 关节/高度仍线性混合。
         # 注: 不用 axis-angle 线性混合倾角——大倾角混合会扫出几十度等效 yaw。
@@ -710,6 +756,21 @@ class ActionState:
             state["source_quaternion"], target_quaternion, blend_in
         )
         tilt = matrix_to_axis_angle(quaternion_to_matrix(world_quaternion))
+        # Root height: the clip's absolute curve by default, or -- when contact
+        # closure is on -- the height that puts the blended configuration's lowest
+        # collision body exactly on the floor. See ActionConfig
+        # .get_up_contact_closure for the measurement that forced this.
+        clip_height = clip.heights_m[index]
+        if self.config.get_up_contact_closure and self.closure_links:
+            poses = forward_kinematics(
+                self.plan,
+                dict(zip(self.plan.dof_names, q, strict=True)),
+                root_rotation=tilt,
+            )
+            clip_height = -min(
+                capsule_bottom(self.plan, poses, name) for name in self.closure_links
+            )
+        height = (1 - blend) * state["source_height_m"] + blend * clip_height
         offset = clip.offsets_xy[index]
         c, s = math.cos(state["heading_rad"]), math.sin(state["heading_rad"])
         anchor = state["anchor_xy"]

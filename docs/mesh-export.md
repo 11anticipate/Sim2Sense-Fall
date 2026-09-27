@@ -28,7 +28,7 @@ python3 scripts/humans/plan.py --out /tmp/sim2sense-plan
 python3 scripts/humans/simulate.py --dry-run --out /tmp/sim2sense-dry
 ```
 
-SMPL neutral 与真实 AMASS 已用于实际记录，详见 [AMASS 审计](amass-physics-audit-2026-09-24.md)。
+SMPL neutral 与真实 AMASS 已用于实际记录，详见 AMASS 审计（已归档）。
 历史 scripted dry-run 的 `stand_neutral.mesh.npz` 为 `(121, 6890, 3)`，该形状只对应其 1 s 参考片段。
 数据来源以每个产物的 provenance 为准，不能从文件名推断 scripted、AMASS 或实际物理。
 

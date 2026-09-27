@@ -188,6 +188,18 @@ def sideways_leg_dofs(
     return sideways
 
 
+def has_collision_geometry(link: Any) -> bool:
+    """True when :func:`capsule_bottom` can measure this link's lowest collision point.
+
+    Chain joints (``left_hip__dof1`` and friends) are drive-only links with no
+    collision shape, so a closure set built from ``plan.links`` alone raises inside
+    :func:`capsule_bottom`. Filter with this first.
+    """
+
+    return (bool(link.collision_mesh_vertices) or link.collision_box_bounds is not None
+            or link.capsule is not None)
+
+
 def capsule_bottom(plan: HumanRigPlan, poses: dict[str, LinkTransform], name: str) -> float:
     vertices = plan.link(name).collision_mesh_vertices
     if vertices:

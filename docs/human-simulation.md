@@ -1,7 +1,7 @@
 # SMPL 人体、动作与跌倒仿真
 
-维护日期：2026-09-24。[文档索引](README.md) · [当前计划](../task_plan.md) · [执行记录](progress.md)。
-阶段 7 部分完成：人体与物理链路可运行，键盘动作质量仍未全部通过。
+维护日期：2026-09-27。[文档索引](README.md) · [当前计划](../task_plan.md) · [执行记录](progress.md)。
+阶段 7 部分完成：人体与物理链路可运行，键盘动作质量仍未全部通过（起身/坐地/姿势过渡）。
 
 ## 控制链路与入口
 
@@ -24,6 +24,40 @@ SMPL 提供骨架与显示网格；分段刚体承担碰撞，显示皮肤不直
 | `scripts/humans/simulate.py` | 配置驱动的物理试验和真值导出 | 检查控制模式、根辅助和传送记录；GUI 可回放实际记录 |
 | `scripts/humans/render_recording.py` | 渲染已保存实际网格或参考网格 | 离线渲染，必须标注输入来源 |
 | `scripts/humans/verify.py` | CPU/USD/PhysX 基础验收 | 不替代完整动作质量验收 |
+
+## 支撑口径与验收门
+
+`scripts/humans/quality.py` 按控制器模式分段统计实测质量，分两类支撑口径
+（阈值全部写在 `configs/humans/keyboard.yaml` 的 `quality:` 段，改门必须改配置，
+不得按结果放宽）：
+
+| 口径 | 覆盖模式 | 什么算"有支撑" | 专属门 |
+| --- | --- | --- | --- |
+| 脚类 | `forward/backward/stand/crouch/bend` 及其过渡 | 左右踝/脚碰撞体与地板冲量 ≥ 0.01 Ns | 蒙皮最低 p95 ≤ 5 mm、滑速 p95 ≤ 0.15 m/s、关节误差 ≤ 15° |
+| 低姿 | `getting_up/sitting/sit` | 踝/脚/膝/髋/手/腕/肘/骨盆/脊柱任一贴地 | 全身蒙皮最低 p95 ≤ 20 mm、滑速 p95 ≤ 0.25 m/s、关节误差 ≤ 30° |
+
+两类都还要过 `skin_penetration`（≥ −5 mm）与新增的 **`ground_load`**：地板法向力中位
+必须承担 ≥ `min_ground_load_fraction`（0.2）倍体重。这一项是"到底有没有踩住东西"的门，
+与骨盆外力的向上份额（报告里的 `root_up_fraction_p50`）成对读，二者不能互相冒充。
+两套数值同时上报，改口径不隐藏旧账；`falling/fallen` 不参与（那是释放控制段）。
+
+起身（`G`）的两处根因与修复见 [起身悬空专项](getup-float-2026-09-27.md)：
+回放路径的根高改为接触闭包（`actions.get_up_contact_closure`），
+交接时把每步限速锚点重设为实测关节角（`actions.recovery_command_anchor`）。
+
+## 骨盆外力剖面
+
+三个已声明的辅助剖面，按控制器模式平滑混合（`root_control.blend_assist_configs`）：
+
+| 剖面 | 用于 | 重力补偿 / 垂直提升上限 |
+| --- | --- | --- |
+| `root_assist_contact.yaml` | `forward/backward/stand` | 0.60 / 1.00 |
+| `root_assist.yaml` | 蹲/弯腰等脚类过渡与保持 | 0.70 / 1.00 |
+| `root_assist_recovery.yaml` | `getting_up/standing_up/sitting/sit` | 0.45 / 0.55 |
+
+恢复期降权是实测决定的：起身段外力从 0.78 倍体重降到 0.55，地面承重从 0.23 升到 0.50 倍体重，
+最长无支撑 0.117 s → 0.033 s。任何使用这些配置的结果都必须同时报告辅助份额，
+不得称自主平衡。
 
 ## 使用
 
@@ -71,13 +105,13 @@ python3 scripts/humans/keyboard.py --dry-run --out artifacts/humans/keyboard_dry
 
 | 测试 | 结论 | 依据 |
 | --- | --- | --- |
-| 多轴刚体基线 | PD 最大误差 11.462°；重力下降 1.0176 m；22 碰撞体 | [AMASS 审计](amass-physics-audit-2026-09-24.md) |
+| 多轴刚体基线 | PD 最大误差 11.462°；重力下降 1.0176 m；22 碰撞体 | AMASS 审计（已归档） |
 | 完整侧行/后退 | 有限根辅助下分别 8.147° / 10.793°，通过该轮跟踪门槛 | 同上；不代表无辅助行走 |
 | 键盘 GUI | 10.3 s、1236 步/回调；实时蒙皮及 R 正常 | [键盘实测](keyboard-control.md) |
 | 键盘动作质量 | 关节 13.787° 通过；穿地 9.86 mm、滑速 p95=0.751 m/s 不通过 | `gui_tilt/report.json` |
 | 挡墙 | 根被阻挡；皮肤局部越墙约 51.2 mm，未完全通过 | `barrier/report.json` |
 | 无辅助行走 | 侧行失败；键盘仍依赖显著根辅助 | AMASS 审计与键盘报告 |
-| 静态站立/后推跌倒 | 特定配置的 5 s 站立和单类跌倒个例通过 | [2026-09-23 复核](verification-2026-09-23.md) |
+| 静态站立/后推跌倒 | 特定配置的 5 s 站立和单类跌倒个例通过 | 2026-09-23 复核（已归档） |
 | 右臂摆动 | 用户手动前进时观察到异常，尚未复现定位 | [计划 P0-A](../task_plan.md#p0-a-右臂摆动异常) |
 
 以上为已有实测，本次文档整理没有新跑 Isaac。人体基础导入成功、单动作跟踪通过、整体物理质量通过是不同结论。

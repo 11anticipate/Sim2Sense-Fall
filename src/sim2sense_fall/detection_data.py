@@ -33,6 +33,9 @@ class ChannelSample:
     event_label: str | None
     imbalance_onset_s: float | None
     first_impact_s: float | None
+    # How ``imbalance_onset_s`` was obtained: a trial's own annotation, or a value
+    # derived from the measured root tilt. Never present a derived onset as annotated.
+    onset_source: str | None = None
     transmitter_xyz: tuple[float, ...] | None = None
     receiver_xyz: tuple[float, ...] | None = None
     carrier_hz: float | None = None
@@ -53,24 +56,115 @@ class MeshMotion:
     time_s: np.ndarray
 
 
-def _event_times(import_payload: dict, import_path: Path) -> tuple[float | None, float | None]:
-    """Resolve (imbalance onset, impact) from the referenced physics trial."""
+# Pre-registered 2026-09-27 for deriving a keyboard session's imbalance onset from the
+# measured body state. The project rule forbids using the F key-press time as the
+# imbalance start, so the onset is taken from the root trajectory: the last moment
+# before the recorded impact at which the pelvis was still within
+# FALL_ONSET_PLATEAU_TOL_M of its pre-fall height -- i.e. where the drop begins.
+# Height-based rather than velocity-based on purpose: a contact bounce must not be able
+# to erase the label. The tolerance (5 cm) is above the measured walking root bob
+# (2 cm), so a stride cannot be mistaken for the start of a fall, and the descent must
+# still exceed FALL_ONSET_MIN_DESCENT_M for the label to exist at all.
+# Measured on batch train01 (6 fall samples): the derived onset lands 0.15 - 0.43 s
+# after the F key press and 0.17 - 0.52 s before the recorded impact, over a
+# 0.37 - 0.44 m drop. So the key press is *not* the imbalance start -- they differ by
+# up to 0.43 s -- and that gap is now measured rather than assumed.
+FALL_ONSET_MIN_DESCENT_M = 0.15
+FALL_ONSET_PLATEAU_TOL_M = 0.05
+ONSET_SOURCE_SESSION = "derived:root_descent_to_impact"
+ONSET_SOURCE_TRIAL = "trial:imbalance_onset_s"
 
-    source_path = (import_payload.get("source") or {}).get("source")
-    if not source_path or not Path(source_path).exists():
-        return None, None
-    trial = json.loads(Path(source_path).read_text(encoding="utf-8"))
+
+def session_event_times(
+    manifest_path: Path,
+    sample_stem: str,
+    *,
+    min_descent_m: float = FALL_ONSET_MIN_DESCENT_M,
+    plateau_tol_m: float = FALL_ONSET_PLATEAU_TOL_M,
+) -> tuple[float | None, float | None, str | None]:
+    """(onset, impact, source) in the sample's own time origin, for a keyboard session.
+
+    A scripted physics trial carries an explicit ``imbalance_onset_s``. A keyboard
+    session does not: its fall record has the key-press request, the measured impact and
+    the moment the body was judged lying. The onset is therefore derived from the
+    measured root height as the last pre-impact moment that still stood
+    within ``plateau_tol_m`` of its pre-fall height (see the constants above), and the returned
+    source names itself as derived so no caller can present it as an annotated
+    imbalance start.
+
+    Fails closed: no impact, no control record, or a total drop smaller than
+    ``min_descent_m`` yields a ``None`` onset, and the sample contributes no positive
+    windows -- exactly as an unlabeled trial does. The impact time itself is still
+    returned so the caller can see *why* the label is missing.
+    """
+
+    for name, value in (("min_descent_m", min_descent_m), ("plateau_tol_m", plateau_tol_m)):
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive, got {value!r}")
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    row = next((item for item in manifest.get("samples", [])
+                if str(item.get("sample_id")) == sample_stem), None)
+    if row is None:
+        return None, None, None
+    impact_abs = (row.get("label") or {}).get("first_impact_s")
+    span = row.get("session_time_span_s") or [None]
+    start_abs, run = span[0], row.get("source_run")
+    if impact_abs is None or start_abs is None or not run:
+        return None, None, None
+    control_path = Path(run) / "control.npz"
+    if not control_path.is_file():
+        return None, None, None
+    with np.load(control_path) as data:
+        times = np.asarray(data["time_s"], dtype=float)
+        heights = np.asarray(data["root"], dtype=float)[:, 2]
+    before = np.where((times <= float(impact_abs)) & (times >= float(start_abs)))[0]
+    if not len(before):
+        return None, None, None
+    window = heights[before]
+    impact_height = float(window[-1])
+    peak = float(window.max())
+    impact = float(impact_abs) - float(start_abs)
+    if peak - impact_height < min_descent_m:
+        return None, float(impact), None
+    on_plateau = np.where(window >= peak - plateau_tol_m)[0]
+    onset = float(times[before[int(on_plateau[-1])]]) - float(start_abs)
+    if not 0.0 <= onset <= max(impact, 0.0):
+        return None, float(impact), None
+    return onset, float(impact), ONSET_SOURCE_SESSION
+
+
+def _event_times(
+    import_payload: dict, import_path: Path, sample_stem: str | None = None
+) -> tuple[float | None, float | None, str | None]:
+    """Resolve (imbalance onset, impact, label source) from the referenced run."""
+
+    source = (import_payload.get("source") or {}).get("source")
+    if not source or not Path(source).exists():
+        return None, None, None
+    path = Path(source)
+    if path.name == "manifest.json":
+        return session_event_times(path, sample_stem or path.parent.name)
+    trial = json.loads(path.read_text(encoding="utf-8"))
     label = trial.get("label") or {}
     onset = label.get("imbalance_onset_s")
     impact = label.get("first_impact_s")
     return (
         float(onset) if onset is not None else None,
         float(impact) if impact is not None else None,
+        ONSET_SOURCE_TRIAL if onset is not None else None,
     )
 
 
-def load_channel_sample(cir_path: Path, import_path: Path | None = None) -> ChannelSample:
-    """Load one CIR sample; validates shape, finiteness and time monotonicity."""
+def load_channel_sample(
+    cir_path: Path, import_path: Path | None = None, *, sample_id: str | None = None
+) -> ChannelSample:
+    """Load one CIR sample; validates shape, finiteness and time monotonicity.
+
+    ``sample_id`` overrides the id recorded in the import report. Batched session
+    exports repeat segment ids across sessions (every session has a ``stand_00``) and
+    the importer prefixes only the scene name, so the directory namespace has to become
+    part of the identity -- otherwise two different measurements train as one sample.
+    """
 
     cir_path = Path(cir_path)
     import_path = (
@@ -90,11 +184,13 @@ def load_channel_sample(cir_path: Path, import_path: Path | None = None) -> Chan
             or np.any(np.diff(time_s) <= 0)):
         raise ValueError(f"{cir_path.name}: time axis must be per-frame and strictly increasing")
     baseline = archive["baseline_cir"] if "baseline_cir" in archive else None
-    onset_s, impact_s = _event_times(payload, import_path)
+    onset_s, impact_s, onset_source = _event_times(
+        payload, import_path, cir_path.name.removesuffix(".cir.npz"))
     transmitter = payload.get("transmitter")
     receiver = payload.get("receiver")
     return ChannelSample(
-        sample_id=str(payload.get("channel_sample_id") or cir_path.name.removesuffix(".cir.npz")),
+        sample_id=str(sample_id or payload.get("channel_sample_id")
+                      or cir_path.name.removesuffix(".cir.npz")),
         cir_path=cir_path,
         import_path=import_path,
         cir=cir,
@@ -106,6 +202,7 @@ def load_channel_sample(cir_path: Path, import_path: Path | None = None) -> Chan
             str(payload["source_event_label"]) if payload.get("source_event_label") else None
         ),
         imbalance_onset_s=onset_s,
+        onset_source=onset_source,
         first_impact_s=impact_s,
         transmitter_xyz=tuple(float(v) for v in transmitter) if transmitter else None,
         receiver_xyz=tuple(float(v) for v in receiver) if receiver else None,
@@ -122,14 +219,17 @@ def iter_channel_samples(sionna_dir: Path, include_failures: bool = False) -> li
 
     directory = Path(sionna_dir)
     samples: list[ChannelSample] = []
-    for cir_path in sorted(directory.glob("*.cir.npz")):
+    for cir_path in sorted(directory.glob("**/*.cir.npz")):
         import_path = cir_path.with_suffix("").with_suffix(".import.json")
         if not import_path.exists():
             continue
         payload = json.loads(import_path.read_text(encoding="utf-8"))
         if payload.get("failures") and not include_failures:
             continue
-        samples.append(load_channel_sample(cir_path, import_path))
+        namespace = cir_path.parent.relative_to(directory).as_posix()
+        stem = cir_path.name.removesuffix(".cir.npz")
+        ident = f"{namespace}/{stem}" if namespace != "." else stem
+        samples.append(load_channel_sample(cir_path, import_path, sample_id=ident))
     return samples
 
 

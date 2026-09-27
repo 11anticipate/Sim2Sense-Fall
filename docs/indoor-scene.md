@@ -256,8 +256,8 @@ CPU 侧：`python -m pytest -q` → 27 passed；`python -m compileall src tests 
 ## 8. 本轮验收与内部查看（2026-09-21）
 
 **当前状态：验收发现的 R1–R6 已修复并通过 CPU/实际 USD/物理复验。**
-详见 [`indoor-scene-remediation.md`](indoor-scene-remediation.md)；当时 GPU 视觉尚未验证，
-后续人体实时截图与 CIR smoke 分别见 [键盘指南](keyboard-control.md) 和 [独立复核](verification-2026-09-23.md)。
+详见 `history/indoor-scene-remediation.md`（已归档）；当时 GPU 视觉尚未验证，
+后续人体实时截图与 CIR smoke 分别见 [键盘指南](keyboard-control.md) 和 独立复核（已归档）。
 以上第 6 节保留首次构建的历史验证记录。
 
 `scripts/scenes/view.py` 现在默认使用去顶正交俯视相机，打开后可以检查六个房间内部：

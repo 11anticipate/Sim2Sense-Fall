@@ -6,11 +6,13 @@ import numpy as np
 import pytest
 
 from sim2sense_fall.detection_data import (
+    ONSET_SOURCE_SESSION,
     ChannelSample,
     MeshMotion,
     iter_channel_samples,
     load_channel_sample,
     load_mesh_motion,
+    session_event_times,
     velocity_labels,
 )
 
@@ -18,10 +20,12 @@ TAPS = 201
 
 
 def _write_sample(directory, name, frames, activity, event_label, trial=None, failures=None):
+    """``name`` may contain ``/`` to place the sample in a session subdirectory."""
     time = np.arange(frames) * 0.05
     cir = np.zeros((frames, TAPS), dtype=np.complex128)
     cir[:, 20] = 1.0
     cir_path = directory / f"{name}.cir.npz"
+    cir_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         cir_path,
         timestamp_s=time,
@@ -154,3 +158,86 @@ def test_velocity_labels_match_analytic_monostatic_shift(tmp_path):
     vertices[:, 0, 0] = 5.0 - time  # 1 m/s toward the co-located radio
     labels = velocity_labels(sample, MeshMotion(vertices=vertices, time_s=time))
     assert labels == pytest.approx([2.0 / wavelength] * 3, rel=1e-6)
+
+
+def test_session_namespaces_keep_identical_segment_ids_distinct(tmp_path):
+    """Every session exports a `stand_00`; a batch must not train them as one sample.
+
+    The RT stage writes each session's samples under ``sionna/<session>/``, and the
+    importer's own ``channel_sample_id`` only prefixes the scene, so identity has to
+    come from the path.
+    """
+
+    _write_sample(tmp_path, "session_a/stand_00", 20, "adl", "stand")
+    _write_sample(tmp_path, "session_b/stand_00", 20, "adl", "stand")
+    samples = iter_channel_samples(tmp_path)
+    assert [sample.sample_id for sample in samples] == [
+        "session_a/stand_00", "session_b/stand_00"
+    ]
+    assert len({sample.sample_id for sample in samples}) == 2
+
+
+def test_flat_directories_keep_the_recorded_id(tmp_path):
+    _write_sample(tmp_path, "stand_00", 20, "adl", "stand")
+    assert [s.sample_id for s in iter_channel_samples(tmp_path)] == ["stand_00"]
+
+
+def _session(tmp_path, *, drop_m: float = 0.52, frames: int = 240):
+    """A synthetic keyboard session: upright, then a sustained descent to impact."""
+
+    session = tmp_path / "session_x"
+    session.mkdir(parents=True, exist_ok=True)
+    dt = 1.0 / 120.0
+    times = np.arange(frames) * dt
+    height = np.full(frames, 0.87)
+    # A fall descends and *then* hits: the drop happens before the impact frame, and
+    # the body rests at the new height afterwards.
+    impact_index = int(1.5 / dt)
+    start_index = int(0.5 / dt)
+    for index in range(start_index, impact_index + 1):
+        progress = (index - start_index) / max(impact_index - start_index, 1)
+        height[index] = 0.87 - drop_m * min(progress, 1.0)
+    height[impact_index + 1:] = 0.87 - drop_m
+    np.savez(session / "control.npz", time_s=times,
+             root=np.column_stack([np.zeros(frames), np.zeros(frames), height]),
+             root_quaternion=np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (frames, 1)))
+    export = tmp_path / "session_x_export"
+    export.mkdir(parents=True, exist_ok=True)
+    impact_s = float(times[impact_index + 4])
+    (export / "manifest.json").write_text(json.dumps({
+        "samples": [{
+            "sample_id": "falling_00",
+            "label": {"label": "fall", "first_impact_s": impact_s},
+            "session_time_span_s": [0.0, float(times[-1])],
+            "source_run": str(session),
+        }],
+    }), encoding="utf-8")
+    return export / "manifest.json", impact_s
+
+
+def test_session_onset_is_derived_from_the_sustained_descent(tmp_path):
+    manifest, impact_s = _session(tmp_path)
+    onset, impact, source = session_event_times(manifest, "falling_00")
+    assert impact == pytest.approx(impact_s)
+    assert source == ONSET_SOURCE_SESSION
+    assert onset is not None and 0.0 <= onset < impact
+    # The derived onset must be the start of the drop, not the segment start.
+    assert 0.4 < onset < 1.5, onset
+
+
+def test_session_without_a_real_drop_fails_closed(tmp_path):
+    manifest, impact_s = _session(tmp_path, drop_m=0.05)
+    onset, impact, source = session_event_times(manifest, "falling_00")
+    assert onset is None and source is None, "a 5 cm wobble is not an imbalance"
+    assert impact == pytest.approx(impact_s)
+
+
+def test_session_lookup_is_by_sample_and_missing_rows_return_none(tmp_path):
+    manifest, _ = _session(tmp_path)
+    assert session_event_times(manifest, "stand_00") == (None, None, None)
+
+
+def test_session_onset_threshold_is_validated(tmp_path):
+    manifest, _ = _session(tmp_path)
+    with pytest.raises(ValueError, match="min_descent_m"):
+        session_event_times(manifest, "falling_00", min_descent_m=float("nan"))

@@ -93,6 +93,14 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
     fraction = payload["idle_stand_height_fraction"]
     if not np.isfinite(fraction) or not 0.9 < fraction <= 1.0:
         raise ValueError("idle_stand_height_fraction must be finite in (0.9, 1.0]")
+    # Per-joint PhysX velocity clamp authored on every revolute joint. Normal
+    # actions peak around 5-9 rad/s; the clamp only bounds the ballistic speeds
+    # a drives-off fall reaches, which is what lets fall_damping_scale go to 0
+    # (fully passive limbs) without entering the measured solver-NaN regime.
+    payload.setdefault("joint_velocity_limit_rad_s", None)
+    limit = payload["joint_velocity_limit_rad_s"]
+    if limit is not None and (not np.isfinite(limit) or limit <= 0):
+        raise ValueError("joint_velocity_limit_rad_s must be finite and positive when given")
     payload["controller"] = TeleopConfig(
         **{
             key: payload[key]
@@ -108,6 +116,15 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
         payload["locomotion_root_assist"] = (
             project_root / payload["locomotion_root_assist"]
         ).resolve()
+    if "recovery_root_assist" in payload:
+        payload["recovery_root_assist"] = (
+            project_root / payload["recovery_root_assist"]
+        ).resolve()
+    if "recovery_modes" in payload:
+        modes = payload["recovery_modes"]
+        if not isinstance(modes, list) or not all(isinstance(mode, str) and mode for mode in modes):
+            raise ValueError("recovery_modes must be a list of non-empty mode names")
+        payload["recovery_modes"] = [str(mode) for mode in modes]
     specs = [*payload["gaits"].values(), payload["idle"]]
     if "crouch" in payload:
         specs.append(payload["crouch"])

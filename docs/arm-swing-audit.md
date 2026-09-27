@@ -13,11 +13,11 @@
 > 复算脚本：`artifacts/humans/arm_capture_motions/walk_strip.py`；
 > 回归测试：`tests/humans/test_motion_swing_analysis.py`（13 条）。
 
-脚本：[`diagnose_arm_swing.py`](../../scripts/humans/diagnose_arm_swing.py)、
-[`gait_seam_audit.py`](../../scripts/humans/gait_seam_audit.py)、
-[`arm_capture.py`](../../scripts/humans/arm_capture.py)、
-[`arm_fix_window_search.py`](../../scripts/humans/arm_fix_window_search.py)。
-门槛：[`configs/humans/arm_symmetry_gate.yaml`](../../configs/humans/arm_symmetry_gate.yaml)。
+脚本：`diagnose_arm_swing.py`（已归档）、
+`gait_seam_audit.py`（已归档）、
+[`arm_capture.py`](../scripts/humans/arm_capture.py)、
+`arm_fix_window_search.py`（已归档）。
+门槛：[`configs/humans/arm_symmetry_gate.yaml`](../configs/humans/arm_symmetry_gate.yaml)。
 证据：`artifacts/humans/arm_swing_audit/`、`artifacts/humans/gait_seam_audit/`、
 `artifacts/humans/arm_capture_azimuths/`、`artifacts/humans/arm_fix_search/`、
 `artifacts/humans/arm_capture_before_after/`。
@@ -255,8 +255,8 @@ P0-A 第 4 项要求「修复后复跑前进、后退、启停、转向，用同
 筛选工具与门槛先行落地：
 
 - 门槛：`configs/humans/arm_symmetry_gate.yaml`
-- 窗口扫描：`scripts/humans/arm_fix_window_search.py`
-- 库级筛选：`scripts/humans/arm_source_screen.py`
+- 窗口扫描：`scripts/humans/arm_fix_window_search.py（已归档）`
+- 库级筛选：`scripts/humans/arm_source_screen.py（已归档）`
 
 ### 方案 1（更换源窗口）已被测量否证
 
@@ -290,7 +290,7 @@ ERROR arm_fix_window_search: no window passed the pre-registered gate (137 candi
 
 因为 `1.0–6.0 s` 的右肘全段欠驱动是本片段的性质，修复必须换源。
 AMASS `.npz` 不含活动标签、CMU 文件名是数字编号，所以新增
-`scripts/humans/arm_source_screen.py` **按测量**而非按文件名识别行走：
+`scripts/humans/arm_source_screen.py（已归档）` **按测量**而非按文件名识别行走：
 先用「根水平位移 + 膝摆动周期」预筛（该判据完全不涉及手臂，
 因此不会把手臂指标变成预筛的产物），再对存活窗口测臂对称性。
 为在 2088 条序列上可行，预筛后的逐窗口重定向用进程池并行（`--workers`）。
@@ -397,6 +397,8 @@ AMASS `.npz` 不含活动标签、CMU 文件名是数字编号，所以新增
 否则「修复后通过」可能只是因为 fixture 太弱。
 
 ## 复算命令
+
+> 2026-09-26 整理：本节命令中的诊断脚本已归档（git 历史可找回），命令保留作当时执行的记录。
 
 ```bash
 python3 scripts/humans/diagnose_arm_swing.py \

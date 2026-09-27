@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "humans"))
 
 from export_session_mesh import (  # noqa: E402
+    SCHEMA_VERSION,
     export_session,
     label_segment,
     segments_from_control,
@@ -71,7 +72,7 @@ def _session(tmp_path: Path, *, impact_time_s: float | None = 4.35, modes_overri
     report = {
         "runtime_completed": True, "motion_accuracy_accepted": True, "errors": [],
         "quality_gates": {"complete_recording_window": True},
-        "motion_quality": {"schema_version": 1, "accepted": True,
+        "motion_quality": {"schema_version": SCHEMA_VERSION, "accepted": True,
                            "modes": {"forward": {"accepted": True}}},
         "actions": {"fallen_tilt_deg": 50., "fallen_height_fraction": .6},
         "fall": {"events": fall_events},
@@ -116,6 +117,24 @@ def test_export_refuses_impact_without_fall_segment(tmp_path):
     run = _session(tmp_path, modes_override=np.array(["forward"] * 180))
     with pytest.raises(ValueError, match="contradict each other"):
         export_session(run, tmp_path / "export")
+
+
+def test_stale_measurement_schema_is_refused(tmp_path):
+    """A report from a different quality schema cannot be admitted.
+
+    The batch died on exactly this contract: the exporter pinned schema_version == 1
+    while the quality module had moved on, and the fixture repeated the same literal,
+    so the drift only showed up on a real session. Both sides now import one constant,
+    and this test pins the refusal direction.
+    """
+
+    run = _session(tmp_path)
+    report = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    report["motion_quality"]["schema_version"] = SCHEMA_VERSION - 1
+    (run / "report.json").write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(ValueError, match="measurement_schema"):
+        export_session(run, tmp_path / "export")
+    assert not (tmp_path / "export" / "manifest.json").exists()
 
 
 def test_uniform_time_resamples_jitter():

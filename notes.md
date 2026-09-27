@@ -24,7 +24,7 @@
   左右不完全对称可能来自原片段，不能把对称性本身设成正确性的充分条件。
 - 三个新动作不能只增加键位：需要支撑切换、状态合法性、受阻处理、摔倒时辅助策略和标签区分。
   特别是蹲姿低骨盆高度不等于跌倒；摔倒请求不等于实际跌倒，R 复位不等于起立。
-- 既有物理证据统一见 [键盘实测](docs/keyboard-control.md) 和 [AMASS 审计](docs/amass-physics-audit-2026-09-24.md)。
+- 既有物理证据统一见 [键盘实测](docs/keyboard-control.md) 和 [AMASS 审计](docs/history/amass-physics-audit-2026-09-24.md)。
   本次只整理计划/文档，未新做动作实验。文献事实章节与原始失败记录保持原意。
 
 ## 2026-09-22 — Transitions 录屏动作表现与物理边界
@@ -96,7 +96,7 @@
 - headless Isaac repair6 通过：PD 最大误差 1.540°（容限 15°），逐 DOF 目标/实测/误差和当前 stiffness/damping 已记录，驱动关闭负对照、重力回落、地面穿透和场景哈希检查均通过；运行使用 CPU PhysX 回退，GPU/CUDA 不可用。
 - 两个旧批次索引已由 `scripts/humans/migrate_trials_index.py` 迁移，`physics_dt_s=0.008333333333333333`，并新增 `physics_hz=120.0`。
 
-- 历史复审时的结论是 SMPL CPU/USD 网格接入和胶囊碰撞原型部分通过、Isaac 完整验收不通过；该结论已由 repair6 更新。当前 AMASS 未取得，自由站立/行走仍未完成；证据见 `docs/progress.md` 与 `docs/stage7-review.md`。
+- 历史复审时的结论是 SMPL CPU/USD 网格接入和胶囊碰撞原型部分通过、Isaac 完整验收不通过；该结论已由 repair6 更新。当前 AMASS 未取得，自由站立/行走仍未完成；证据见 `docs/progress.md` 与 `docs/history/stage7-review.md`。
 - 文件存在、成功加载、用于实际几何、物理姿态驱动蒙皮是四个不同验收条件；当前 CPU/USD 路径已接入真实 neutral 网格，Isaac 逐帧稳定性仍未通过。
 - PD 中程测试重复转弧度，75 度目标变为 1.309 度，历史 2 度误差不可外推为动作跟踪合格。
 - 轨迹启发式撞击不是测得接触；近地体点和速度必须对应同一体点/方向。水平移动负例已被错误标为 fall。
@@ -195,7 +195,7 @@
 
 ### E07 最终交付
 
-- 验收报告：`docs/indoor-scene-review.md`；结论为需整改，R1–R6 未在本次审查中改动。
+- 验收报告：`docs/history/indoor-scene-review.md`；结论为需整改，R1–R6 未在本次审查中改动。
 - 新查看入口已通过 USD 单元测试和 Isaac 无界面视口集成；临时去顶显示与完整仿真几何分离。重新导出与原始资产哈希一致。
 - 接下来应先修错误退出码和真实几何，再开展 GPU 视觉、机器人可达性以及分材质摩擦/无线传播验证。
 
@@ -208,7 +208,7 @@
 ### E08 复验与交付
 
 - R1–R6 已闭环：CPU 70 tests passed；依赖 USD 的测试在 bundled 环境另跑 9 passed；真实 Isaac 正例退出 0、旧资产/新清单负例退出 1。
-- 默认 USD 已更新，实际几何无家具越界/穿墙；地基顶面为 -0.12 m。详细版本、容差与证据见 `docs/indoor-scene-remediation.md`。
+- 默认 USD 已更新，实际几何无家具越界/穿墙；地基顶面为 -0.12 m。详细版本、容差与证据见 `docs/history/indoor-scene-remediation.md`。
 - 量化摩擦标定、机器人可达性、真实 GPU 光照和 Sionna 传播仍未验证，不能据本轮资产检查推断其效果。
 
 ## E09 — 场景模块边界整理

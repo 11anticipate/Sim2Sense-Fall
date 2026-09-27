@@ -35,11 +35,19 @@ def audit(run: Path, rig: Path) -> dict:
         "floor_contact_slips_m_s": contacts[i]["floor_contact_slips_m_s"]}
         for i in range(len(times))]
     with np.load(run / "recording.npz", allow_pickle=False) as data:
+        # Sessions recorded before the whole-body gate exist have no body_min_z_m;
+        # recover it from the retained vertices so old runs stay auditable.
+        if "body_min_z_m" in data.files:
+            body_min_z = data["body_min_z_m"]
+        elif "mesh_vertices_xyz" in data.files:
+            body_min_z = data["mesh_vertices_xyz"].min(axis=1)[:, 2].astype(np.float64)
+        else:
+            body_min_z = None
         quality = motion_quality(
             rows, data["time_s"], data["foot_min_z_m"],
             config=MotionQualityConfig(**report["motion_quality"]["config"]),
             dt_s=report["physics_dt_s"], mass_kg=config.skeleton.mass_kg,
-            gravity_m_s2=config.simulation.gravity_m_s2)
+            gravity_m_s2=config.simulation.gravity_m_s2, skin_min_z_m=body_min_z)
     return {
         "motion_quality": quality,
         "source_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),

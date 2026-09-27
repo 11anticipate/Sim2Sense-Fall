@@ -61,6 +61,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--velocity-weight", type=float, default=0.0)
     parser.add_argument("--held-out", nargs="*", default=None,
                         help="sample ids to hold out; default: one per activity class")
+    parser.add_argument("--splits", type=Path, default=None,
+                        help="splits.json from scripts/sionna/assign_splits.py; when given, "
+                             "the held-out set is every sample of --eval-split (group-aware: "
+                             "a physics session never straddles the split)")
+    parser.add_argument("--eval-split", choices=("val", "test"), default="test",
+                        help="which split of --splits to score (default test)")
     parser.add_argument("--loo", action="store_true",
                         help="leave-one-sample-out over all samples instead of one split")
     parser.add_argument("--pretrain-epochs", type=int, default=0,
@@ -180,13 +186,23 @@ def main(argv: list[str] | None = None) -> int:
         per_sample_counts[sample.sample_id] = sum(item.usable for item in built)
         examples.extend(built)
     velocity_labelled = sum(item.velocity is not None for item in examples)
-    held_out = set(
-        args.held_out
-        if args.held_out is not None
-        else default_holdout(
-            [(s.sample_id, s.activity) for s in sorted(samples, key=lambda s: s.sample_id)]
+    if args.splits is not None:
+        payload = json.loads(Path(args.splits).read_text(encoding="utf-8"))
+        held_out = {str(row["sample_id"]) for row in payload["samples"]
+                    if row.get("split") == args.eval_split}
+        if not held_out:
+            raise SystemExit(f"{args.splits}: no samples in split {args.eval_split!r}")
+        print(f"splits from {args.splits} (seed {payload.get('seed')}, "
+              f"batch {payload.get('batch')}): holding out {len(held_out)} "
+              f"{args.eval_split}-split samples")
+    else:
+        held_out = set(
+            args.held_out
+            if args.held_out is not None
+            else default_holdout(
+                [(s.sample_id, s.activity) for s in sorted(samples, key=lambda s: s.sample_id)]
+            )
         )
-    )
     config = TrainConfig(
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, seed=args.seed,
         hidden=args.hidden, activity_weight=args.activity_weight,

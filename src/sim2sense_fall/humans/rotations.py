@@ -587,3 +587,21 @@ def split_rotation(
         rotation_split_residual_rad(matrix, canonical_axes, angles),
         _limit_violation_deg(angles, limits_deg),
     )
+
+
+def trunk_tilt_deg(quaternion: np.ndarray) -> float:
+    """Tilt of the root's up-axis away from world +Z, in degrees.
+
+    ``R[2][2] = 1 - 2*(x^2 + y^2)`` for a (w, x, y, z) quaternion. A pure yaw (the
+    standing heading, e.g. 90 deg in (0.707, 0, 0, 0.707)) must read 0 deg here;
+    using the ``1 - 2*(y^2 + z^2)`` element instead reads the yaw itself as a 90
+    deg lie. Shared by the session exporter (fall verification) and the detector's
+    label derivation so the two can never disagree about what "lying down" means.
+    """
+
+    values = np.asarray(quaternion, dtype=float)
+    if values.shape != (4,):
+        raise ValueError(f"quaternion must have shape (4,), got {values.shape}")
+    w, x, y, _z = values
+    r22 = 1.0 - 2.0 * (x * x + y * y)
+    return float(np.degrees(np.arccos(np.clip(r22, -1.0, 1.0))))

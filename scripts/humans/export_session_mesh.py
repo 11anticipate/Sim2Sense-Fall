@@ -42,6 +42,16 @@ from typing import Any
 
 import numpy as np
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT / "src") not in sys.path:
+    # Same convention as import_fall_mesh.py: the batch emits this script under a
+    # bare `python3` with no PYTHONPATH, and the quality schema constant must be
+    # importable from exactly one place.
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from sim2sense_fall.humans.quality import SCHEMA_VERSION  # noqa: E402
+from sim2sense_fall.humans.rotations import trunk_tilt_deg  # noqa: E402
+
 LOGGER = logging.getLogger("export_session_mesh")
 
 SEGMENT_LABELS = {
@@ -64,17 +74,9 @@ _RESET_STEP_M = 0.05
 
 
 def trunk_angle_deg(quaternion: np.ndarray) -> float:
-    """Tilt of the root's up-axis away from world +Z, in degrees.
+    """See :func:`sim2sense_fall.humans.rotations.trunk_tilt_deg` (single source)."""
 
-    ``R[2][2] = 1 - 2*(x^2 + y^2)`` for a (w, x, y, z) quaternion. A pure yaw
-    (the standing heading, e.g. 90 deg in (0.707, 0, 0, 0.707)) must read 0 deg
-    here; using the ``1 - 2*(y^2 + z^2)`` element instead reads the yaw itself
-    as a 90 deg lie.
-    """
-
-    w, x, y, z = quaternion
-    r22 = 1.0 - 2.0 * (x * x + y * y)
-    return float(np.degrees(np.arccos(np.clip(r22, -1.0, 1.0))))
+    return trunk_tilt_deg(quaternion)
 
 
 def segments_from_control(
@@ -241,7 +243,8 @@ def export_session(
         "complete_recording_window": report.get("quality_gates", {}).get(
             "complete_recording_window"
         ) is True,
-        "measurement_schema": report.get("motion_quality", {}).get("schema_version") == 1,
+        "measurement_schema": report.get("motion_quality", {}).get("schema_version")
+        == SCHEMA_VERSION,
     }
     invariants_ok = all(invariants.values())
     if not invariants_ok and not diagnostic:
