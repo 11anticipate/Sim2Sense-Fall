@@ -1,6 +1,6 @@
 # Sim2Sense-Fall 项目计划
 
-更新：2026-09-27（起身悬空两处根因修复 + 低姿支撑口径预登记 + 训练前批量包 train01 开跑）。
+更新：2026-09-27 夜（train02 扩量批次上机 + 报警级评测口径预登记；起身悬空两处根因已修）。
 阶段7普通行走/站立接触整改已通过；起身（G）观感大幅改善但**仍未过门**，蹲/起质量项继续阻断整阶段验收。
 当前正在执行未完成的人体整改与训练前数据准备；只有实测通过的项目才勾选。
 证据与文档入口见 [文档索引](docs/README.md)，历次执行见 [进度](docs/progress.md)。
@@ -96,6 +96,72 @@
 这些工程检查不替代人体物理门。完整记录见整改实测，阶段7/8均不标为完成。
 
 ## 执行顺序
+
+### ProtoMotions 路线启动（2026-09-30，用户拍板）：验证周进行中
+
+- [x] 调研与拍板：NVIDIA 官方 ProtoMotions（SMPL+AMASS RL 跟踪，物理纯闭环）为主路线；
+  自研 rig 保留为回退与对照数据源；动画人路线确认无物理已排除。
+- [x] 环境与数据桥：mujoco(CPU)/newton(GPU) venv 就绪；IsaacLab pinned 卡
+  ovphysx 精确 pin 暂停；4 段现役同源 AMASS 片段（绊倒/起身/步态×2）转 MotionLib 成功。
+- [x] 对照组判定：G1 deploy tracker 在 mujoco 上 success 96.6% ⇒ 管线正确；
+  SMPL 预训练 tracker mujoco 0% ⇒ 跨模拟器迁移限制（模型卡明示），非数据缺陷。
+- [x] **验证周核心完成**：Newton 自训 SMPL tracker（2000 迭代，~55 min，4060 单卡）
+  对 4 段现役同源动作（绊倒/起身/步态×2）`--full-eval` **success_rate 1.000（4/4）**，
+  gt_error mean 0.131——"RL 能物理跟踪我们的摔倒/起身/步态" 成立。
+  如实边界：动作尚糙（high_jerk 67.8%）、平地空场景、训练评测同库。
+- [x] **真值导出管线打通（2026-09-30 续）**：`scripts/protomotions/export_tracker_trials.py`
+  两种模式——reference（CPU，蒙皮 MotionLib 参考态）与 tracker（GPU，逐物理子步快照
+  实测态，原生 120 Hz 无插值）；标签走 `label_trial` 预登记规则作用于实测轨迹；
+  产物 = simulate.py 同款 trial 契约。reference 导出 4/4 过 `import_fall_mesh`
+  load_geometry 契约；蒙皮帧约定经探针验证自洽（站立 1.68 m / 躺平 0.63 m）；
+  渲染预览已出（绊倒序列观感正确）。
+- [ ] **进行中**：过夜训练 r3（2000→10000 迭代）完成后跑 tracker 模式导出 + 渲染，
+  交用户验收观感；之后公寓场景接入（SceneLib）。
+- [ ] 下一步候选（待拍板）：①过夜 10k 迭代收紧精度；②公寓场景接入 + 120 Hz mesh
+  真值导出管线（SMPL 刚体位姿→本仓库 LBS→Sionna）；③BABEL 标注接入（v1.0 zip 已在
+  `data/humans/`，未解压；v2.0 需 babel.cps.unizar.es 独立账号）。
+- [x] AMASS 子集扩量（2026-09-30）：KIT（4232 段，100 fps）+ BMLmovi（1801 段，120 fps）
+  已下载解压入 `data/humans/amass_raw/`，SMPL+H gender_specific mosh 变体，poses (N,156)
+  与既有管线同口径；shas 与账号溯源入 `artifacts/humans/asset_fetch_log.json`。
+  官网域名已迁移 `.edu`→`.de`（旧域名 NXDOMAIN 是此前下载反复中断的根因），
+  `fetch.py` 适配新站（onclick 藏链 + PHPSESSID 判定），下载实测 5/12 段断点续传接上。
+
+### 动作质量诊断与修复（2026-10-02，用户三连质疑驱动）
+
+- [x] **诊断定案**：用户看到渲染"四肢非常抖"属实且在数据产品里。定量口径换新——
+  **接触顶点 min-z 曲线**（体平均 NJ/high_jerk 会把局部脚部信号稀释 ~5 倍，作废）。
+  实测 Trial_77 站立：参考脚钉地（1s 峰峰 0.3cm/0.7Hz），r4 硬增益 10.9cm/21.6Hz；
+  min-z 频谱双峰=**5-8Hz 弹跳（29%）+12-20Hz 求解器纹波（26%）**+1-3Hz 慢晃（27%）。
+  机理=硬 PD（踝 kp=800）踝环振铃 × 刚性接触，**非训练不足**（holdout 90-91% 从
+  2.5k→12k 迭代平台收敛）。
+- [x] **免重训杠杆全部出局（各一次实测）**：action-EMA 0.5、全局阻尼×2、脚部接触强化
+  （solref/margin）——**三者全部让 5 段 trial 早停**，该策略只在训练时的精确被控对象内
+  工作；产品侧修复只能走物理后处理。
+- [x] **立即产品修复**：`scripts/protomotions/filter_trial_mesh.py`（4Hz 零相位
+  Butterworth，可验证——此前名为"8Hz 滤波"的 `export_tracker_r4_filt` 实测与未滤波
+  基线指标全同，名不副实）。4Hz 版：过零 21.6→4.5Hz、穿透 −6.3→−3.9cm、脚部视频特写
+  与参考同样安静；1-3Hz 重心慢晃（策略未学会静站）滤波切不掉，留待重训。
+  `measure_contact_chatter.py`、`render_trial_mesh.py`（跟随相机三方对比）入库带测试。
+  验收视频：`artifacts/protomotions_bridge/compare_Trial_77_ref_r4_filt4.mp4`、
+  `compare_walking_run07_ref_r4_filt4.mp4`。
+- [ ] **根治重训（进行中，~11h）**：纠正版软增益=软 kp 保持 250/150/500…但 **kd=kp/10**
+  （上次软增益 kd/kp=0.01 欠阻尼，是它仍振铃的设计错误）；平滑 −0.05、评测禁用、
+  256 env/batch 1024/TF32；全库四分片（production_soft2_shard{1-4}.pt，由
+  production_train.pt 重切）链式轮换（后台 chain 脚本，完成通知续片）。完成后：
+  min-z 指标 + holdout 考试 + 渲染验收 → 产品线拍板（ADL 走 kinematic 参考导出、
+  tracker 专职物理摔倒/扰动）。
+
+### 自碰撞过滤机制落地（2026-09-29，官方工作流；默认仍关闭）
+
+- [x] 机制：`rig.rest_overlap_pairs(margin_m)` + `UsdPhysics.FilteredPairsAPI` authoring +
+  rig 键 `self_collision_filter_rest_overlap`（默认 true）+ authoring 报告入 keyboard
+  report.json；出厂 rig 实测静止重叠 36 对、margin=contact_offset 后 38 对。
+- [x] GPU 三档消融（`artifacts/humans/selfcollide_ab/`）：off=全门过；flag-only=59 步
+  NaN 爆炸；on（开+过滤）=不炸但行走劣化（root z 0.16、足穿地 −138 mm、关节 54°）。
+  PhysX 不上报关节链内部接触对——官方"跑-观察-过滤"迭代缺观测输入。
+- [ ] **启用自碰撞的前置**（用户决策）：按运动状态运行时开关（行走关/摔倒开），或
+  全配对普查+白名单。默认 `self_collisions: false` 不变，机制已就绪。
+- [x] 门禁：563 passed / 15 skipped（+4 单测）、compileall、ruff 全过。
 
 ### 滑步专项：2026-09-25 用户要求定位并解决（完成限定验收）
 
@@ -370,6 +436,54 @@
       112–115°、肘 ~8°）保持人形、峰值 866 deg/s 碰不到限速。正常动作门零
       回归（误差 5.5°、滑速 p95 0.019、正常峰值 8.4 rad/s 余量 2.4 倍）。
       见 [摔倒释放专项](docs/fall-release-2026-09-27.md)。
+
+### train02 扩量与报警级口径（2026-09-27 夜，用户指令：完成正式训练前所有任务）
+
+- [x] 净空审计增加逐轴可行走距离探测（站立点用 r=0.9 活动包络、走廊用 r=0.3 人宽包络），
+      16 个候选 spawn 的实测 run 长度入库；行走协议只排给跑得开的 spawn。
+- [x] train02 会话矩阵：9 类协议 × 审计 spawn × 朝向自动排程，40 会话
+      （20 摔倒触发情境 + 20 ADL），只含当前过门的活动；40/40 独立复核行走需求与净空、
+      40/40 CPU dry-run 通过。
+- [x] 逐样本确定性 RT seed（`rt_seed_base` + crc32 样本身份；不用加盐 hash、不用计数器），
+      120 Hz 全率前端 + 按会话命名空间的 CIR 输出。
+- [x] `run_batch_loop.sh` 自愈循环：有界重展开续跑，已在收敛批次上验证。
+- [x] **报警级评测口径预登记**（`sim2sense_fall/detection_eval.py`）：hold-off 事件计数、
+      延迟预算内才算检出（onset 前已在响不记功）、误报按每小时事件并按物理会话分组，
+      pooled 与 per-group macro 同时报。13 条单测。
+- [x] 修掉三处真缺陷（含测试抓出的 Python 求值顺序 IndexError、`channel_activity` 漏
+      `sit/bend` 导致 ADL 分母偏小＝误报率被低估、`evaluate_batch` 非递归 glob 与
+      重复的 onset 解析），并加导出器/导入器标签漂移守卫。
+- [x] train02 跑完：40 会话 0 errors，157 段导出 → **117 段过分段门并完成 120 Hz 全率 CIR**
+      （逐样本 113 个不同 seed），划分 train/val/test = 70/24/23、泄漏为空、
+      仅 `bend`(2 组) 登记为组数不足；数据卡 [dataset-train02](docs/dataset-train02.md)。
+      train01 里 `activity="unknown"` 的 sit 样本已按修复重跑（seed 与本批一致 42，
+      397 帧全过，`splits.json` 重算后逐样本分桶不变）。
+- [x] 基线检测器的报警级首读数（两批对照，见数据卡）：train02 检出 0.80 (16/20)、
+      延迟中位 +0.18 s（相对导出 onset）/ **−0.30 s（相对实测冲击）**、
+      **568 误报/小时**。结论：基线等于"几乎常响"，正式模型必须先打败这条 FP/h 线；
+      且它响在撞击之前，不能写成"检测到撞击"。
+- [x] **train03（长时 ADL 曝光）**：23 会话 / 805 s 仿真（ADL 739 s，预计准入 ~0.17 h），
+      只含 4 类长协议（长巡走 81 s / 中巡走 45 s / 久站 46 s / 弯腰保持 17 s）
+      + 两类 100% 过门的摔倒作正样本；23/23 独立复核净空与 dry-run 通过。
+      磁盘是硬约束（全批 mesh ≈24 GB > 剩余空间），为此给批量驱动加了三个开关：
+      RT 成功后删该段 mesh、`--session-chunk-index/count` 连续分块、`min_free_gb` 开跑前 df 闸。
+      数据卡 [dataset-train03](docs/dataset-train03.md)。
+- [x] train03 三块跑完（138 段 / 773 s 准入、0 失败），合并根
+      `artifacts/batches/train02_03/`（硬链接，0 额外磁盘）→ 255 段 / 63 组、泄漏为空；
+      同名会话的组塌缩问题已在 `assign_splits.collect` 里按"相对 RT 根的完整目录"解决并有单测。
+      第二轮训练已跑：test 上模型 0.571 (4/7) 检出 / 136–170 误报每小时 vs 基线 0.714 (5/7) / 374，
+      cluster 配对检验 p=0.14–0.22（不显著），`data_sufficiency` 全 False。
+      速度项吃掉目标的病因已治好（fall 项 0.3% → 59–67%，概率支撑张开到 0.988）。
+      结论与全表见 [dataset-train03](docs/dataset-train03.md)。
+- [x] **第一轮正式训练读数作废并重建**（09-27 深夜）：
+      ① 误报率分母按检测器算（35.0 s vs 19.4 s）已修成"按样本准入曝光"；
+      ② 同 seed 四次重跑 0.864/0.762/0.847/0.515 的根因**不是**线程数，而是
+      `train_baseline` 在 seeding 之前就构造了 `FallNet`（我最初的归因是错的，已公开更正）；
+      修成 `build_model()` 统一 seed-后-构造 + `deterministic` 默认开 + 末 10 epoch 权重均值，
+      现在两次同 CLI 重跑 404 条概率与全部事件指标**逐位一致**；
+      ③ 可复现重建的 test 读数：模型 1.00 (5/5) 检出 / 1 次误报（103/h），
+      基线 0.80 (4/5) / 6 次（618/h）——区间完全重叠，`data_sufficiency` 三条仍全不达标。
+      详见 [dataset-train02](docs/dataset-train02.md) 的"第一轮正式训练"一节。
 
 ### 起身悬空专项（2026-09-27，用户实测缺陷 + 训练前清账）
 

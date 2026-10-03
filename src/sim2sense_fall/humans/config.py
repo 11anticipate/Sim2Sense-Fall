@@ -322,6 +322,7 @@ class RigConfig:
     segments: Mapping[str, SegmentConfig]
     joints: Mapping[str, JointConfig]
     horizontal_foot_capsules: bool = False
+    self_collision_filter_rest_overlap: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.root_joint, str) or not self.root_joint.strip():
@@ -335,6 +336,9 @@ class RigConfig:
             )
         strict_bool(self.self_collisions, "rig.self_collisions")
         strict_bool(self.horizontal_foot_capsules, "rig.horizontal_foot_capsules")
+        strict_bool(
+            self.self_collision_filter_rest_overlap, "rig.self_collision_filter_rest_overlap"
+        )
         for name in ("contact_offset_m", "rest_offset_m", "linear_damping", "angular_damping"):
             finite_number(getattr(self, name), f"rig.{name}")
         if self.contact_offset_m < 0 or self.rest_offset_m < 0:
@@ -901,6 +905,7 @@ def human_config_from_mapping(
         rig_payload,
         {
             "horizontal_foot_capsules",
+            "self_collision_filter_rest_overlap",
             "root_joint",
             "root_mode",
             "collider",
@@ -924,6 +929,9 @@ def human_config_from_mapping(
     }
     rig = RigConfig(
         horizontal_foot_capsules=_as_bool(rig_payload, "horizontal_foot_capsules", default=False),
+        self_collision_filter_rest_overlap=_as_bool(
+            rig_payload, "self_collision_filter_rest_overlap", default=True
+        ),
         root_joint=_as_str(rig_payload, "root_joint"),
         root_mode=_as_str(rig_payload, "root_mode", default="free"),
         collider=_as_str(rig_payload, "collider", default="capsule"),

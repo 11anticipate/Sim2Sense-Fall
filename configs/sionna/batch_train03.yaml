@@ -1,0 +1,73 @@
+# 训练前 ADL 扩量批量包 train03（2026-09-27）。
+# 由 scripts/humans/make_dataset_configs.py --batch train03 --print-plan \
+#       --max-sessions 23 \
+#       --only fall_standing,fall_forward,adl_long_patrol,adl_patrol_mid,adl_long_stand,adl_bend_hold
+#   生成；会话配置须先由该脚本产出（spawn 必须来自净空审计，行走需求必须被实测 run 长度覆盖）。
+# 目的：train02 只准入 210 s ADL 信道材料，误报率的分母不足以引用；本批把 ADL 仿真时长
+#   提到 739 s（预计准入 ~628 s），并用 4 类长时 ADL（长巡走/中巡走/久站/弯腰保持）
+#   压每小时误报这一指标。摔倒只保留 100% 过门的 standing/forward 两类作正样本对照。
+# 展开并执行：
+#   PYTHONPATH=src python3 scripts/sionna/batch_generate.py \
+#     --plan configs/sionna/batch_train03.yaml --out artifacts/batches/train03
+#   bash scripts/sionna/run_batch_loop.sh configs/sionna/batch_train03.yaml artifacts/batches/train03 12
+description: 'train03: 23 会话，spawn x 触发情境 x 朝向矩阵，只含当前过门的活动'
+trials: []
+sessions:
+- config: configs/humans/dataset/train03/01_fall_standing_sp040_bedroom.yaml
+  name: 01_fall_standing_sp040_bedroom
+- config: configs/humans/dataset/train03/02_fall_forward_sp040_bedroom.yaml
+  name: 02_fall_forward_sp040_bedroom
+- config: configs/humans/dataset/train03/03_adl_long_patrol_sp040_corridor.yaml
+  name: 03_adl_long_patrol_sp040_corridor
+- config: configs/humans/dataset/train03/04_adl_patrol_mid_sp040_bedroom.yaml
+  name: 04_adl_patrol_mid_sp040_bedroom
+- config: configs/humans/dataset/train03/05_adl_long_stand_sp040_bedroom.yaml
+  name: 05_adl_long_stand_sp040_bedroom
+- config: configs/humans/dataset/train03/06_adl_bend_hold_sp040_bedroom.yaml
+  name: 06_adl_bend_hold_sp040_bedroom
+- config: configs/humans/dataset/train03/07_fall_standing_sp040_kitchen.yaml
+  name: 07_fall_standing_sp040_kitchen
+- config: configs/humans/dataset/train03/08_fall_forward_sp040_kitchen.yaml
+  name: 08_fall_forward_sp040_kitchen
+- config: configs/humans/dataset/train03/09_adl_long_patrol_sp040_corridor.yaml
+  name: 09_adl_long_patrol_sp040_corridor
+- config: configs/humans/dataset/train03/10_adl_patrol_mid_sp040_kitchen.yaml
+  name: 10_adl_patrol_mid_sp040_kitchen
+- config: configs/humans/dataset/train03/11_adl_long_stand_sp040_kitchen.yaml
+  name: 11_adl_long_stand_sp040_kitchen
+- config: configs/humans/dataset/train03/12_adl_bend_hold_sp040_kitchen.yaml
+  name: 12_adl_bend_hold_sp040_kitchen
+- config: configs/humans/dataset/train03/13_fall_standing_sp040_living_room.yaml
+  name: 13_fall_standing_sp040_living_room
+- config: configs/humans/dataset/train03/14_fall_forward_sp040_living_room.yaml
+  name: 14_fall_forward_sp040_living_room
+- config: configs/humans/dataset/train03/15_adl_long_patrol_sp040_corridor.yaml
+  name: 15_adl_long_patrol_sp040_corridor
+- config: configs/humans/dataset/train03/16_adl_patrol_mid_sp040_corridor.yaml
+  name: 16_adl_patrol_mid_sp040_corridor
+- config: configs/humans/dataset/train03/17_adl_long_stand_sp040_living_room.yaml
+  name: 17_adl_long_stand_sp040_living_room
+- config: configs/humans/dataset/train03/18_adl_bend_hold_sp040_living_room.yaml
+  name: 18_adl_bend_hold_sp040_living_room
+- config: configs/humans/dataset/train03/19_fall_standing_sp040_bathroom.yaml
+  name: 19_fall_standing_sp040_bathroom
+- config: configs/humans/dataset/train03/20_fall_forward_sp040_bathroom.yaml
+  name: 20_fall_forward_sp040_bathroom
+- config: configs/humans/dataset/train03/21_adl_long_patrol_sp040_corridor.yaml
+  name: 21_adl_long_patrol_sp040_corridor
+- config: configs/humans/dataset/train03/22_adl_patrol_mid_sp040_corridor.yaml
+  name: 22_adl_patrol_mid_sp040_corridor
+- config: configs/humans/dataset/train03/23_adl_long_stand_sp040_bathroom.yaml
+  name: 23_adl_long_stand_sp040_bathroom
+rt_target_hz: 120
+rt_frames: 24
+rt_seed_base: 20260927
+render_frames: false
+# 120 Hz mesh costs ~10 MB of recording plus ~20 MB of segment export per simulated second:
+# 805 s of train03 protocol is ~24 GB, more than the free space on this disk. Each accepted
+# RT trace therefore deletes its own segment mesh (re-derivable from recording.npz on CPU),
+# the plan is executed in 3 contiguous session chunks, and no pass starts below 6 GB free.
+prune_mesh_after_import: true
+min_free_gb: 6
+split_label: train03_grouped_by_session_pending_splits_json
+

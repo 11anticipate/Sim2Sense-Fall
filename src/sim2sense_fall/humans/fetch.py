@@ -79,6 +79,10 @@ USER_AGENT = "Sim2Sense-Fall asset fetch/1.0 (licensed research use)"
 #: A body that starts like this is an HTML page, not the requested archive.
 _HTML_SNIFF = re.compile(rb"<\s*(?:!doctype html|html|head|body|form)\b", re.IGNORECASE)
 
+#: A modal-open handler whose first argument is an sfile download URL, as used by the
+#: 2026 MPI download pages (``openModalLicense('https://download.is.tue.mpg.de/...')``).
+_ONCLICK_ASSET_RE = re.compile(r"\('([^']*sfile=[^']+)'")
+
 
 class FetchError(RuntimeError):
     """A fetch step failed for a reason the operator can act on."""
@@ -543,6 +547,16 @@ class _LinkCollector(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {str(key).lower(): (value or "") for key, value in attrs}
+        # The 2026 MPI redesign hides archive links in modal-open button handlers
+        # (``openModalLicense('...download.php?...&sfile=<path>.tar.bz2', ...)``) instead
+        # of anchor hrefs; recover them so the page keeps listing downloads.
+        onclick = values.get("onclick", "")
+        for match in _ONCLICK_ASSET_RE.finditer(onclick):
+            url = match.group(1)
+            query = urllib.parse.urlsplit(url).query
+            sfile = (urllib.parse.parse_qs(query).get("sfile") or [""])[0]
+            label = Path(urllib.parse.unquote(sfile)).name or url
+            self.links.append((label, url))
         if tag == "a" and values.get("href"):
             self._href = values["href"]
             self._text = []
@@ -662,7 +676,11 @@ def discover(
             (
                 cookie.name
                 for cookie in session.cookiejar
-                if any(hint in cookie.name.lower() for hint in ("session", "phpbb", "jsid", "auth"))
+                if any(
+                    hint in cookie.name.lower()
+                    # "sessid" covers PHPSESSID, which does not contain "session".
+                    for hint in ("session", "sessid", "phpbb", "jsid", "auth")
+                )
             ),
             None,
         )

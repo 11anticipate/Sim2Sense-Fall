@@ -40,6 +40,12 @@ class ChannelSample:
     receiver_xyz: tuple[float, ...] | None = None
     carrier_hz: float | None = None
 
+    @property
+    def duration_s(self) -> float:
+        """Span of the traced stream in seconds; false alarms per hour need a denominator."""
+
+        return float(self.time_s[-1] - self.time_s[0]) if len(self.time_s) > 1 else 0.0
+
 
 @dataclass(frozen=True, slots=True)
 class MeshMotion:

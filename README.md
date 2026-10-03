@@ -129,13 +129,19 @@ PYTHONPATH=src python3 scripts/humans/make_dataset_configs.py
 # 3) 展开为幂等脚本并执行（Isaac 会话 → 分段导出 → Sionna CIR；中断可重跑）
 PYTHONPATH=src python3 scripts/sionna/batch_generate.py --plan configs/sionna/batch_train01.yaml \
     --out artifacts/batches/train01 && bash artifacts/batches/train01/run_batch.sh
+#    盘不够时用自愈循环 + 分批：plan 里 prune_mesh_after_import/min_free_gb，
+#    再 --session-chunk-index K --session-chunk-count N（见 docs/dataset-train03.md）
 # 4) 分组感知划分（分组单位=物理会话，绝不按样本切分）
 PYTHONPATH=src python3 scripts/sionna/assign_splits.py --batch artifacts/batches/train01 \
     --seed 20260927 --fractions 0.6,0.2,0.2
-# 5) 训练入口消费 splits
+# 5) 训练入口消费 splits：阈值只在 val 上选，test 只评一次；
+#    默认单线程可复现，报"末 N 个 epoch 的权重均值"而不是最后一个 epoch
+#    （--device cuda 时 use_deterministic_algorithms 会对缺少确定性实现的算子直接报错，
+#     那是有意的：宁可失败也不要给出一条重建不出来的曲线；要跑 CUDA 就显式加 --nondeterministic）
 ~/.local/opt/sionna/bin/python scripts/sionna/train_baseline.py \
     --sionna-dir artifacts/batches/train01/sionna --splits artifacts/batches/train01/splits.json \
-    --eval-split test --device cuda
+    --eval-split val --event-threshold-sweep 0.3,0.5,0.7,0.9 --average-last-epochs 10 \
+    --device cuda
 ```
 
 ## 室内场景

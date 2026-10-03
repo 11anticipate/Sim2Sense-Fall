@@ -29,6 +29,13 @@ from sim2sense_fall.detection import (  # noqa: E402
     cir_features,
     detect_fall,
 )
+from sim2sense_fall.detection_data import iter_channel_samples  # noqa: E402
+from sim2sense_fall.detection_eval import (  # noqa: E402
+    EventEvalConfig,
+    aggregate,
+    config_dict,
+    sample_event_metrics,
+)
 from sim2sense_fall.windowing import WindowConfig  # noqa: E402
 
 
@@ -43,18 +50,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--baseline-tau-s", type=float, default=0.3)
     parser.add_argument("--window-length-s", type=float, default=0.2)
     parser.add_argument("--stride-s", type=float, default=0.1)
+    parser.add_argument("--splits", type=Path, default=None,
+                        help="splits.json from assign_splits.py; with --only-split it "
+                             "restricts the evaluation to one split so the baseline and a "
+                             "trained model can be compared on the same held-out sessions")
+    parser.add_argument("--only-split", choices=("train", "val", "test"), default=None)
+    parser.add_argument("--hold-off-s", type=float, default=5.0,
+                        help="alarm episodes closer together than this count as one event")
+    parser.add_argument("--max-latency-s", type=float, default=5.0,
+                        help="an episode starting later than this after the imbalance onset "
+                             "is a miss, not a slow detection")
     return parser.parse_args(argv)
-
-
-def event_times(import_payload: dict) -> tuple[float | None, float | None]:
-    """Resolve (imbalance onset, impact) from the referenced physics trial."""
-
-    trial_path = (import_payload.get("source") or {}).get("source")
-    if not trial_path or not Path(trial_path).exists():
-        return None, None
-    trial = json.loads(Path(trial_path).read_text(encoding="utf-8"))
-    label = trial.get("label") or {}
-    return label.get("imbalance_onset_s"), label.get("first_impact_s")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,42 +72,60 @@ def main(argv: list[str] | None = None) -> int:
         power_threshold_db=args.power_threshold_db,
         delay_spread_threshold_s=args.delay_spread_threshold_ns * 1e-9,
     )
+    event_config = EventEvalConfig(hold_off_s=args.hold_off_s,
+                                   max_detection_latency_s=args.max_latency_s)
     window = WindowConfig(
         window_length_s=args.window_length_s, stride_s=args.stride_s,
         threshold=0.8, min_consecutive_positive_windows=2,
     )
     rows: list[dict] = []
-    for cir_path in sorted(args.sionna_dir.glob("*.cir.npz")):
-        import_path = cir_path.with_suffix("").with_suffix(".import.json")
-        if not import_path.exists():
+    # One loader for identity, label resolution and failure admission: it globs the
+    # per-session namespaces the batch writes and derives the imbalance onset from a
+    # keyboard session's measured root trajectory (a trial carries its own).
+    split_of: dict[str, str] = {}
+    if args.splits is not None:
+        payload = json.loads(args.splits.read_text(encoding="utf-8"))
+        split_of = {str(row["sample_id"]): str(row["split"]) for row in payload["samples"]}
+        if args.only_split is None:
+            print("note: --splits given without --only-split; evaluating every sample")
+    skipped = 0
+    for sample in iter_channel_samples(args.sionna_dir):
+        if args.only_split is not None and split_of.get(sample.sample_id) != args.only_split:
+            skipped += 1
             continue
-        payload = json.loads(import_path.read_text(encoding="utf-8"))
-        if payload.get("failures"):
-            continue
-        archive = np.load(cir_path)
-        onset_s, impact_s = event_times(payload)
         result = detect_fall(
-            cir_features(archive["cir"], archive["delay_s"]),
-            archive["timestamp_s"].astype(np.float64),
-            detector, window,
+            cir_features(sample.cir, sample.delay_s), sample.time_s, detector, window,
         )
+        onset_s, impact_s = sample.imbalance_onset_s, sample.first_impact_s
         first_alarm = result["first_alarm_s"]
         latency = (
             first_alarm - onset_s
             if (onset_s is not None and first_alarm is not None) else None
         )
+        event = sample_event_metrics(
+            sample.time_s, result["alarm_flag"], activity=sample.activity,
+            onset_s=onset_s, impact_s=impact_s, config=event_config,
+            # Same exposure definition the window model is divided by: the admitted channel
+            # duration of the sample, not whatever span this detector happened to score.
+            duration_s=float(sample.duration_s),
+        )
         rows.append({
-            "sample_id": payload.get("channel_sample_id") or cir_path.stem,
-            "cir_file": str(cir_path),
-            "activity": payload.get("activity"),
-            "source_event_label": payload.get("source_event_label"),
+            "sample_id": sample.sample_id,
+            # Episode and false-alarm rates are aggregated per physics session, because
+            # segments cut from one session are not independent measurements.
+            "group": sample.sample_id.rsplit("/", 1)[0] or "ungrouped",
+            "cir_file": str(sample.cir_path),
+            "activity": sample.activity,
+            "source_event_label": sample.event_label,
             "imbalance_onset_s": onset_s,
+            "onset_source": sample.onset_source,
             "first_impact_s": impact_s,
             "first_alarm_s": first_alarm,
             "detection_latency_s": latency,
             "window_alarmed": result["window_alarmed"],
             "alarm_frame_count": int(result["alarm_frames"].size),
-            "duration_s": float(archive["timestamp_s"][-1] - archive["timestamp_s"][0]),
+            "duration_s": float(sample.duration_s),
+            "event": event,
         })
 
     falls = [row for row in rows if row["activity"] == "fall"]
@@ -115,6 +139,12 @@ def main(argv: list[str] | None = None) -> int:
         adl_alarm_seconds += row["alarm_frame_count"] * float(np.median(np.diff(stamps)))
     adl_hours = sum(row["duration_s"] for row in adls) / 3600.0
     summary = {
+        "evaluation_scope": {
+            "splits_file": str(args.splits) if args.splits else None,
+            "only_split": args.only_split,
+            "samples_in_dir": len(rows) + skipped,
+            "samples_evaluated": len(rows),
+        },
         "detector": {
             "kind": "trailing_baseline_step_change",
             **{key: getattr(detector, key) for key in
@@ -132,6 +162,10 @@ def main(argv: list[str] | None = None) -> int:
         "adl_false_alarm_per_hour": (
             round(adl_alarm_seconds / adl_hours, 3) if adl_hours else None
         ),
+        # Event-level contract: episodes (not seconds), a latency budget that turns a
+        # late alarm into a miss, and false alarms per hour aggregated per session.
+        "event_metrics": aggregate([row["event"] | {"group": row["group"]} for row in rows]),
+        "event_config": config_dict(event_config),
         "samples": rows,
     }
     report_path = out / "detection_report.json"

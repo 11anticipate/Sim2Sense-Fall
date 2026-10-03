@@ -8,9 +8,10 @@ room floor of the built scene and keeps the points where a standing human envelo
 positive-volume intersection with any collidable wall, opening or furniture prim, and
 where the floor really extends underneath.
 
-Output: ``spawn_clearance.json`` with the free-area fraction per room, the largest
-inscribed clearance found, and ``--pick`` well-separated candidate spawns (greedy
-max-min distance) that ``make_dataset_configs.py`` consumes.
+Output: ``spawn_clearance.json`` with the free-area fraction per room and ``--pick``
+well-separated candidate spawns (greedy max-min distance), each carrying the clear run
+length along the four axes, that ``make_dataset_configs.py`` consumes: a spawn only gets
+a walking protocol if it can actually make the steps.
 
 CPU only: reads the scene manifest, no Isaac Sim.
 """
@@ -77,7 +78,12 @@ GEOMETRY_TOLERANCE = 1e-6
 
 def candidates(
     scene: Path, *, radius_m: float, height_m: float, margin_m: float, step_m: float,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, WorldShape], list[WorldShape]]:
+    """Grid-sample every room floor; returns the summary plus the clearance inputs.
+
+    The floors and obstacle shapes come back alongside the summary so the caller can
+    probe run lengths without re-resolving the scene.
+    """
     plan = load_scene_manifest(scene)
     shapes = world_shapes(plan.prims)
     floors = floor_shapes(shapes)
@@ -105,9 +111,10 @@ def candidates(
                 free_points.append((round(float(x), 3), round(float(y), 3), path))
         rooms[path] = {"samples": total, "clear_fraction": clear / max(total, 1),
                        "bounds_xy": [list(low[:2]), list(high[:2])]}
-    return {"rooms": rooms, "free_points": free_points,
-            "grid_step_m": step_m, "human_radius_m": radius_m,
-            "human_height_m": height_m, "margin_m": margin_m}
+    return ({"rooms": rooms, "free_points": free_points,
+             "grid_step_m": step_m, "human_radius_m": radius_m,
+             "human_height_m": height_m, "margin_m": margin_m},
+            floors, obstacles)
 
 
 def pick_spawns(free_points: list[tuple[float, float, str]], *, count: int) -> list[dict[str, Any]]:
@@ -130,6 +137,43 @@ def pick_spawns(free_points: list[tuple[float, float, str]], *, count: int) -> l
     } for i in chosen]
 
 
+AXIS_DIRECTIONS = (("plus_x", 1.0, 0.0), ("minus_x", -1.0, 0.0),
+                   ("plus_y", 0.0, 1.0), ("minus_y", 0.0, -1.0))
+
+
+def clearance_probe(
+    point: tuple[float, float], *, floors: dict[str, WorldShape],
+    obstacles: list[WorldShape], radius_m: float, height_m: float, margin_m: float,
+    step_m: float, max_run_m: float,
+) -> dict[str, float]:
+    """How far the human envelope can travel from ``point`` along each axis.
+
+    A spawn that is clear in isolation is not enough for a locomotion session: the
+    shipped walking protocol covers ``speed_m_s * duration_s`` metres, and a body that
+    walks into a sofa produces a refused segment and a wasted session. The session
+    generator reads these run lengths and only assigns a walk to a spawn that can
+    actually make the steps.
+    """
+
+    for name, value in (("step_m", step_m), ("max_run_m", max_run_m)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be positive and finite, got {value!r}")
+    runs: dict[str, float] = {}
+    for name, dx, dy in AXIS_DIRECTIONS:
+        distance = 0.0
+        while distance + step_m <= max_run_m:
+            trial = distance + step_m
+            ok, _ = is_clear(
+                (point[0] + dx * trial, point[1] + dy * trial), floors=floors,
+                obstacles=obstacles, radius_m=radius_m, height_m=height_m, margin_m=margin_m,
+            )
+            if not ok:
+                break
+            distance = trial
+        runs[name] = round(distance, 2)
+    return runs
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--scene", type=Path, default=DEFAULT_SCENE)
@@ -141,27 +185,51 @@ def main() -> int:
                         help="extra clearance demanded around the envelope")
     parser.add_argument("--step-m", type=float, default=0.10)
     parser.add_argument("--pick", type=int, default=8)
+    parser.add_argument("--probe-radius-m", type=float, default=None,
+                        help="envelope radius used for the walk-out probe, which may be "
+                             "narrower than --human-radius-m: a fallen body needs room to "
+                             "sprawl (0.9 m) while the same spawn only needs a body-wide "
+                             "corridor to walk (0.3 m). Defaults to --human-radius-m.")
+    parser.add_argument("--probe-step-m", type=float, default=0.10,
+                        help="resolution of the per-axis walk-out probe around each spawn")
+    parser.add_argument("--max-run-m", type=float, default=4.0,
+                        help="cap on the reported clear run length in metres")
     args = parser.parse_args()
     for name, value in (("human_radius_m", args.human_radius_m),
-                        ("human_height_m", args.human_height_m), ("step_m", args.step_m)):
+                        ("human_height_m", args.human_height_m), ("step_m", args.step_m),
+                        ("probe_step_m", args.probe_step_m), ("max_run_m", args.max_run_m)):
         if not math.isfinite(value) or value <= 0:
             parser.error(f"{name} must be positive and finite")
+    probe_radius_m = args.human_radius_m if args.probe_radius_m is None else args.probe_radius_m
+    if not math.isfinite(probe_radius_m) or probe_radius_m <= 0:
+        parser.error("probe-radius-m must be positive and finite")
     if args.margin_m < 0 or args.pick < 1:
         parser.error("margin-m must be >= 0 and pick >= 1")
 
-    result = candidates(
+    result, floors, obstacles = candidates(
         args.scene, radius_m=args.human_radius_m, height_m=args.human_height_m,
         margin_m=args.margin_m, step_m=args.step_m,
     )
+    result["probe_radius_m"] = probe_radius_m
     result["picked_spawns"] = pick_spawns(result["free_points"], count=args.pick)
+    for row in result["picked_spawns"]:
+        row["runs_m"] = clearance_probe(
+            (row["xy"][0], row["xy"][1]), floors=floors, obstacles=obstacles,
+            radius_m=probe_radius_m, height_m=args.human_height_m,
+            margin_m=args.margin_m, step_m=args.probe_step_m, max_run_m=args.max_run_m,
+        )
     del result["free_points"]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=1), encoding="utf-8")
-    for path, row in result["rooms"].items():
-        print(f"{path:34s} clear {row['clear_fraction'] * 100:5.1f}%  ({row['samples']} samples)")
-    print("picked spawns:")
+    for path, room in result["rooms"].items():
+        print(f"{path:34s} clear {room['clear_fraction'] * 100:5.1f}%  "
+              f"({room['samples']} samples)")
+    print("picked spawns (runs_m = how far the envelope travels before it is blocked):")
     for row in result["picked_spawns"]:
-        print(f"  {row['room']:34s} {row['xy']}")
+        runs = row["runs_m"]
+        print(f"  {row['room']:30s} {row['xy']} "
+              f"+x {runs['plus_x']:4.1f} -x {runs['minus_x']:4.1f} "
+              f"+y {runs['plus_y']:4.1f} -y {runs['minus_y']:4.1f}")
     print(f"wrote {args.out}")
     return 0
 

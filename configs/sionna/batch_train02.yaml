@@ -1,0 +1,96 @@
+# 训练前扩量批量包 train02（2026-09-27）。
+# 由 scripts/humans/make_dataset_configs.py --batch train02 --print-plan 生成；
+# 会话配置须先由该脚本产出（spawn 必须来自净空审计，行走需求必须被实测 run 长度覆盖）。
+# 展开并执行：
+#   PYTHONPATH=src python3 scripts/sionna/batch_generate.py \
+#     --plan configs/sionna/batch_train02.yaml --out artifacts/batches/train02
+#   bash artifacts/batches/train02/run_batch.sh      # 中断后重新展开即续跑
+description: 'train02: 40 会话，spawn x 触发情境 x 朝向矩阵，只含当前过门的活动'
+trials: []
+sessions:
+- config: configs/humans/dataset/train02/01_fall_standing_sp040_bedroom.yaml
+  name: 01_fall_standing_sp040_bedroom
+- config: configs/humans/dataset/train02/02_fall_forward_sp040_bedroom.yaml
+  name: 02_fall_forward_sp040_bedroom
+- config: configs/humans/dataset/train02/03_fall_backward_sp040_bedroom.yaml
+  name: 03_fall_backward_sp040_bedroom
+- config: configs/humans/dataset/train02/04_fall_turning_sp040_bedroom.yaml
+  name: 04_fall_turning_sp040_bedroom
+- config: configs/humans/dataset/train02/05_adl_walk_patrol_sp040_corridor.yaml
+  name: 05_adl_walk_patrol_sp040_corridor
+- config: configs/humans/dataset/train02/06_adl_turn_walk_sp040_bedroom.yaml
+  name: 06_adl_turn_walk_sp040_bedroom
+- config: configs/humans/dataset/train02/07_adl_crouch_sp040_bedroom.yaml
+  name: 07_adl_crouch_sp040_bedroom
+- config: configs/humans/dataset/train02/08_adl_sit_sp040_bedroom.yaml
+  name: 08_adl_sit_sp040_bedroom
+- config: configs/humans/dataset/train02/09_adl_bend_sp040_bedroom.yaml
+  name: 09_adl_bend_sp040_bedroom
+- config: configs/humans/dataset/train02/10_fall_standing_sp040_kitchen.yaml
+  name: 10_fall_standing_sp040_kitchen
+- config: configs/humans/dataset/train02/11_fall_forward_sp040_kitchen.yaml
+  name: 11_fall_forward_sp040_kitchen
+- config: configs/humans/dataset/train02/12_fall_backward_sp040_kitchen.yaml
+  name: 12_fall_backward_sp040_kitchen
+- config: configs/humans/dataset/train02/13_fall_turning_sp040_kitchen.yaml
+  name: 13_fall_turning_sp040_kitchen
+- config: configs/humans/dataset/train02/14_adl_walk_patrol_sp040_corridor.yaml
+  name: 14_adl_walk_patrol_sp040_corridor
+- config: configs/humans/dataset/train02/15_adl_turn_walk_sp040_kitchen.yaml
+  name: 15_adl_turn_walk_sp040_kitchen
+- config: configs/humans/dataset/train02/16_adl_crouch_sp040_kitchen.yaml
+  name: 16_adl_crouch_sp040_kitchen
+- config: configs/humans/dataset/train02/17_adl_sit_sp040_kitchen.yaml
+  name: 17_adl_sit_sp040_kitchen
+- config: configs/humans/dataset/train02/18_adl_bend_sp040_kitchen.yaml
+  name: 18_adl_bend_sp040_kitchen
+- config: configs/humans/dataset/train02/19_fall_standing_sp040_living_room.yaml
+  name: 19_fall_standing_sp040_living_room
+- config: configs/humans/dataset/train02/20_fall_forward_sp040_living_room.yaml
+  name: 20_fall_forward_sp040_living_room
+- config: configs/humans/dataset/train02/21_fall_backward_sp040_living_room.yaml
+  name: 21_fall_backward_sp040_living_room
+- config: configs/humans/dataset/train02/22_fall_turning_sp040_living_room.yaml
+  name: 22_fall_turning_sp040_living_room
+- config: configs/humans/dataset/train02/23_adl_walk_patrol_sp040_kitchen.yaml
+  name: 23_adl_walk_patrol_sp040_kitchen
+- config: configs/humans/dataset/train02/24_adl_turn_walk_sp040_living_room.yaml
+  name: 24_adl_turn_walk_sp040_living_room
+- config: configs/humans/dataset/train02/25_adl_crouch_sp040_living_room.yaml
+  name: 25_adl_crouch_sp040_living_room
+- config: configs/humans/dataset/train02/26_adl_sit_sp040_living_room.yaml
+  name: 26_adl_sit_sp040_living_room
+- config: configs/humans/dataset/train02/27_adl_bend_sp040_living_room.yaml
+  name: 27_adl_bend_sp040_living_room
+- config: configs/humans/dataset/train02/28_fall_standing_sp040_bathroom.yaml
+  name: 28_fall_standing_sp040_bathroom
+- config: configs/humans/dataset/train02/29_fall_forward_sp040_bathroom.yaml
+  name: 29_fall_forward_sp040_bathroom
+- config: configs/humans/dataset/train02/30_fall_backward_sp040_bathroom.yaml
+  name: 30_fall_backward_sp040_bathroom
+- config: configs/humans/dataset/train02/31_fall_turning_sp040_bathroom.yaml
+  name: 31_fall_turning_sp040_bathroom
+- config: configs/humans/dataset/train02/32_adl_walk_patrol_sp040_corridor.yaml
+  name: 32_adl_walk_patrol_sp040_corridor
+- config: configs/humans/dataset/train02/33_adl_turn_walk_sp040_bathroom.yaml
+  name: 33_adl_turn_walk_sp040_bathroom
+- config: configs/humans/dataset/train02/34_adl_crouch_sp040_bathroom.yaml
+  name: 34_adl_crouch_sp040_bathroom
+- config: configs/humans/dataset/train02/35_adl_sit_sp040_bathroom.yaml
+  name: 35_adl_sit_sp040_bathroom
+- config: configs/humans/dataset/train02/36_adl_bend_sp040_bathroom.yaml
+  name: 36_adl_bend_sp040_bathroom
+- config: configs/humans/dataset/train02/37_fall_standing_sp040_corridor.yaml
+  name: 37_fall_standing_sp040_corridor
+- config: configs/humans/dataset/train02/38_fall_forward_sp040_corridor.yaml
+  name: 38_fall_forward_sp040_corridor
+- config: configs/humans/dataset/train02/39_fall_backward_sp040_corridor.yaml
+  name: 39_fall_backward_sp040_corridor
+- config: configs/humans/dataset/train02/40_fall_turning_sp040_corridor.yaml
+  name: 40_fall_turning_sp040_corridor
+rt_target_hz: 120
+rt_frames: 24
+rt_seed_base: 20260927
+render_frames: false
+split_label: train02_grouped_by_session_pending_splits_json
+

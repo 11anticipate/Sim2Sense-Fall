@@ -83,7 +83,7 @@ from typing import Any
 import numpy as np
 
 from .config import PerturbationConfig
-from .rig import HumanRigPlan, LinkTransform, pose_surface_points
+from .rig import HumanRigPlan, LinkTransform, pose_surface_points, rest_overlap_pairs
 from .rotations import quaternion_to_matrix
 
 __all__ = [
@@ -740,6 +740,7 @@ def author_human(
             dynamic_friction=dynamic_friction,
         )
     collider_paths: list[str] = []
+    collider_paths_by_link: dict[str, str] = {}
     for link in plan.links:
         if link.name == plan.root_link:
             path = root_path
@@ -776,6 +777,24 @@ def author_human(
         capsule_path = _author_capsule(runtime, stage, plan, link.name, friction_material_path)
         if capsule_path:
             collider_paths.append(capsule_path)
+            collider_paths_by_link[link.name] = capsule_path
+
+    # --- self-collision: filter the by-design rest-pose overlaps -------------
+    # Rest overlaps are geometric, not behavioural (torso stack, hip pair); with
+    # self-collision enabled they would fight the solver from frame 0. The margin
+    # is the contact offset: pairs inside that distance generate contacts at rest
+    # even without overlap (knee pair sits 9.3 mm apart). Filtered pairs are the
+    # USD-neutral mechanism: PhysX and Newton both honour them.
+    filtered_pairs: list[str] = []
+    if plan.self_collisions and plan.self_collision_filter_rest_overlap:
+        for name_a, name_b in rest_overlap_pairs(plan.links, margin_m=plan.contact_offset_m):
+            path_a = collider_paths_by_link[name_a]
+            path_b = collider_paths_by_link[name_b]
+            api = runtime.UsdPhysics.FilteredPairsAPI.Apply(stage.GetPrimAtPath(path_a))
+            api.CreateFilteredPairsRel().SetTargets([path_b])
+            filtered_pairs.append(f"{name_a}|{name_b}")
+    report["self_collisions"] = bool(plan.self_collisions)
+    report["self_collision_filtered_pairs"] = filtered_pairs
 
     # --- joints --------------------------------------------------------------
     joints_root = f"{root_path}/{JOINTS_SUFFIX}"
@@ -890,11 +909,14 @@ def build_human_stage(
     skin_faces: np.ndarray | None = None,
     friction: tuple[float, float] | None = None,
     joint_velocity_limit_rad_s: float | None = None,
+    report_out: dict[str, Any] | None = None,
 ) -> Path:
     """Author the human, optionally into a copy of an existing scene, and save.
 
     ``base_scene`` is a scene USD (the fixed indoor apartment). It is *copied*
     first, so exporting a human never rewrites the verified scene artifact.
+    ``report_out``, when given, receives the authoring report (self-collision
+    filtering, damping, spawn position) in place; the return stays the stage path.
     """
 
     runtime = pxr_modules()
@@ -929,6 +951,8 @@ def build_human_stage(
         friction=friction,
         joint_velocity_limit_rad_s=joint_velocity_limit_rad_s,
     )
+    if report_out is not None:
+        report_out.update(report)
     position = tuple(float(v) for v in (spawn_position or plan.spawn_root_position))
     root_prim = stage.GetPrimAtPath(root_path)
     xformable = runtime.UsdGeom.Xformable(root_prim)

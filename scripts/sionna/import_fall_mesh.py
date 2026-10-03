@@ -43,13 +43,24 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# Verified keyboard-session activities that are legitimate negatives. This set must
+# track ``export_session_mesh.SEGMENT_LABELS``: a label the exporter can admit but the
+# importer cannot classify quietly leaves the ADL denominator -- and therefore false
+# alarms per hour -- short. That is exactly how ``sit`` and ``bend`` went missing;
+# ``tests/test_sionna_import.py`` now guards the two lists against drifting apart.
+SESSION_ADL_LABELS = frozenset({
+    "walk", "stand", "crouch", "bend", "sit", "stand_up", "turn",
+})
+# Labels the exporter can produce but which are not yet a validated negative class:
+# floor recovery fails its measured gates (docs/getup-float-2026-09-27.md).
+SESSION_UNCLASSIFIED_LABELS = frozenset({"get_up"})
+
+
 def channel_activity(label: str, fidelity: str) -> Activity:
     """Map verified session activities without promoting unknown reference motions."""
     if label == "fall":
         return Activity.FALL
-    if fidelity == "physics_keyboard_session" and label in {
-        "walk", "stand", "crouch", "stand_up", "turn"
-    }:
+    if fidelity == "physics_keyboard_session" and label in SESSION_ADL_LABELS:
         return Activity.ADL
     return Activity.UNKNOWN
 
@@ -377,7 +388,11 @@ def main(argv: list[str] | None = None) -> int:
             f"delta={record['delta_vs_no_body_db']:+.3f} dB"
         )
     channel = np.stack(channels)
-    achieved_hz = 1.0 / float(np.diff(times[frames])[0])
+    # Median, not the first interval: a recording can carry one longer gap at a segment
+    # or reset boundary, and reading only the first step made every such sample fail
+    # `target_rate_achieved` and burn a retry (44 of them in train02's first pass).
+    traced_steps = np.diff(times[frames])
+    achieved_hz = 1.0 / float(np.median(traced_steps))
     label = info["label"]["label"]
     activity = channel_activity(label, info["fidelity"])
     # The reference's intended action is not evidence that a lowering was intentional ADL.

@@ -184,6 +184,9 @@ def detect_fall(
     return {
         "scores": frame_result["scores"],
         "alarm_frames": alarm_frames,
+        # The same decision as a per-frame boolean aligned with ``time_s``, which is what
+        # episode counting needs (``alarm_frames`` is only the index list).
+        "alarm_flag": frame_result["alarm"],
         "first_alarm_s": float(time_s[alarm_frames[0]]) if len(alarm_frames) else None,
         "window_alarmed": bool(alarmed),
         "window_scores": pooled,

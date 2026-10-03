@@ -167,6 +167,24 @@ def load_keyboard_config(path: Path, project_root: Path) -> dict[str, Any]:
         if not isinstance(get_up, dict) or not get_up.get("file"):
             raise ValueError("get_up must be a mapping with a file")
         get_up["file"] = (project_root / get_up["file"]).resolve()
+    if "fall_replay" in payload:
+        # Optional anchored fall replay (F). Source clip + optional crop window,
+        # integer time compression and reverse flag; see load_action_clip.
+        fall_replay = payload["fall_replay"]
+        if not isinstance(fall_replay, dict) or not fall_replay.get("file"):
+            raise ValueError("fall_replay must be a mapping with a file")
+        fall_replay["file"] = (project_root / fall_replay["file"]).resolve()
+        if not isinstance(fall_replay.get("reverse", False), bool):
+            raise ValueError("fall_replay.reverse must be a bool")
+        speed = fall_replay.get("speed", 1)
+        if not isinstance(speed, int) or isinstance(speed, bool) or speed < 1:
+            raise ValueError("fall_replay.speed must be a positive integer")
+        for key in ("start_s", "duration_s"):
+            value = fall_replay.get(key)
+            if value is not None and (not np.isfinite(value) or value < 0):
+                raise ValueError(f"fall_replay.{key} must be finite and non-negative")
+        if fall_replay.get("duration_s") is not None and fall_replay["duration_s"] <= 0:
+            raise ValueError("fall_replay.duration_s must be positive")
     if "contact_planner" in payload:
         from .contact_gait import ContactGaitConfig
 

@@ -21,6 +21,7 @@ from common import (
     boot_isaac,
     load_inputs,
     open_scene,
+    repo_relative,
     set_physics_dt,
     write_json,
 )
@@ -148,11 +149,18 @@ def prepare(path: Path) -> tuple[dict[str, Any], Any, Any, Any, TeleopController
             if "get_up" in settings
             else None
         )
+        fall_clip = (
+            load_action_clip(settings["fall_replay"], plan, dt_s=config.simulation.physics_dt_s)
+            if "fall_replay" in settings
+            else None
+        )
         settings["action_state"] = ActionState(
-            ActionConfig(**settings["actions"]), postures, playback_clip, plan=plan
+            ActionConfig(**settings["actions"]), postures, playback_clip, plan=plan,
+            fall_clip=fall_clip,
         )
         settings["posture_provenance"] = {name: p.provenance for name, p in postures.items()}
         settings["get_up_provenance"] = None if playback_clip is None else playback_clip.provenance
+        settings["fall_replay_provenance"] = None if fall_clip is None else fall_clip.provenance
         settings["crouch_provenance"] = postures["crouch"].provenance
     if settings.get("stance", {}).get("enabled", False):
         settings["stance_controller"] = StanceFootController(
@@ -205,6 +213,10 @@ def main(argv: list[str] | None = None) -> int:
     # argv is injectable so experiment harnesses can reuse this exact entry
     # point (identical physics setup) with generated per-trial configs.
     args = parser.parse_args(argv)
+    if not args.out.is_absolute():
+        # A relative --out is repo-relative, not cwd-relative: the GUI may be
+        # launched from any directory and sessions must land under artifacts/.
+        args.out = REPO_ROOT / args.out
     if not np.isfinite(args.seconds) or args.seconds < 0:
         parser.error("seconds must be finite and nonnegative")
     if args.headless and not args.demo and args.seconds == 0 and not args.dry_run:
@@ -240,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
     scene = args.scene or settings["scene"]
     provenance = {
         "controller_sources_sha256": {
-            str(path.relative_to(REPO_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+            repo_relative(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in [Path(__file__),
                          *sorted((REPO_ROOT / "src/sim2sense_fall/humans").glob("*.py"))]
         },
@@ -305,8 +317,14 @@ def main(argv: list[str] | None = None) -> int:
                 intent.reset_requested = False
                 provenance["reset_count"] += 1
             if actions and intent.action_requested:
+                # Same walk-coupled routing as the physics loop: moving F = trip.
+                requested_action = intent.action_requested
+                if requested_action == "fall" and controller.speed > (
+                    ActionConfig(**settings["actions"]).stopped_speed_m_s
+                ):
+                    requested_action = "trip"
                 actions.request(
-                    intent.action_requested,
+                    requested_action,
                     time_s=frame * config.simulation.physics_dt_s,
                     heading_rad=controller.heading,
                     measured_joints=controller.joints,
@@ -397,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
         from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport
         from pxr import Gf, UsdGeom, Vt
 
+        stage_report: dict[str, Any] = {}
         build_human_stage(
             plan,
             args.out / "human_keyboard.usda",
@@ -405,6 +424,11 @@ def main(argv: list[str] | None = None) -> int:
             skin_faces=mesh.faces,
             friction=settings.get("human_friction"),
             joint_velocity_limit_rad_s=settings.get("joint_velocity_limit_rad_s"),
+            report_out=stage_report,
+        )
+        provenance["self_collisions"] = stage_report.get("self_collisions")
+        provenance["self_collision_filtered_pairs"] = stage_report.get(
+            "self_collision_filtered_pairs", []
         )
         stage = open_scene(app, args.out / "human_keyboard.usda")
         # Create all visual structure before the tensor views. Only points change later.
@@ -521,16 +545,42 @@ def main(argv: list[str] | None = None) -> int:
                         if intent.action_requested == "get_up"
                         else controller.heading
                     )
+                    # Route-A increment: F WHILE WALKING is a trip, not a fall
+                    # request -- the gait keeps stepping and the measured
+                    # outcome decides. Standing F keeps the anchored replay.
+                    # The snag lands on the swing foot (the toe that catches).
+                    requested_action = intent.action_requested
+                    trip_foot = None
+                    if requested_action == "fall" and controller.speed > (
+                        actions.config.stopped_speed_m_s
+                    ):
+                        requested_action = "trip"
+                        request_heading = measured_heading
+                        supporting = controller.gaits[controller.mode].supporting_feet(
+                            controller.phase
+                        )
+                        candidates = sorted({"left_ankle", "right_ankle"} - (supporting or set()))
+                        trip_foot = candidates[0] if candidates else "left_ankle"
                     accepted = actions.request(
-                        intent.action_requested,
+                        requested_action,
                         time_s=clock_s,
                         heading_rad=request_heading,
                         measured_joints=runtime.joint_positions_rad(),
                         measured_position=position,
                         measured_quaternion=quaternion,
+                        trip_foot=trip_foot,
                     )
                     intent.action_requested = None
-                    if actions.falling:
+                    if actions.tripping:
+                        # Route-A trip in flight: drives weakened (the muscle
+                        # failure that makes the snag stick), stance keeps
+                        # running. The release happens when observe() latches
+                        # the measured fall; the restore happens on survival.
+                        if not runtime.set_control_scale(
+                            actions.config.trip_control_scale, 1.0
+                        ):
+                            raise RuntimeError("could not weaken drives for trip")
+                    elif actions.falling and not actions.fall_replay_engaged:
                         if not runtime.set_control_scale(
                             actions.config.fall_control_scale,
                             actions.config.fall_damping_scale,
@@ -538,6 +588,10 @@ def main(argv: list[str] | None = None) -> int:
                             raise RuntimeError("could not release position drives for fall")
                         if stance:
                             stance.reset()
+                    # A fall replay keeps the drives engaged (it commands the
+                    # descent itself); the release happens when the replay's
+                    # lying end is actually measured fallen -- see the
+                    # consume_fall_replay_release() call after actions.apply().
                     elif accepted and actions.mode == "getting_up":
                         # The fall released the position drives; recovery plays
                         # under full drives plus the standard root assistance.
@@ -562,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if actions:
                     was_getting_up = actions.mode == "getting_up"
+                    was_tripping = actions.tripping
                     target = actions.apply(
                         target,
                         dt_s=dt,
@@ -577,6 +632,34 @@ def main(argv: list[str] | None = None) -> int:
                         # it back to the pre-fall heading (that tug was the
                         # post-get-up spin).
                         controller.heading = _yaw_of(target.quaternion)
+                    if actions.consume_trip_release():
+                        # The stumble crossed the measured fall thresholds:
+                        # release the drives fully (the trip had them weakened).
+                        if not runtime.set_control_scale(
+                            actions.config.fall_control_scale,
+                            actions.config.fall_damping_scale,
+                        ):
+                            raise RuntimeError("could not release drives after trip fall")
+                        if stance:
+                            stance.reset()
+                    elif was_tripping and not actions.tripping and not actions.falling:
+                        # The stumble steps caught the body: restore full drives
+                        # and locomotion. The survived stumble stays on record.
+                        if not runtime.set_control_scale(1.0):
+                            raise RuntimeError("could not restore drives after survived trip")
+                    if actions.consume_fall_replay_release():
+                        # The replay commanded its lying end and observe() has
+                        # measured the real fallen state: release the drives
+                        # exactly like the legacy fall so the body settles.
+                        if not runtime.set_control_scale(
+                            actions.config.fall_control_scale,
+                            actions.config.fall_damping_scale,
+                        ):
+                            raise RuntimeError(
+                                "could not release position drives after fall replay"
+                            )
+                        if stance:
+                            stance.reset()
                 if stance and not (actions and actions.suppresses_stance):
                     stance_mode = (
                         "transition"
@@ -716,6 +799,19 @@ def main(argv: list[str] | None = None) -> int:
                         active_assistance = blend_assist_configs(
                             active_assistance, recovery_assistance, recovery_blend
                         )
+                if actions and (actions.fall_replay_engaged or actions.tripping):
+                    # No horizontal tow-cable during a fall replay OR a trip.
+                    # The 12 kN/m pelvis spring absorbs any survivable shove
+                    # (first trip run: 180 N deflected the body 1.5 cm, peak
+                    # tilt 9 deg) -- the balance failure must remove the
+                    # spring, not fight it. The clip/trip still owns the joint
+                    # collapse, the vertical support curve and the tilt;
+                    # horizontal momentum is the legs' own floor contact.
+                    target = replace(
+                        target,
+                        position=np.array([*position[:2], target.position[2]]),
+                        linear_velocity=np.array([*linear[:2], target.linear_velocity[2]]),
+                    )
                 force, torque = root_wrench(
                     active_assistance,
                     position=position,
@@ -732,7 +828,23 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 force *= settings["root_assist_scale"]
                 torque *= settings["root_assist_scale"]
-                if actions and actions.falling:
+                if actions and actions.tripping:
+                    # The orientation servo is the system's de-facto balance
+                    # controller (3000 Nm/rad, immune to the mode blend): while
+                    # it stays full the body cannot pitch past ~10 deg no matter
+                    # what the snag does (trip_walk_v1..v5). Scaling the pitch
+                    # authority is the measured difference between catching and
+                    # toppling; the release removes it entirely.
+                    torque *= actions.config.trip_torque_scale
+                if actions and actions.tripping and actions.trip_foot:
+                    # The caught-toe drag, applied AT THE SNAGGED ANKLE (a root
+                    # shove accelerates the feet along with the body and nothing
+                    # trips -- trip_walk_v1..v3, peak tilt 9.8 deg at 450 N).
+                    # Rides on top of the fading assist; the horizontal pelvis
+                    # authority is already removed (tripping branch above), so
+                    # the trip torque comes from real foot arrest vs momentum.
+                    runtime.apply_force(actions.trip_foot, actions.trip_force(clock_s))
+                if actions and actions.falling and not actions.fall_replay_engaged:
                     force, torque = actions.fall_force(clock_s), np.zeros(3)
                     target = replace(target, joint_velocities=np.zeros_like(target.joints))
                 runtime.set_joint_targets(target.joints, target.joint_velocities)

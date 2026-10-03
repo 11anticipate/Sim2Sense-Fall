@@ -28,6 +28,7 @@ import json
 import re
 import shlex
 import sys
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,9 @@ DEFAULT_SIONNA_PYTHON = Path.home() / ".local" / "opt" / "sionna" / "bin" / "pyt
 # Plan-provided names become command arguments; a strict allowlist keeps the
 # emitted script free of anything the shell could reinterpret.
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
+# Distinct seeds available per base, kept well below the range a single sample's
+# repeats need to alias.
+RT_SEED_SPREAD = 10_000
 
 
 @dataclass
@@ -60,6 +64,22 @@ class BatchPlan:
     # Recorded into every RT report. The split itself is assigned afterwards by
     # scripts/sionna/assign_splits.py; this only says what the batch promises.
     split_label: str = "smoke_only_not_train_test"
+    # When set, every RT trace gets a per-sample seed derived from this base and the
+    # sample's identity, so the batch covers different ray-sampling realisations instead
+    # of one fixed channel seed. Derived from a checksum, never a counter: the batch is
+    # resumable, so a seed must not depend on the order the stages happen to complete in.
+    rt_seed_base: int | None = None
+    # A 120 Hz native-mesh session costs ~30 MB of disk per simulated second (recording
+    # ~10 MB/s plus segment meshes ~20 MB/s), so an 800 s ADL batch is bigger than a
+    # developer disk. When enabled, each segment's ``*.mesh.npz`` is removed only after
+    # its own RT command exits 0, which keeps the cumulative footprint at the recordings.
+    # Nothing else reads those files (RT takes the mesh, the loaders take ``.cir.npz`` plus
+    # the export ``manifest.json``, which stays), and the meshes are re-derivable from
+    # ``recording.npz`` by re-running export_session_mesh.py on CPU.
+    prune_mesh_after_import: bool = False
+    # Refuse to start a pass when the filesystem holding the batch root has less than this
+    # much free. A disk that fills mid-run corrupts Isaac's own scratch, not just the batch.
+    min_free_gb: float = 0.0
 
 
 def _identifier(value: Any, field_name: str) -> str:
@@ -90,6 +110,10 @@ def load_plan(path: Path) -> BatchPlan:
                       else float(payload["rt_target_hz"])),
         render_frames=bool(payload.get("render_frames", False)),
         split_label=str(payload.get("split_label", "smoke_only_not_train_test")),
+        rt_seed_base=(None if payload.get("rt_seed_base") is None
+                      else int(payload["rt_seed_base"])),
+        prune_mesh_after_import=bool(payload.get("prune_mesh_after_import", False)),
+        min_free_gb=float(payload.get("min_free_gb", 0.0)),
     )
     for trial in plan.trials:
         if not {"motion", "perturbation"} <= set(trial):
@@ -108,6 +132,10 @@ def load_plan(path: Path) -> BatchPlan:
         raise ValueError("rt_frames must be within [2, 512]")
     if plan.rt_target_hz is not None and not 1.0 <= plan.rt_target_hz <= 2000.0:
         raise ValueError("rt_target_hz must be within [1, 2000]")
+    if plan.rt_seed_base is not None and plan.rt_seed_base < 0:
+        raise ValueError("rt_seed_base must be non-negative")
+    if plan.min_free_gb < 0:
+        raise ValueError("min_free_gb must be non-negative")
     return plan
 
 
@@ -169,6 +197,26 @@ def rt_done(sionna_dir: Path, sample_id: str) -> bool:
     return not json.loads(report.read_text(encoding="utf-8")).get("failures")
 
 
+def session_chunk(names: list[str], index: int, count: int) -> list[str]:
+    """Contiguous slice ``index`` of ``count`` equal parts, remainder to the early parts.
+
+    The batch exists to keep GPU time resumable, but every session's 120 Hz mesh is ~30 MB
+    per simulated second, so a 23-session plan can outgrow the disk before its RT stage ever
+    runs. Splitting the plan into contiguous chunks bounds how many recordings and segment
+    meshes coexist; outputs still accumulate in one batch root, so the split assignment and
+    the data card see a single batch.
+    """
+
+    if count < 1:
+        raise ValueError("chunk count must be >= 1")
+    if not 0 <= index < count:
+        raise ValueError(f"chunk index {index} outside [0, {count})")
+    size, remainder = divmod(len(names), count)
+    start = index * size + min(index, remainder)
+    end = start + size + (1 if index < remainder else 0)
+    return names[start:end]
+
+
 def expand(plan: BatchPlan, args: argparse.Namespace) -> tuple[list[str], list[dict[str, str]]]:
     """Return the pending shell commands plus the expected sample manifest."""
 
@@ -176,14 +224,29 @@ def expand(plan: BatchPlan, args: argparse.Namespace) -> tuple[list[str], list[d
         return (["--target-hz", str(plan.rt_target_hz)] if plan.rt_target_hz
                 else ["--frames", str(plan.rt_frames)])
 
-    def rt_command(sample_id: str, argv: list[str]) -> str:
-        # Rare GPU scheduling transients (~2 in 9 runs) can fail the strict
-        # static-repeat check; a failed sample leaves no import.json, so the
-        # next re-expansion re-emits it. The batch must not abort on it.
-        return shlex.join(argv) + " || " + shlex.join([
+    def seed_args(sample_id: str) -> list[str]:
+        if plan.rt_seed_base is None:
+            return []
+        # zlib.crc32, not hash(): the built-in string hash is salted per process, so a
+        # counter-free but salt-free derivation is what makes the seed reproducible.
+        digest = zlib.crc32(sample_id.encode("utf-8")) % RT_SEED_SPREAD
+        return ["--seed", str(plan.rt_seed_base + digest)]
 
-            "echo", f"transient-failure: {sample_id}",
-        ]) + f" >> {shlex.quote(str(args.out / 'batch_failures.log'))}"
+    def rt_command(sample_id: str, argv: list[str], *, prune: Path | None = None) -> str:
+        # Rare GPU scheduling transients (~2 in 9 runs) can fail the strict static-repeat
+        # check. The importer still writes its report, with `failures` non-empty, and
+        # `rt_done` treats that as not-done -- so the next re-expansion re-emits exactly this
+        # sample. The batch must not abort on it, and the loader/`assign_splits` refuse it.
+        failure_log = shlex.quote(str(args.out / "batch_failures.log"))
+        if prune is None:
+            return (shlex.join(argv) + " || "
+                    + shlex.join(["echo", f"transient-failure: {sample_id}"])
+                    + f" >> {failure_log}")
+        # `if ... then ... else ... fi` rather than `cmd && rm || echo`: with the chained
+        # form a failed rm would be logged as an RT transient, and a *successful* rm after
+        # a failed import would delete the only input the retry needs.
+        return (f"if {shlex.join(argv)}; then rm -f {shlex.quote(str(prune))}; "
+                f"else echo 'transient-failure: {sample_id}' >> {failure_log}; fi")
 
     trials_dir = args.out / "trials"
     sionna_dir = args.out / "sionna"
@@ -218,15 +281,21 @@ def expand(plan: BatchPlan, args: argparse.Namespace) -> tuple[list[str], list[d
         if not rt_done(sionna_dir, sample_id):
             commands.append(rt_command(sample_id, [
                 str(args.sionna_python), "scripts/sionna/import_fall_mesh.py",
-                *rate_args(), "--out", str(sionna_dir),
+                *rate_args(), *seed_args(sample_id), "--out", str(sionna_dir),
                 "--split", plan.split_label,
                 *(["--render-frames"] if plan.render_frames else []),
                 "--trial-json", str(trial_json),
             ]))
 
+    selected = set(session_chunk(
+        [e.get("name") or Path(e["config"]).stem for e in plan.sessions],
+        int(getattr(args, "session_chunk_index", 0)),
+        int(getattr(args, "session_chunk_count", 1))))
     for entry in plan.sessions:
         config = _inside_repo(REPO_ROOT / entry["config"])
         name = entry.get("name") or config.stem
+        if name not in selected:
+            continue
         session_dir = args.out / f"session_{name}"
         export_dir = session_dir.parent / (session_dir.name + "_export")
         if not session_accepted(session_dir / "report.json"):
@@ -257,11 +326,13 @@ def expand(plan: BatchPlan, args: argparse.Namespace) -> tuple[list[str], list[d
                 if not rt_done(session_out, sample_id):
                     commands.append(rt_command(f"{name}/{sample_id}", [
                         str(args.sionna_python), "scripts/sionna/import_fall_mesh.py",
-                        *rate_args(), "--out", str(session_out),
+                        *rate_args(), *seed_args(f"{name}/{sample_id}"),
+                        "--out", str(session_out),
                         "--split", plan.split_label,
                         *(["--render-frames"] if plan.render_frames else []),
                         "--dir", str(export_dir), "--sample", sample_id,
-                    ]))
+                    ], prune=(export_dir / f"{sample_id}.mesh.npz")
+                          if plan.prune_mesh_after_import else None))
     return commands, expected
 
 
@@ -294,6 +365,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--render", action="store_true", help="render path figures per sample")
     parser.add_argument("--summarize", action="store_true",
                         help="collect .import.json results into batch_report.json and exit")
+    parser.add_argument("--session-chunk-index", type=int, default=0,
+                        help="contiguous session chunk to emit (0-based); pair with --count")
+    parser.add_argument("--session-chunk-count", type=int, default=1,
+                        help="number of session chunks; 1 keeps the whole plan (default)")
     args = parser.parse_args(argv)
     plan = load_plan(args.plan)
     args.rt_frames = args.rt_frames if args.rt_frames is not None else plan.rt_frames
@@ -315,13 +390,31 @@ def main(argv: list[str] | None = None) -> int:
     # artifacts/batches/<name> died with FileNotFoundError on run_batch.sh.
     args.out.mkdir(parents=True, exist_ok=True)
     script_path = args.out / "run_batch.sh"
+    guard = ""
+    if plan.min_free_gb > 0:
+        need_kb = int(plan.min_free_gb * 2 ** 20)
+        guard = (
+            "# Disk guard: 120 Hz mesh costs ~10 MB of recording plus ~20 MB of segment export\n"
+            "# per simulated second, and a filesystem that fills mid-run corrupts Isaac's own\n"
+            "# scratch, not just this batch. Checked once per pass, before any stage starts.\n"
+            "free_kb=$(df -Pk '.' | awk 'NR==2 {print $4}')\n"
+            f"if [ \"${{free_kb:-0}}\" -lt {need_kb} ]; then\n"
+            f"  echo \"run_batch.sh: ${{free_kb}} KB free, under the {plan.min_free_gb:g} GB "
+            "floor; clear space or raise --session-chunk-count\" >&2\n"
+            "  exit 1\n"
+            "fi\n"
+        )
     header = (
         "#!/usr/bin/env bash\n"
         f"# Generated by scripts/sionna/batch_generate.py from {args.plan.name}.\n"
         f"# {plan.description}\n"
         "# Pending stages only; re-run the generator to emit the remainder.\n"
-        "set -euo pipefail\n"
+        + ("# Each segment's .mesh.npz is deleted once its own RT trace is accepted; the\n"
+           "# meshes come back from the recording directory by re-running the session export.\n"
+           if plan.prune_mesh_after_import else "")
+        + "set -euo pipefail\n"
         f"cd {shlex.quote(str(REPO_ROOT))}\n"
+        + guard
     )
     script_path.write_text(header + "\n".join(commands) + "\n", encoding="utf-8")
     script_path.chmod(0o755)

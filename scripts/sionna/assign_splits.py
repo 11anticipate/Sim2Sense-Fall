@@ -53,7 +53,12 @@ def collect(batch: Path, sionna_dir: Path | None = None) -> tuple[list[dict[str,
         # Segment ids repeat across sessions (every session has a stand_00), so the
         # sample identity is namespaced by the directory the RT stage wrote it into.
         stem = path.name.removesuffix(".import.json")
-        namespace = path.parent.name if path.parent != root else ""
+        # Namespaced by every directory level between the root and the sample, exactly like
+        # `detection_data.iter_channel_samples`, so the two agree on one identity: segment
+        # ids repeat per session (every session has a stand_00), and under a root that
+        # merges batches the batch name has to be part of the id too.
+        relative = path.parent.relative_to(root).as_posix()
+        namespace = "" if relative == "." else relative
         sample_id = f"{namespace}/{stem}" if namespace else stem
         if report.get("failures"):
             refused.append(sample_id)
@@ -62,9 +67,15 @@ def collect(batch: Path, sionna_dir: Path | None = None) -> tuple[list[dict[str,
         label = str(report.get("source_event_label") or report.get("activity") or "")
         if not source or not label:
             raise ValueError(f"{path.name}: missing source path or event label")
+        # The leakage group is the run that produced the sample: the session directory under
+        # the RT root. train02 and train03 both contain a session named
+        # `01_fall_standing_sp040_bedroom`, so a name-only group would merge two different
+        # physics runs into one group and quietly move samples across the split. Root-level
+        # samples (single-trial traces) keep the path-derived group.
+        group = namespace if namespace else group_of(source)
         rows.append({
             "sample_id": sample_id,
-            "group": group_of(source),
+            "group": group,
             "label": label,
             "activity": report.get("activity"),
             "rt_frames": len(report.get("frames") or []),
@@ -105,7 +116,9 @@ def main() -> int:
         "seed": args.seed,
         "fractions": {"train": args.fractions.train, "val": args.fractions.val,
                       "test": args.fractions.test},
-        "assignment_unit": "physics session (group), never sample",
+        "assignment_unit": "physics run (the sample's session directory under the "
+                         "RT root, so batch-prefixed when the root merges batches), "
+                         "never the individual segment",
         "samples": sorted(rows, key=lambda row: (row["split"], row["label"], row["sample_id"])),
         "report": report,
         "refused_samples": refused,

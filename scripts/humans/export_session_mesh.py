@@ -68,7 +68,10 @@ SEGMENT_LABELS = {
     "standing_up": "stand_up",
     "getting_up": "get_up",
 }
-FALL_MODES = {"falling", "fallen"}
+# "tripping" is a fall attempt in flight (walk-coupled trip): its frames belong
+# to the fall episode, so a stumble that ends in a release-fall is covered by
+# one fall-labelled segment from the shove onward.
+FALL_MODES = {"falling", "fallen", "tripping"}
 MIN_SEGMENT_FRAMES = 5
 _RESET_STEP_M = 0.05
 

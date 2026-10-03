@@ -19,6 +19,7 @@ importing this module without it is fine, using it is not.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -70,12 +71,35 @@ class TrainConfig:
     activity_weight: float = 0.5
     velocity_weight: float = 0.0
     device: str = "cpu"
+    # Averaging the state dicts of the last N epochs keeps the returned model near the mean
+    # of that trajectory. 0 keeps the historical behaviour (last epoch as-is).
+    average_last_epochs: int = 0
+    # Three builds of train02 round 1 with the same seed and the same CLI reported held-out
+    # window accuracies of 0.864 / 0.762 / 0.515: ATen's multi-thread CPU reductions fold in
+    # a run-dependent order, and the accuracy oscillates enough epoch to epoch for that to
+    # move the final-epoch number anywhere on the curve. Reproducibility is an AGENTS.md
+    # requirement for any recorded result, so it is on by default and costs little: the
+    # backbone is under 10k parameters and the runs are I/O bound.
+    deterministic: bool = True
+
+    # The Doppler head regresses Hz, so its raw MSE is a *squared frequency*: on train02 it
+    # measured 44 of a 45-unit total objective, i.e. the fall head's BCE (~0.75) and the
+    # activity head (~0.6) together got 1.7% of the gradient. That is the mechanism behind a
+    # detector with a healthy window AUC (0.86) whose fall probabilities nevertheless never
+    # leave 0.5-0.78 and whose epoch-to-epoch accuracy oscillates. Dividing the residual by a
+    # reference speed makes the term dimensionless and comparable with the other two; the
+    # reported MAE stays in Hz.
+    velocity_loss_scale_hz: float = 10.0
 
     def __post_init__(self) -> None:
         if self.epochs < 1 or self.batch_size < 1 or self.lr <= 0 or self.hidden < 1:
             raise ValueError("epochs/batch_size/hidden must be >= 1 and lr > 0")
         if self.activity_weight < 0 or self.velocity_weight < 0:
             raise ValueError("auxiliary head weights must be non-negative")
+        if self.average_last_epochs < 0:
+            raise ValueError("average_last_epochs must be >= 0")
+        if not np.isfinite(self.velocity_loss_scale_hz) or self.velocity_loss_scale_hz <= 0:
+            raise ValueError("velocity_loss_scale_hz must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,10 +317,9 @@ def pretrain_reconstruction(
     require_torch()
     if not examples:
         raise ValueError("pretraining needs at least one usable window")
-    torch.manual_seed(config.seed)
     generator = np.random.default_rng(config.seed)
     device = torch.device(config.device)
-    encoder = FallNet(hidden=config.hidden, n_activities=2).to(device)
+    encoder = build_model(config, 2).to(device)
     decoder = ReconstructionDecoder().to(device)
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(decoder.parameters()), lr=config.lr
@@ -355,6 +378,22 @@ def _group_split(
     return train, evaluation
 
 
+def build_model(config: TrainConfig, n_activities: int) -> FallNet:
+    """Construct the detector under *this run's* seed, so the caller cannot get it wrong.
+
+    ``FallNet.__init__`` draws its initial weights from torch's global RNG at construction
+    time. A caller that builds the network before anything seeds torch therefore gets a
+    different starting point in every process, and re-running the identical seed/config
+    yields a different model -- which is what happened to train02 round 1: two builds of one
+    seed reported 0.797 and 0.854 held-out window accuracy. Seeding inside the constructor
+    helper is the only place that ordering can be fixed once.
+    """
+
+    require_torch()
+    torch.manual_seed(config.seed)
+    return FallNet(hidden=config.hidden, n_activities=max(1, n_activities))
+
+
 def train_model(
     train_examples: list[WindowExample],
     eval_examples: list[WindowExample],
@@ -366,22 +405,37 @@ def train_model(
 
     Class imbalance is handled with ``pos_weight`` (negatives/positives of
     the fall head), not by resampling; the activity head ignores unlabeled
-    windows (``-100``) and the velocity head only trains on windows that
-    carry a speed label, which today is none — the head exists so the
-    stage-9 packets can switch it on without touching the model.
+    windows (``-100``) and the velocity head only trains on windows that carry
+    a mesh-derived speed label, so ``velocity_weight`` costs nothing on a batch
+    whose packets have no mesh stream. With ``average_last_epochs`` the returned
+    model holds the mean of that many final epoch checkpoints, not the last one.
     """
 
     require_torch()
-    torch.manual_seed(config.seed)
+    if config.deterministic:
+        # Raises rather than silently continuing if any op lacks a deterministic
+        # implementation: a result that cannot be rebuilt is not a result.
+        torch.use_deterministic_algorithms(True)
+        torch.set_num_threads(1)
     generator = np.random.default_rng(config.seed)
     device = torch.device(config.device)
     if model is None:
-        model = FallNet(hidden=config.hidden, n_activities=max(1, n_activities))
+        # Seeds internally: the initial weights must come from this run's seed, not from
+        # whatever the process's RNG happened to be when the caller constructed the model.
+        model = build_model(config, n_activities)
+    torch.manual_seed(config.seed)
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
     positives = sum(item.fall_label for item in train_examples)
     negatives = len(train_examples) - positives
+    if negatives == 0:
+        # pos_weight would be 0.0, which silently zeroes the fall term: a split with no
+        # negatives cannot train the head the whole alarm depends on, and reporting a loss
+        # of 0 for it would hide that.
+        raise ValueError(
+            f"the training split has {positives} fall windows and no negatives; "
+            "an event head cannot be fitted (or measured) on that")
     pos_weight_value = (negatives / positives) if positives else 1.0
     fall_criterion = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight_value, dtype=torch.float32)
@@ -390,10 +444,19 @@ def train_model(
     velocity_criterion = nn.MSELoss(reduction="none")
 
     history: list[dict] = []
+    keep_last = min(config.average_last_epochs, config.epochs)
+    snapshots: list[dict] = []
     for epoch in range(config.epochs):
         order = generator.permutation(len(train_examples))
         model.train()
         epoch_loss = 0.0
+        # Per-term contributions, weighted exactly as they enter the objective: the total
+        # loss of the three-head run is dominated by whichever head's target has the largest
+        # unit, and a Doppler error in Hz squared is not comparable to a BCE in [0,1]. Without
+        # this split one cannot tell "the detector is weak" from "the detector is being
+        # out-voted in its own loss" -- and train02 showed a fall head whose probabilities
+        # barely leave 0.5 while its window AUC is 0.83-0.93.
+        epoch_fall = epoch_activity = epoch_velocity = 0.0
         batches = 0
         for start in range(0, len(order), config.batch_size):
             chunk = [train_examples[index] for index in order[start : start + config.batch_size]]
@@ -414,28 +477,75 @@ def train_model(
                 dtype=torch.float32,
             )
             fall_logits, activity_logits, velocity_pred = model(inputs)
-            loss = fall_criterion(fall_logits, fall_target.to(device))
+            fall_term = fall_criterion(fall_logits, fall_target.to(device))
+            loss = fall_term
+            activity_term = loss.new_zeros(())
+            velocity_term = loss.new_zeros(())
             if config.activity_weight > 0:
-                loss = loss + config.activity_weight * activity_criterion(
+                activity_term = config.activity_weight * activity_criterion(
                     activity_logits, activity_target.to(device)
                 )
+                loss = loss + activity_term
             if config.velocity_weight > 0 and velocity_mask.any():
                 squared = velocity_criterion(velocity_pred, velocity_target.to(device))
-                loss = loss + config.velocity_weight * squared[velocity_mask.to(device)].mean()
+                velocity_term = (config.velocity_weight / config.velocity_loss_scale_hz ** 2) \
+                    * squared[velocity_mask.to(device)].mean()
+                loss = loss + velocity_term
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += float(loss.detach())
+            epoch_fall += float(fall_term.detach())
+            epoch_activity += float(activity_term.detach())
+            epoch_velocity += float(velocity_term.detach())
             batches += 1
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": epoch_loss / max(batches, 1),
+                "train_loss_fall": epoch_fall / max(batches, 1),
+                "train_loss_activity": epoch_activity / max(batches, 1),
+                "train_loss_velocity": epoch_velocity / max(batches, 1),
                 "eval_fall_accuracy": evaluate_fall_accuracy(model, eval_examples, config),
                 "eval_velocity_mae_hz": evaluate_velocity_mae(model, eval_examples, config),
             }
         )
+        if keep_last:
+            snapshots.append({key: value.detach().clone()
+                              for key, value in model.state_dict().items()})
+            if len(snapshots) > keep_last:
+                snapshots.pop(0)
+    if keep_last > 1:
+        model.load_state_dict(average_state_dicts(snapshots))
     return model, history
+
+
+def average_state_dicts(state_dicts: Sequence[Mapping[str, torch.Tensor]]) -> dict:
+    """Equal-weight mean of several checkpoints of the same architecture (SWA-style).
+
+    Floating-point tensors are averaged; integer buffers (batch-norm style counters) must
+    agree across the checkpoints, because averaging them would invent a value that no
+    epoch ever had.
+    """
+
+    if not state_dicts:
+        raise ValueError("cannot average an empty list of checkpoints")
+    first = state_dicts[0]
+    for index, state in enumerate(state_dicts[1:], start=1):
+        if set(state) != set(first):
+            raise ValueError(f"checkpoint {index} has a different parameter set")
+    averaged: dict = {}
+    for key in first:
+        stacked = [state[key] for state in state_dicts]
+        if not torch.is_floating_point(stacked[0]):
+            reference = stacked[0]
+            if not all(torch.equal(reference, other) for other in stacked[1:]):
+                raise ValueError(f"non-float buffer {key} differs between checkpoints")
+            averaged[key] = reference.clone()
+            continue
+        averaged[key] = torch.stack([value.to(torch.float64) for value in stacked]).mean(0) \
+            .to(stacked[0].dtype)
+    return averaged
 
 
 @torch.no_grad()

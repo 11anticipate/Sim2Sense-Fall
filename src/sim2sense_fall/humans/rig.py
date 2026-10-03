@@ -76,6 +76,7 @@ __all__ = [
     "plan_human_rig",
     "pose_surface_points",
     "quaternion_from_z",
+    "rest_overlap_pairs",
     "validate_plan_geometry",
 ]
 
@@ -419,6 +420,7 @@ class HumanRigPlan:
     ground_offset_m: float
     spawn_root_position: tuple[float, float, float]
     rest_joint_positions: tuple[tuple[float, float, float], ...]
+    self_collision_filter_rest_overlap: bool = True
     notes: tuple[str, ...] = ()
     stats: Mapping[str, Any] = field(default_factory=dict)
 
@@ -489,6 +491,7 @@ class HumanRigPlan:
             "total_mass_kg": self.total_mass_kg,
             "mass_weight_total": self.mass_weight_total,
             "self_collisions": self.self_collisions,
+            "self_collision_filter_rest_overlap": self.self_collision_filter_rest_overlap,
             "contact_offset_m": self.contact_offset_m,
             "rest_offset_m": self.rest_offset_m,
             "linear_damping": self.linear_damping,
@@ -940,6 +943,7 @@ def plan_human_rig(
         total_mass_kg=round(total_mass, 6),
         mass_weight_total=round(weight_total, 6),
         self_collisions=rig.self_collisions,
+        self_collision_filter_rest_overlap=rig.self_collision_filter_rest_overlap,
         contact_offset_m=rig.contact_offset_m,
         rest_offset_m=rig.rest_offset_m,
         linear_damping=rig.linear_damping,
@@ -1089,23 +1093,38 @@ def _measure_clearance(
     return -lowest, highest - lowest
 
 
-def _rest_overlap_pairs(links: Sequence[LinkSpec]) -> int:
-    """Count capsule pairs that interpenetrate in the rest pose.
+def rest_overlap_pairs(
+    links: Sequence[LinkSpec], *, margin_m: float = 0.0
+) -> tuple[tuple[str, str], ...]:
+    """Capsule pairs closer than ``margin_m`` apart in the rest pose.
 
+    Links without a capsule are ignored, so callers can pass the full link list.
     This is informational, not an error: the torso is a stack of short bones with
-    large radii, so neighbouring capsules overlap by design. Whether that matters
-    is decided by ``self_collisions``, which is disabled in the shipped rig.
-    Capsules are compared in the **body rest frame**, using each link's rest
-    position, because a capsule's centre is stored in its own link frame.
+    large radii, so neighbouring capsules overlap by design. When self-collision is
+    enabled, every pair reported here must be filtered via
+    ``UsdPhysics.FilteredPairsAPI`` or the rest pose itself becomes a source of
+    phantom contacts. Authoring should pass the collider ``contact_offset_m`` as
+    the margin: a pair inside that distance generates contacts at rest even
+    without geometric overlap. Capsules are compared in the **body rest frame**,
+    using each link's rest position, because a capsule's centre is stored in its
+    own link frame.
     """
 
-    count = 0
-    for index, left in enumerate(links):
-        for right in links[index + 1 :]:
-            assert left.capsule is not None and right.capsule is not None
-            if _world_separation(left, right) < -1e-6:
-                count += 1
-    return count
+    if not math.isfinite(margin_m) or margin_m < 0.0:
+        raise ValueError(f"margin_m must be finite and nonnegative, got {margin_m!r}")
+    colliders = [link for link in links if link.capsule is not None]
+    pairs: list[tuple[str, str]] = []
+    for index, left in enumerate(colliders):
+        for right in colliders[index + 1 :]:
+            if _world_separation(left, right) < margin_m - 1e-6:
+                pairs.append(tuple(sorted((left.name, right.name))))  # type: ignore[assignment]
+    return tuple(pairs)
+
+
+def _rest_overlap_pairs(links: Sequence[LinkSpec]) -> int:
+    """Count capsule pairs that interpenetrate in the rest pose."""
+
+    return len(rest_overlap_pairs(links))
 
 
 def _world_separation(left: LinkSpec, right: LinkSpec) -> float:

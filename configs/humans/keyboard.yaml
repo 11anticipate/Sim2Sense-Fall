@@ -12,7 +12,9 @@ root_assist_scale: 1.0
 # 外力 0.78 -> 0.55、最长无支撑 0.117 -> 0.033 s（过 0.05 门）。坐地实测地板只承担
 # 0.07 倍体重（几乎被绳子吊着），同属该剖面覆盖范围。脚类站立/行走剖面不变。
 recovery_root_assist: configs/humans/root_assist_recovery.yaml
-recovery_modes: [getting_up, standing_up, sitting, sit]
+# "falling" 仅对锚定摔倒回放生效：回放像起身一样把骨盆保持在片段的接地曲线上。
+# 传统断电式摔倒会用偏置脉冲整体覆盖 force/torque，这里的混合对其无影响。
+recovery_modes: [getting_up, standing_up, sitting, sit, falling]
 spawn_xy: [10.255, 1.455]
 heading_deg: 90.0
 speed_m_s: 0.4
@@ -107,6 +109,27 @@ actions:
   fall_damping_scale: 0.005
   fallen_height_fraction: 0.60
   fallen_tilt_deg: 50.0
+  # 锚定回放专用的提前释放触发：命令躯干倾角达到该角度即断开驱动，剩余运动
+  # 是从失稳点开始的真实翻倒。不触发会被读成"刻意放平"（v2 实测：全程竖直
+  # 速度 <=1.4 m/s）；根高触发（v4, 0.6 m）切在跪撑段会释放成稳定跪姿不倒。
+  # 45° 对 128_09 的前扑失稳（手已前伸、身体已前倾），翻倒段交给物理；
+  # 撞击/倒地标签仍由实测判定。null = 播到片段末尾。
+  fall_replay_release_tilt_deg: 45
+  # 行走中触发（路线 A 增量，2026-09-27）：F 在移动中按下 = 绊倒而非回放。
+  # 步态继续迈步（真实踉跄步），助力按 "tripping" 模式自动淡出（平衡失效）。
+  # 扰动 = 对摆动脚踝的反向拖拽（被绊住的脚尖）——推质心只会让双脚跟着加速
+  # （trip_walk_v1..v3：450N 峰值倾角仍 9.8°）。窗口内自行稳住 = 幸存踉跄，
+  # 回到行走（如实记录，标签管线不作为摔倒也不作为可准入负例）。
+  trip_force_n: 450.0
+  trip_window_s: 1.6
+  # 绊扰窗口内腿部驱动按此比例削弱（肌力骤降）——否则位置驱动会把被绊住的
+  # 脚瞬间拽回摆动轨迹（trip_walk_v4：脚踝 450N 拖拽、峰值倾角 10.7°）。
+  # 实测失衡后转 fall_control_scale 全释放；幸存则恢复 1.0。
+  trip_control_scale: 0.35
+  # 同理：姿态伺服（两份助力配置都是 3000 Nm/rad、不随模式混合淡出）是系统
+  # 事实上的平衡控制器（trip_walk_v1..v5 里它把峰值倾角死死压在 9-11°）。
+  # 绊扰窗口内俯仰权限乘此系数，失衡释放后整体归零。
+  trip_torque_scale: 0.15
 crouch:
   # 2026-09-26 换源: 全库筛对称深蹲(用户实测旧源=蹲走跨步帧, 像"跑步预备")。
   # CMU/01_06 f744: 骨盆 0.386 m(站高 42%), 膝屈 130°, 双脚平贴间距 0.13 m,
@@ -140,6 +163,27 @@ sit:
 # assisted playback anchored at the measured fallen position/heading.
 get_up:
   file: data/humans/amass_raw/CMU/140/140_01_poses.npz
+# Anchored fall replay (key F): the fall is COMMANDED as a grounded clip
+# playback instead of a drive release, so the rest pose comes from human
+# kinematics. Source history (2026-09-27): the reversed get-up clip read as a
+# deliberate lowering (vertical speed never above 1.4 m/s, no collapse phase),
+# so it was replaced with a REAL trip-fall, CMU 128_09: walk -> lurch ->
+# protective arm reach -> floor, screened from
+# artifacts/humans/fall_mesh/amass_rescreen_20260925.json (root drop 0.77 m,
+# 1.83 m horizontal travel, zero joint-limit excess in the window). Elderly
+# home falls are mostly trip/slip/weight-shift failures with horizontal
+# momentum (Robinovitch 2013), not in-place sinking.
+fall_replay:
+  file: data/humans/amass_raw/CMU/128/128_09_poses.npz
+  # [0.25, 1.50] s from a near-standing stride (v7 taught: starting mid-lunge
+  # kicks the body into a 6.6 m/s belly flop). Speed 1: the clip's own descent
+  # is already at real-fall pace. Horizontal offsets are additionally scaled
+  # by the replay blend-in (see actions._apply_fall_replay): a standing body
+  # must NOT be yanked to the clip subject's walking pace (v6 slid 2.84 m).
+  start_s: 0.25
+  duration_s: 1.25
+  reverse: false
+  speed: 1
 # AMASS supplies upper-body motion. Legs are contact-retargeted with a closed
 # 0.6 m cycle, overlapping support and zero world velocity at touchdown.
 # Full provenance, old attribution correction and Isaac results:

@@ -37,6 +37,7 @@ __all__ = [
     "DEFAULT_SCENE_CONFIG",
     "REPO_ROOT",
     "human_spawn_clearance_m",
+    "repo_relative",
     "resolve_spawn_point",
     "scene_spawn_point",
     "set_physics_dt",
@@ -45,6 +46,18 @@ __all__ = [
     "print_report",
     "write_json",
 ]
+
+
+def repo_relative(path: Path) -> str:
+    """Return ``path`` relative to the repository root, resolving symlinks first.
+
+    The checkout can be reached through several paths (the real directory plus
+    symlinked spellings); ``Path.relative_to`` compares raw strings, so a repo
+    file reached through a different spelling than ``REPO_ROOT`` would raise
+    ``ValueError``. Canonicalizing both sides also makes provenance keys
+    independent of the directory the entry point was launched from.
+    """
+    return str(path.resolve().relative_to(REPO_ROOT))
 
 
 class Checks:

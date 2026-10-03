@@ -11,6 +11,8 @@ left untested here, and they are exercised by
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -20,6 +22,8 @@ from sim2sense_fall.sionna import (
     human_tissue_material,
     place_mesh_in_scene,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _triangle() -> tuple[np.ndarray, np.ndarray]:
@@ -158,3 +162,40 @@ def test_placing_a_mesh_without_the_runtime_fails_with_a_readable_message():
         place_mesh_in_scene(
             object(), vertices, faces, name="human", material=human_tissue_material()
         )
+
+
+def _load_script(module_dir: str, name: str):
+    import importlib.util
+    import sys
+
+    path = REPO_ROOT / "scripts" / module_dir / f"{name}.py"
+    for entry in (str(REPO_ROOT / "src"), str(path.parent)):
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_adl_labels_cannot_drift_between_exporter_and_importer():
+    """Every label the exporter can admit must be classified by the importer.
+
+    ``channel_activity`` kept an inline set of ADL labels that omitted ``sit`` and
+    ``bend``, so those samples arrived as ``activity="unknown"``: they trained as
+    negatives but were missing from the ADL denominator, quietly inflating the reported
+    false-alarm-free rate. The two lists are now checked against each other.
+    """
+
+    exporter = _load_script("humans", "export_session_mesh")
+    importer = _load_script("sionna", "import_fall_mesh")
+    emitted = set(exporter.SEGMENT_LABELS.values())
+    unclassified = emitted - importer.SESSION_ADL_LABELS - {"fall"}
+    assert unclassified == importer.SESSION_UNCLASSIFIED_LABELS, (
+        f"labels neither ADL nor fall nor explicitly unclassified: {sorted(unclassified)}"
+    )
+    for label in sorted(importer.SESSION_ADL_LABELS):
+        assert importer.channel_activity(label, "physics_keyboard_session").value == "adl"
+    assert importer.channel_activity("fall", "physics_keyboard_session").value == "fall"
+    # A kinematic replay is not physical evidence, whatever its label claims.
+    assert importer.channel_activity("sit", "kinematic_replay").value == "unknown"
